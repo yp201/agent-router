@@ -1,5 +1,7 @@
 # agent-router
 
+![agent-router console — overview](docs/img/overview.png)
+
 A local proxy for Claude Code that routes each session to one of several Claude accounts, keeps prompt caches warm,
 and shows you where your tokens go. Works with the Claude desktop app (transparent mode) and the terminal CLI.
 Zero dependencies: Node 24 + SQLite (built in) + `openssl`.
@@ -12,6 +14,21 @@ not a way to share one account between people. MIT licensed.
 - **Ledger.** Every request joined to your session transcripts by request id: cache read/write per turn, bursts and
   why they happened, per-window headroom, per-session cost.
 - **Console** at `http://localhost:4001/router/`: accounts, sessions (switch with one click), cache manager, budgets, insights.
+
+
+## What it looks like
+
+| Session timeline — which account each turn ran on, and what every switch cost | Cache manager — bursts and why they happened |
+| --- | --- |
+| ![timeline](docs/img/timeline.png) | ![cache](docs/img/cache.png) |
+
+| Accounts & routing — headroom per window, one-click switch | Cost & budgets — pooled windows, thresholds, per-session share |
+| --- | --- |
+| ![accounts](docs/img/accounts.png) | ![cost](docs/img/cost.png) |
+
+| Insights — unused tools, oversized contexts, when bursts happen |
+| --- |
+| ![insights](docs/img/insights.png) |
 
 ## Setup (macOS)
 
