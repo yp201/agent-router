@@ -13,7 +13,7 @@ git tag v0.1.2 && git push origin v0.1.2    # semver: patch = fixes, minor = fea
 SHA=$(curl -sL https://github.com/yp201/agent-router/archive/refs/tags/v0.1.2.tar.gz | shasum -a 256 | cut -d' ' -f1)
 cd /opt/homebrew/Library/Taps/yp201/homebrew-tap
 sed -i '' -e "s|tags/v[0-9.]*\.tar\.gz|tags/v0.1.2.tar.gz|" -e "s|sha256 \"[0-9a-f]*\"|sha256 \"$SHA\"|" Formula/agent-router.rb
-brew audit --strict yp201/tap/agent-router && git commit -am "agent-router 0.1.2" && git push
+git commit -am "agent-router 0.1.2" && git push   # skip `brew audit`: it insists on formula_opt_bin, which older Homebrew lacks
 ```
 Keep `packaging/agent-router.rb` in this repo identical to the tap's formula. Use `Formula["node"].opt_bin`
 (works on old Homebrew); `formula_opt_bin` is newer and breaks users who haven't run `brew update`.
