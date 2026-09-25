@@ -158,7 +158,9 @@ If the tab errors with a certificate failure, the CLI isn't seeing `NODE_EXTRA_C
   excluded from `system_hash` or every turn would look like a system-prompt change. The first user message is mostly
   `<system-reminder>` blocks; `first_user_hash` hashes the remaining typed text (falls back to all text).
 - **Burst "previous request"** = previous request in the same *thread* (same session_key + first_user_hash), because a session's
-  metadata session_id is shared by its subagents and side requests, which have different prefixes. First request of a thread that
-  bursts is labelled "first turn, cold cache". Account switch = migration row for the request *or* account differs from the previous turn
+  metadata session_id is shared by its subagents and side requests, which have different prefixes. A thread's first request is a
+  cold start ("first turn, cold cache" on the turn), never a burst. Burst = `cache_create > max(8k, 2 × context added since the previous
+  turn)` (context = joined in+read+create, else the byte estimate): it re-wrote old context, not just the new tokens. Replaced
+  `> max(20k, 3 × session median)`, which flagged ordinary big turns on large sessions (9 of 10 read "context growth / unknown"). Account switch = migration row for the request *or* account differs from the previous turn
   (manual pins log their migration with request_id null).
 - 7d projection uses the window's average rate so far (util × 7d / elapsed); a 60-min burn stretched over days projected 300%+.

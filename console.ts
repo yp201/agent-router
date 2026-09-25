@@ -31,8 +31,6 @@ function turns(since: number, session?: string | null) {
   const by = new Map<string, any[]>();
   for (const r of rows) { const k = r.session_key ?? '-'; if (!by.has(k)) by.set(k, []); by.get(k)!.push(r); }
   for (const rs of by.values()) {
-    const cc = rs.map((r) => r.cache_create).filter((x) => x != null).sort((a, b) => a - b);
-    const thr = Math.max(20_000, 3 * (cc.length ? cc[Math.floor(cc.length / 2)] : 0));
     // "previous request" = previous one in the same thread: a session also carries subagent and side-request threads,
     // each with its own first user message and prefix. Old rows without fingerprints fall back to model.
     const last = new Map<string, any>();
@@ -41,15 +39,18 @@ function turns(since: number, session?: string | null) {
       const k = r.first_user_hash ?? r.model, p = last.get(k);
       last.set(k, r);
       r.switched = !!(r.migrated || (p && p.account_id !== r.account_id));
-      if (r.cache_create == null || r.cache_create <= thr) return;
+      if (r.cache_create == null || r.cache_create <= 8_000) return;
+      // a thread's first turn is a cold start: labelled on the turn, never counted as a burst
+      if (!p) return void (r.cold = { cause: 'first turn, cold cache', avoidable: false, delta: r.cache_create, fix: null, gap_s: null });
+      // burst = wrote well over what this turn added, so old context was re-written. ctx(): joined usage, else the byte estimate
+      if (r.cache_create <= 2 * Math.max(0, ctx(r) - (ctx(p) ?? 0))) return;
       const cause = r.switched ? 'account switch'
-        : !p ? 'first turn, cold cache'
         : p.tools_hash && r.tools_hash && p.tools_hash !== r.tools_hash ? `MCP tool list changed (${p.tools_count} → ${r.tools_count} tools)`
         : p.system_hash && r.system_hash && p.system_hash !== r.system_hash ? 'system prompt changed'
         : r.ts - p.ts > 3600_000 ? 'idle > 1h, cache TTL expired'
-        : 'context growth / unknown';
+        : 'unknown: prefix re-written without a fingerprint change';
       const fix = Object.entries(FIX).find(([k]) => cause.startsWith(k))?.[1] ?? null;
-      r.burst = { cause, avoidable: /tool list|system prompt/.test(cause), delta: r.cache_create, fix, gap_s: p ? Math.round((r.ts - p.ts) / 1000) : null };
+      r.burst = { cause, avoidable: /tool list|system prompt/.test(cause), delta: r.cache_create, fix, gap_s: Math.round((r.ts - p.ts) / 1000) };
     });
   }
   return rows;
@@ -126,7 +127,7 @@ function cache(q: URLSearchParams) {
     reads: sum(j, (r) => r.cache_read), writes: sum(j, (r) => r.cache_create), turns_joined: j.length,
     reads_per_turn: j.length ? Math.round(sum(j, (r) => r.cache_read) / j.length) : null, last_write: j.at(-1)?.cache_create ?? null,
     avoidable: { count: avoid.length, total: bursts.length },
-    turns: (session ? rows : j).slice(-200).map((r) => ({ i: r.i, ts: r.ts, session_key: r.session_key, cache_read: r.cache_read, cache_create: r.cache_create, in_tok: r.in_tok, burst: r.burst ?? null })),
+    turns: (session ? rows : j).slice(-200).map((r) => ({ i: r.i, ts: r.ts, session_key: r.session_key, cache_read: r.cache_read, cache_create: r.cache_create, in_tok: r.in_tok, burst: r.burst ?? r.cold ?? null })),
     bursts: bursts.reverse(),
     savings_if_avoided_tokens: saved, savings_pct_of_5h: cap ? saved / cap : null,
   };

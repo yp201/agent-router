@@ -1,6 +1,6 @@
 #!/bin/bash
 # agent-router transparent mode: local CA + api.anthropic.com leaf + LaunchAgent plist.
-# Never runs sudo; prints the commands that need it. Idempotent: existing files are kept.
+# Never runs sudo; prints the commands that need it. Idempotent: certs are kept, the plist is rewritten only if it would change.
 # `setup.sh --into DIR [--host NAME]` only makes the certs (the test uses this).
 set -euo pipefail
 DIR=~/.agent-router/ca HOST=api.anthropic.com CERTS_ONLY=
@@ -31,10 +31,10 @@ chmod 600 ca-key.pem "$HOST-key.pem"
 [ -n "$CERTS_ONLY" ] && exit 0
 
 PLIST=~/Library/LaunchAgents/com.agent-router.plist
-if [ -f "$PLIST" ]; then echo "kept existing $PLIST (delete it to regenerate)"; else
-  NODE=$(node -p process.execPath) # real path: `which node` under fnm is a per-shell symlink that disappears
-  mkdir -p ~/Library/LaunchAgents
-  cat > "$PLIST" <<PL
+# keep the plist's node if it still exists; else the real path (`which node` under fnm is a per-shell symlink that disappears)
+NODE=$(plutil -extract ProgramArguments.0 raw "$PLIST" 2>/dev/null) && [ -x "$NODE" ] || NODE=$(node -p process.execPath)
+mkdir -p ~/.agent-router ~/Library/LaunchAgents && chmod 700 ~/.agent-router
+NEW=$(cat <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -43,13 +43,14 @@ if [ -f "$PLIST" ]; then echo "kept existing $PLIST (delete it to regenerate)"; 
   <key>WorkingDirectory</key><string>$PROJ</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$PROJ/router.log</string>
-  <key>StandardErrorPath</key><string>$PROJ/router.log</string>
+  <key>StandardOutPath</key><string>$HOME/.agent-router/router.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.agent-router/router.log</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>$(dirname "$NODE"):/usr/bin:/bin</string></dict>
 </dict></plist>
 PL
-  plutil -lint "$PLIST" >/dev/null
-  echo "created $PLIST"
+)
+if [ "$(cat "$PLIST" 2>/dev/null)" = "$NEW" ]; then echo "kept $PLIST (unchanged)"; else
+  printf '%s\n' "$NEW" > "$PLIST" && plutil -lint "$PLIST" >/dev/null && echo "wrote $PLIST"
 fi
 
 [ -n "${NO_HINTS:-}" ] && exit 0

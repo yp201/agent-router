@@ -1,8 +1,20 @@
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
+import { homedir } from 'node:os';
 
-const dir = import.meta.dirname;
-export const db = new DatabaseSync(process.env.LEDGER_PATH ?? `${dir}/ledger.sqlite`);
+// State lives in ~/.agent-router/; a ledger from before that (next to the source) is moved there once.
+const dir = import.meta.dirname, path = process.env.LEDGER_PATH ?? `${homedir()}/.agent-router/ledger.sqlite`;
+if (!process.env.LEDGER_PATH) {
+  mkdirSync(`${homedir()}/.agent-router`, { recursive: true, mode: 0o700 });
+  const old = `${dir}/ledger.sqlite`;
+  if (existsSync(old) && !existsSync(path)) {
+    const o = new DatabaseSync(old); o.exec('pragma wal_checkpoint(TRUNCATE)'); o.close();
+    // ponytail: rename, so same volume only (checkout under ~); any -wal/-shm left moves with it, nothing is dropped
+    for (const x of ['', '-wal', '-shm']) if (existsSync(old + x)) renameSync(old + x, path + x);
+    console.log(`ledger moved: ${old} -> ${path}`);
+  }
+}
+export const db = new DatabaseSync(path);
 db.exec('pragma journal_mode = wal; pragma busy_timeout = 2000'); // UI/tests read while the router writes
 db.exec(readFileSync(`${dir}/schema.sql`, 'utf8'));
 // `create if not exists` skips tables older ledgers already have; add their missing columns

@@ -4,7 +4,7 @@ import { createServer, request as httpRequest, type IncomingMessage, type Server
 import { createServer as createTls, request as httpsRequest } from 'node:https';
 import { createServer as createNet, type AddressInfo } from 'node:net';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, mkdirSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, mkdirSync, appendFileSync, cpSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { tmpdir, networkInterfaces } from 'node:os';
@@ -35,8 +35,16 @@ async function fakeUpstream(t: TestContext, handler: (req: IncomingMessage, res:
 }
 
 async function startRouter(t: TestContext, env: Record<string, string>) {
-  const ledger = `${mkdtempSync(`${tmpdir()}/router-`)}/ledger.sqlite`;
-  const child = spawn(process.execPath, [`${import.meta.dirname}/router.ts`], { env: { ...process.env, PORT: '0', LEDGER_PATH: ledger, TLS_DIR: mkdtempSync(`${tmpdir()}/router-notls-`),
+  const dir = mkdtempSync(`${tmpdir()}/router-`), home = 'LEDGER_PATH' in env;
+  // `LEDGER_PATH: undefined` runs a copy of the source with HOME = dir and an old ledger next to it, so the default
+  // path and the one-time move happen in temp, never on the checkout's own ledger
+  const src = home ? `${dir}/src` : import.meta.dirname;
+  if (home) {
+    cpSync(import.meta.dirname, src, { recursive: true, filter: (f) => !/\/(ledger\.sqlite|router\.log|\.git|node_modules)/.test(f) });
+    const old = new DatabaseSync(`${src}/ledger.sqlite`); old.exec('create table moved (x); insert into moved values (1)'); old.close();
+  }
+  const ledger = home ? `${dir}/.agent-router/ledger.sqlite` : `${dir}/ledger.sqlite`;
+  const child = spawn(process.execPath, [`${src}/router.ts`], { env: { ...process.env, PORT: '0', LEDGER_PATH: ledger, ...(home && { HOME: dir }), TLS_DIR: mkdtempSync(`${tmpdir()}/router-notls-`),
     CLAUDE_PROJECTS_DIR: mkdtempSync(`${tmpdir()}/router-projects-`), ...env } });
   t.after(() => child.kill());
   let stdout = '';
@@ -72,8 +80,13 @@ const sse = (seen: { path: string; auth?: string }[]) => (req: IncomingMessage, 
 
 test('router streams SSE verbatim and logs one ledger row; no certs -> HTTP only', async (t) => {
   const seen: { path: string; auth?: string }[] = [];
-  const { base, ledger, stdout: out } = await startRouter(t, await fakeUpstream(t, sse(seen)));
+  const { base, ledger, stdout: out } = await startRouter(t, { ...(await fakeUpstream(t, sse(seen))), LEDGER_PATH: undefined as any });
   assert.match(out(), /transparent mode off \(no certs in TLS_DIR\)/);
+  // no LEDGER_PATH -> $HOME/.agent-router/ledger.sqlite (dir 700), and the ledger that sat next to the source moved there
+  assert.equal(statSync(dirname(ledger)).mode & 0o777, 0o700);
+  assert.match(out(), /ledger moved: .*\/src\/ledger\.sqlite -> .*\/\.agent-router\/ledger\.sqlite/);
+  assert.ok(!existsSync(`${dirname(dirname(ledger))}/src/ledger.sqlite`));
+  assert.deepEqual(new DatabaseSync(ledger).prepare('select x from moved').all().map((r: any) => r.x), [1]);
 
   const res = await fetch(`${base}/v1/messages?beta=true`, {
     method: 'POST',
@@ -452,7 +465,7 @@ test('session titles + subagents: custom-title over first prompt, project, agent
   h.noLeak();
 });
 
-test('burst attribution: tool list change on turn 3 (avoidable), idle gap on turn 5 (not)', async (t) => {
+test('burst attribution: cold first turn and big growth turn are not bursts; tool list change on turn 3 (avoidable), idle gap on turn 5 (not)', async (t) => {
   const proj = mkdtempSync(`${tmpdir()}/router-proj-`);
   const h = await setup(t, { CLAUDE_PROJECTS_DIR: proj });
   const tools = (n: string[]) => ({ tools: n.map((name) => ({ name })) });
@@ -462,19 +475,22 @@ test('burst attribution: tool list change on turn 3 (avoidable), idle gap on tur
   t.after(() => db.close());
   db.prepare(`update requests set ts = ts - 7200000 where request_id in ('req_1', 'req_2', 'req_3', 'req_4')`).run(); // 2h gap before turn 5
   mkdirSync(`${proj}/p`);
-  const u = [[0, 5000], [5000, 1000], [6000, 30000], [36000, 1000], [0, 40000]];
-  writeFileSync(`${proj}/p/sb.jsonl`, u.map(([read, create], i) => arow(`req_${i + 1}`, { in: 10, read, create }, undefined, 'sb')).join(''));
-  await until(() => (db.prepare(`select cache_create from requests where request_id = 'req_5'`).get() as any).cache_create === 40000, 'joined');
+  // [in, read, create]; context = their sum: 20k cold start, +40k growth (30k written), +2k with a 30k re-write (tools), +1k, idle re-write
+  const u = [[10, 0, 20000], [10000, 20000, 30000], [10, 31990, 30000], [10, 62000, 1000], [10, 0, 64000]];
+  writeFileSync(`${proj}/p/sb.jsonl`, u.map(([inp, read, create], i) => arow(`req_${i + 1}`, { in: inp, read, create }, undefined, 'sb')).join(''));
+  await until(() => (db.prepare(`select cache_create from requests where request_id = 'req_5'`).get() as any).cache_create === 64000, 'joined');
 
   const c = await h.api('cache?session=sb&days=1');
   assert.equal(c.turns.length, 5);
+  assert.equal(c.turns[0].burst.cause, 'first turn, cold cache');
+  assert.equal(c.turns[1].burst, null, 'wrote 30k but added 40k: growth, not a burst');
   assert.deepEqual(c.bursts.map((b: any) => [b.i, b.cause, b.avoidable, b.delta]), [
-    [5, 'idle > 1h, cache TTL expired', false, 40000],
+    [5, 'idle > 1h, cache TTL expired', false, 64000],
     [3, 'MCP tool list changed (2 → 3 tools)', true, 30000],
   ]);
   assert.deepEqual(c.avoidable, { count: 1, total: 2 });
   assert.equal(c.savings_if_avoided_tokens, 30000);
-  assert.equal(c.hit_rate, 47000 / (47000 + 77000 + 50));
+  assert.equal(c.hit_rate, 113990 / (113990 + 145000 + 10040));
 
   // the other console views read the same rows
   const o = await h.api('overview');

@@ -15,6 +15,8 @@ loaded()   { launchctl print "$LABEL" >/dev/null 2>&1; }
 health()   { curl -s -m 2 localhost:4001/router/health; }
 transp()   { curl -s -m 5 --cacert "$CA" --resolve api.anthropic.com:443:127.0.0.1 https://api.anthropic.com/api/hello -o /dev/null -w '%{http_code}'; }
 wait_up()  { for _ in $(seq 1 20); do health >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+# launchd only re-reads the plist on bootstrap (kickstart keeps the old one); bootout can take a moment to settle
+reload()   { loaded && launchctl bootout "$LABEL"; for _ in $(seq 1 20); do launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && return 0; sleep 0.5; done; return 1; }
 
 preflight() {
   command -v openssl >/dev/null || { echo "openssl not found (it ships with macOS; on Linux: apt/dnf install openssl)"; exit 1; }
@@ -31,8 +33,7 @@ cmd_install() {
     printf '127.0.0.1 api.anthropic.com\n::1 api.anthropic.com\n' | sudo tee -a /etc/hosts >/dev/null && say "/etc/hosts" "ok"; fi
   launchctl setenv NODE_EXTRA_CA_CERTS "$CA" && say "NODE_EXTRA_CA_CERTS" "set (lost on reboot: re-run install)"
   pkill -f 'node router.ts' 2>/dev/null && sleep 0.5
-  if loaded; then launchctl kickstart -k "$LABEL"; else launchctl bootstrap "$LABEL" "$PLIST" 2>/dev/null || launchctl bootstrap "gui/$(id -u)" "$PLIST"; fi
-  wait_up && say "router (launchd)" "up" || { say "router (launchd)" "NOT UP — see router.log"; exit 1; }
+  reload; wait_up && say "router (launchd)" "up" || { say "router (launchd)" "NOT UP — see ~/.agent-router/router.log"; exit 1; }
   say "transparent path" "HTTP $(transp) from api.anthropic.com via :443"
   cat <<MSG
 
@@ -62,8 +63,8 @@ case ${1:-} in
   status)    cmd_status ;;
   start)     loaded && launchctl kickstart "$LABEL" || launchctl bootstrap "gui/$(id -u)" "$PLIST"; wait_up && echo up ;;
   stop)      loaded && launchctl bootout "$LABEL"; pkill -f 'node router.ts' 2>/dev/null; echo stopped ;;
-  restart)   launchctl kickstart -k "$LABEL" && wait_up && echo up ;;
-  logs)      tail -f "$PROJ/router.log" ;;
+  restart)   NO_HINTS=1 "$PROJ/setup.sh" >/dev/null && reload && wait_up && echo up || { echo "NOT UP — see ~/.agent-router/router.log"; exit 1; } ;;
+  logs)      tail -f ~/.agent-router/router.log ;;
   ui)        open http://localhost:4001/router/ ;;
   *)         echo "usage: $0 install|uninstall|status|start|stop|restart|logs|ui"; exit 2 ;;
 esac

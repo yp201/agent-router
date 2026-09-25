@@ -45,6 +45,8 @@ CLAUDE_CONFIG_DIR=~/.agent-router/accounts/<name> claude auth login
 ./agent-router.sh uninstall  # remove hosts entry, CA trust, launchd job
 ```
 
+State lives in `~/.agent-router/` (ledger, certs, accounts, log); the checkout only holds code.
+
 After a reboot everything comes back by itself. If the router is ever down, Claude can't reach the API — `status` tells
 you in one line, `start` fixes it.
 
@@ -62,7 +64,7 @@ which ignores that setting.
 ## Development
 
 ```bash
-node --test test_router.ts   # 13 tests, fake upstream, no network
+node --test test_router.ts   # 14 tests, fake upstream, no network
 ```
 
 `router.ts` proxy + routing · `accounts.ts` token store · `tailer.ts` transcript join · `console.ts` analytics ·
