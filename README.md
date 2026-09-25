@@ -13,7 +13,13 @@ not a way to share one account between people. MIT licensed.
   why they happened, per-window headroom, per-session cost.
 - **Console** at `http://localhost:4001/router/`: accounts, sessions (switch with one click), cache manager, budgets, insights.
 
-## Setup — one command (macOS)
+## Setup (macOS)
+
+```bash
+brew tap yp201/tap && brew install agent-router && brew services start agent-router && agent-router install
+```
+
+Or from source:
 
 ```bash
 git clone https://github.com/yp201/agent-router.git && cd agent-router && ./agent-router.sh install
