@@ -52,6 +52,7 @@ input[type=number] { width: 72px; font-family: var(--mono); }
 .table { display: flex; flex-direction: column; gap: 2px; overflow-x: auto; }
 .tr { display: grid; gap: 12px; padding: 10px; border-radius: 8px; align-items: center; font: 13px var(--mono); min-width: 760px; }
 .tr:nth-child(even) { background: var(--bg); } .tr.th { color: var(--muted); font: 12px var(--sans); }
+.nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live .tr { grid-template-columns: 70px 76px 1fr 56px 64px; gap: 8px; padding: 8px; font-size: 12px; min-width: 420px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--teal); display: inline-block; flex-shrink: 0; }
 .status { padding: 12px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); }
@@ -94,6 +95,10 @@ const ago = (ms) => ms ? `${dur((Date.now() - ms) / 1000)} ago` : 'never';
 const until = (epochS) => epochS ? dur(epochS - Date.now() / 1000) : '—';
 const hms = (ms) => new Date(ms).toLocaleTimeString('en-GB');
 const short = (k) => esc((k ?? '').slice(0, 8));
+// a session by name: title + muted project, key as tooltip; `m` = Map from byKey(sessions), unknown keys fall back to the short key
+const SC = 'grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) 80px 90px 90px 100px 210px'; // Sessions table
+const byKey = (sessions) => new Map(sessions.map((s) => [s.session_key, s]));
+const sname = (m, k, s = m.get(k)) => `<span title="${esc(k)}">${s ? `${esc(s.title)}${s.project ? ` <span class="muted">${esc(s.project)}</span>` : ''}` : short(k)}</span>`;
 const model = (m) => esc((m ?? '—').replace(/^claude-/, '').replace(/-\d{8}$/, ''));
 const get = (p) => fetch(`/router/${p}`).then((r) => r.json());
 const send = (method, p, body) => fetch(`/router/${p}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) }).then((r) => r.json());
@@ -111,8 +116,8 @@ const acctLine = (a) => a.kind === 'home' ? 'desktop login · never stored'
 
 // ---------- views: each returns [paths to fetch, render(data)] ----------
 const views = {
-  overview: [['overview', 'settings'], (o) => {
-    const accts = o.accounts, paused = S.policy === 'manual';
+  overview: [['overview', 'sessions', 'settings'], (o, sessions) => {
+    const m = byKey(sessions), accts = o.accounts, paused = S.policy === 'manual';
     const src = o.sources ?? {}, srcLine = Object.keys(src).length ? `${src.desktop ?? 0} desktop · ${src.cli ?? 0} terminal sessions` : 'no user-agent data yet';
     const sw = o.switches, write = o.live.find((r) => r.cache === 'write');
     return head('Today', `${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' })} · ${accts.length} accounts · ${o.live_sessions} live sessions`,
@@ -142,8 +147,8 @@ const views = {
         <div class="between"><h2>Live</h2><span class="small muted row"><span class="dot" style="width:6px;height:6px"></span>polling 3s</span></div>
         <div class="table live">
           <div class="tr th"><span>time</span><span>account</span><span>session · model</span><span>cache</span><span>latency</span></div>
-          ${o.live.map((r) => (r.migration ? `<div class="tr"><span class="muted">${hms(r.ts)}</span><span class="muted">—</span><span class="muted">${esc(r.migration.reason)} switch · ${short(r.session_key)} ${esc(r.migration.from ?? '—')} → ${esc(r.migration.to)}</span><span></span><span></span></div>` : '')
-            + `<div class="tr"><span class="muted">${hms(r.ts)}</span><span${r.account !== 'home' ? ' class="amber"' : ''}>${esc(r.account)}</span><span>${short(r.session_key)} · ${model(r.model)}${r.status >= 400 ? ` <span class="clay">${r.status}</span>` : ''}</span>
+          ${o.live.map((r) => (r.migration ? `<div class="tr"><span class="muted">${hms(r.ts)}</span><span class="muted">—</span><span class="muted">${esc(r.migration.reason)} switch · ${sname(m, r.session_key)} ${esc(r.migration.from ?? '—')} → ${esc(r.migration.to)}</span><span></span><span></span></div>` : '')
+            + `<div class="tr"><span class="muted">${hms(r.ts)}</span><span${r.account !== 'home' ? ' class="amber"' : ''}>${esc(r.account)}</span><span class="nm">${sname(m, r.session_key)} · ${model(r.model)}${r.status >= 400 ? ` <span class="clay">${r.status}</span>` : ''}</span>
               <span class="${r.cache === 'hit' ? 'teal' : r.cache === 'write' ? 'clay' : 'muted'}">${r.cache}</span><span>${(r.latency_ms / 1000).toFixed(2)}s</span></div>`).join('') || '<div class="note">No /v1/messages traffic yet.</div>'}
         </div>
         ${write ? `<a href="#cache" data-session="${esc(write.session_key)}" class="inset" style="margin-top:auto;text-align:center;font-size:13px">Why did ${hms(write.ts)} write ${tok(write.cache_create)}?</a>` : ''}
@@ -174,14 +179,17 @@ const views = {
     <section class="panel">
       <div class="between"><h2>Sessions</h2><span class="small muted">Switch cost = a full cache re-write of that session's context. Shown before you confirm.</span></div>
       <div class="table">
-        <div class="tr th" style="grid-template-columns:110px 1fr 80px 90px 90px 100px 210px"><span>session</span><span>project · model</span><span>requests</span><span>account</span><span>context</span><span>switch cost</span><span>route to</span></div>
-        ${sessions.map((s) => `<div class="tr" style="grid-template-columns:110px 1fr 80px 90px 90px 100px 210px">
-          <span title="${esc(s.session_key)}">${short(s.session_key)}</span>
-          <span>${esc(s.project ?? '—')} · ${model(s.last_model)} ${s.source ? `<span class="chip">${s.source === 'cli' ? 'terminal' : 'desktop'}</span>` : ''}</span>
+        <div class="tr th" style="${SC}"><span>session · project</span><span>model</span><span>requests</span><span>account</span><span>context</span><span>switch cost</span><span>route to</span></div>
+        ${sessions.map((s) => `<div class="tr" style="${SC}">
+          <span class="nm">${sname(null, s.session_key, s)}</span>
+          <span>${model(s.last_model)} ${s.source ? `<span class="chip">${s.source === 'cli' ? 'terminal' : 'desktop'}</span>` : ''}</span>
           <span>${s.request_count}</span><span${s.account_id !== 'home' ? ' class="amber"' : ''}>${esc(s.account_id)}</span><span>${tok(s.context_est)}</span><span>${s.switch_cost_est == null ? NA : '≈' + tok(s.switch_cost_est)}</span>
           <div class="row"><select class="sm" aria-label="Route session ${short(s.session_key)} to account" data-s="${esc(s.session_key)}">${accts.map((a) => `<option ${a.id === (ui.open[`pin-${s.session_key}`] ?? s.account_id) ? 'selected' : ''}>${esc(a.id)}</option>`).join('')}</select>
-            <button class="sm" data-pin="${esc(s.session_key)}" data-cost="${s.switch_cost_est ?? ''}">Switch</button></div></div>`).join('') || '<div class="note">No sessions yet.</div>'}
+            <button class="sm" data-pin="${esc(s.session_key)}" data-cost="${s.switch_cost_est ?? ''}">Switch</button></div></div>`
+          + s.agents.map((a) => `<div class="tr" style="${SC}"><span class="nm muted" style="padding-left:14px" title="${esc(a.agent_id)}">↳ ${esc(a.name)}</span>
+            <span class="small muted">read ${tok(a.cache_read)} · write ${tok(a.cache_create)}</span><span>${a.requests}</span><span></span><span></span><span></span><span></span></div>`).join('')).join('') || '<div class="note">No sessions yet.</div>'}
       </div>
+      ${sessions.some((s) => s.agents.length) ? '<div class="note">↳ rows are subagents. Their requests are included in the parent\'s count and follow the parent\'s pin — switch the parent to move them.</div>' : ''}
       <fieldset class="inset" style="margin:0"><legend class="small muted" style="padding:0 4px">Routing policy</legend>
         ${[['sticky_least_utilized', 'Sticky, least-utilized for new sessions', ' <span class="muted">(recommended)</span>'], ['prefer_home_until_80', 'Prefer home until 80%', ''], ['manual', 'Manual only', ' <span class="muted">(new sessions stay on home)</span>']].map(([v, l, x]) =>
           `<label class="row"><input type="radio" name="policy" value="${v}" ${S.policy === v ? 'checked' : ''}> ${l}${x}</label>`).join('')}
@@ -190,18 +198,18 @@ const views = {
     </section>`],
 
   cache: [[() => `cache?session=${encodeURIComponent(ui.cacheSession)}&days=${ui.cacheDays}`, 'sessions', 'settings'], (c, sessions) => {
-    const t = c.turns.slice(-60), max = Math.max(1, ...t.map((r) => (r.cache_read ?? 0) + (r.cache_create ?? 0) + (r.in_tok ?? 0)));
+    const m = byKey(sessions), t = c.turns.slice(-60), max = Math.max(1, ...t.map((r) => (r.cache_read ?? 0) + (r.cache_create ?? 0) + (r.in_tok ?? 0)));
     const step = 700 / Math.max(t.length, 1), bw = Math.min(22, step - 4), y = (v) => (v / max) * 200;
     const bars = t.map((r, k) => { const x = 44 + k * step; let top = 260; const seg = (v, fill) => { const h = y(v ?? 0); top -= h; return h > 0 ? `<rect x="${x.toFixed(1)}" y="${top.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${fill}"/>` : ''; };
-      return `<g><title>turn ${r.i}${ui.cacheSession === 'all' ? ` (${(r.session_key ?? '').slice(0, 8)})` : ''} · ${hms(r.ts)}\nread ${r.cache_read ?? '—'} · write ${r.cache_create ?? '—'} · uncached ${r.in_tok ?? '—'}${r.burst ? `\nburst: ${r.burst.cause}` : ''}</title>${seg(r.cache_read, '#5FB3A1')}${seg(r.cache_create, '#D97757')}${seg(r.in_tok, '#4A453D')}
+      return `<g><title>turn ${r.i}${ui.cacheSession === 'all' ? ` (${esc(m.get(r.session_key)?.title ?? (r.session_key ?? '').slice(0, 8))})` : ''} · ${hms(r.ts)}\nread ${r.cache_read ?? '—'} · write ${r.cache_create ?? '—'} · uncached ${r.in_tok ?? '—'}${r.burst ? `\nburst: ${r.burst.cause}` : ''}</title>${seg(r.cache_read, '#5FB3A1')}${seg(r.cache_create, '#D97757')}${seg(r.in_tok, '#4A453D')}
         ${r.burst ? `<text x="${(x + bw / 2).toFixed(1)}" y="276" text-anchor="middle" font-family="IBM Plex Mono" font-size="10" fill="#D97757">${r.i}</text>` : ''}</g>`; }).join('');
     const DESC = { 'account switch': 'Cache is per account, so the full context was re-written.', 'MCP tool list': 'Tools sit before the conversation in the prefix, so everything after them was invalidated.',
       'system prompt': 'Anything in the system block invalidates the entire cache.', 'first turn': 'First request of this thread: nothing to reuse yet.',
       'context growth': 'No prefix change detected: the context grew, or the cache was evicted.' };
     const desc = (b) => b.cause.startsWith('idle') ? `Gap of ${dur(b.gap_s)} between turns. The 1h cache lapsed. Not avoidable unless you keep the session warm.` : Object.entries(DESC).find(([k]) => b.cause.startsWith(k))?.[1] ?? '';
-    const label = ui.cacheSession === 'all' ? 'all sessions' : `session ${short(ui.cacheSession)}`;
+    const label = ui.cacheSession === 'all' ? 'all sessions' : sname(m, ui.cacheSession);
     return head('Cache', 'Every turn re-sends the whole conversation. What\'s cached is nearly free; what isn\'t is the bill.',
-      `<div class="row"><label class="sr" for="cs">Session</label><select id="cs" data-act="cache-session"><option value="all">All sessions</option>${sessions.map((s) => `<option value="${esc(s.session_key)}" ${s.session_key === ui.cacheSession ? 'selected' : ''}>Session ${short(s.session_key)} · ${esc(s.project ?? '')}</option>`).join('')}</select>
+      `<div class="row"><label class="sr" for="cs">Session</label><select id="cs" data-act="cache-session"><option value="all">All sessions</option>${sessions.map((s) => `<option value="${esc(s.session_key)}" title="${esc(s.session_key)}" ${s.session_key === ui.cacheSession ? 'selected' : ''}>${esc(s.title)}${s.project ? ` · ${esc(s.project)}` : ''}</option>`).join('')}</select>
        <label class="sr" for="cd">Days</label><select id="cd" data-act="cache-days">${[1, 7, 30].map((d) => `<option value="${d}" ${d === ui.cacheDays ? 'selected' : ''}>${d === 1 ? '24 hours' : d + ' days'}</option>`).join('')}</select></div>`)
     + `<section class="grid4">
         ${kpi('Hit rate', pct(c.hit_rate), 'of input tokens read from cache', 'teal')}
@@ -222,20 +230,21 @@ const views = {
         <div class="panel">
           <h2>Cache bursts — why the cache was rewritten</h2>
           ${c.bursts.slice(0, 12).map((b) => `<div class="inset" style="${b.avoidable ? 'border-color:#4A3A2E' : ''}">
-              <div class="between"><span class="row" style="font-weight:600">Turn ${b.i}${ui.cacheSession === 'all' ? ` <span class="small muted mono">${short(b.session_key)}</span>` : ''} · ${esc(b.cause)}${b.avoidable ? '<span class="chip warn">avoidable</span>' : ''}</span><span class="mono small clay">+${tok(b.delta)} written</span></div>
+              <div class="between"><span class="row" style="font-weight:600">Turn ${b.i}${ui.cacheSession === 'all' ? ` <span class="small muted">${sname(m, b.session_key)}</span>` : ''} · ${esc(b.cause)}${b.avoidable ? '<span class="chip warn">avoidable</span>' : ''}</span><span class="mono small clay">+${tok(b.delta)} written</span></div>
               <div class="note">${esc(desc(b))}</div>${b.fix && b.avoidable ? `<div class="small">Fix: ${esc(b.fix)}</div>` : ''}</div>`).join('') || '<div class="note">No bursts in this range.</div>'}
           <div class="note">If the avoidable bursts had not happened, ${label} would have written <span class="mono" style="color:var(--fg)">${tok(c.savings_if_avoided_tokens)}</span> fewer tokens — about <span class="mono" style="color:var(--fg)">${pct(c.savings_pct_of_5h)}</span> of a 5-hour window.</div>
         </div>
       </section>`;
   }],
 
-  cost: [['cost', 'accounts'], (c, accts) => {
+  cost: [['cost', 'accounts', 'sessions'], (c, accts, sessions) => {
+    const m = byKey(sessions);
     const w5 = c.windows['5h'], w7 = c.windows['7d'], st = c.settings, rc = st.rate_card ?? {};
     const resets = w5.map((w) => w.reset).filter(Boolean), firstReset = resets.length ? new Date(Math.min(...resets) * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '—';
     const warnings = [...w7.filter((w) => (w.projected_at_reset ?? 0) > 1 - st.weekly_reserve_pct).map((w) => `${w.account} will reach its ${pct(st.weekly_reserve_pct)} weekly reserve before reset at the current rate (${pct(w.projected_at_reset)} projected).`),
       ...w5.filter((w) => (w.util ?? 0) >= st.warn_pct).map((w) => `${w.account} is past the ${pct(st.warn_pct)} warning on its 5-hour window.`)];
     const maxShare = Math.max(0.0001, ...c.per_session.map((s) => s.share ?? 0));
-    const cols = 'grid-template-columns:120px 1fr 80px 100px 100px 90px 120px';
+    const cols = 'grid-template-columns:minmax(0,1.3fr) 1fr 80px 100px 100px 90px 120px';
     const cell = (s) => ui.dollars ? (s.dollars == null ? NA : `$${s.dollars.toFixed(2)}`) : tok(s.switch_overhead || null);
     return head('Cost &amp; budgets', 'On a subscription the currency is window headroom. Dollar equivalents use the rate card you set.',
       `<div class="seg" role="group" aria-label="Units"><button data-act="units" data-v="0" aria-pressed="${!ui.dollars}">Windows</button><button data-act="units" data-v="1" aria-pressed="${ui.dollars}">Dollars (est.)</button></div>`)
@@ -267,7 +276,7 @@ const views = {
       <div class="between"><h2>Where the tokens went — today</h2><span class="small muted">from the session transcripts, not estimates</span></div>
       <div class="table">
         <div class="tr th" style="${cols}"><span>session</span><span>share of window</span><span>turns</span><span>cache read</span><span>cache write</span><span>output</span><span>${ui.dollars ? 'dollars (est.)' : 'switch overhead'}</span></div>
-        ${c.per_session.map((s) => `<div class="tr" style="${cols}"><span title="${esc(s.session_key)}">${short(s.session_key)}</span>${bar([[(s.share ?? 0) / maxShare, '#D97757']])}
+        ${c.per_session.map((s) => `<div class="tr" style="${cols}"><span class="nm">${sname(m, s.session_key)}</span>${bar([[(s.share ?? 0) / maxShare, '#D97757']])}
           <span>${s.turns}</span><span>${tok(s.joined ? s.cache_read : null)}</span><span>${tok(s.joined ? s.cache_create : null)}</span><span>${tok(s.joined ? s.out_tok : null)}</span><span>${cell(s)}</span></div>`).join('')}
         <div class="tr" style="${cols}"><span>${c.one_shots.count} one-shots</span>${bar([[(c.one_shots.share ?? 0) / maxShare, '#A39E93']])}<span>${c.one_shots.count}</span><span>${NA}</span><span>${NA}</span><span>${tok(c.one_shots.out_tok || null)}</span><span>${NA}</span></div>
       </div>

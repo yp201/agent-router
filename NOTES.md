@@ -151,6 +151,9 @@ If the tab errors with a certificate failure, the CLI isn't seeing `NODE_EXTRA_C
   - Subagent transcripts live at `<project>/<session>/subagents/agent-*.jsonl` (hence the recursive watch).
   - Side requests (title generation, suggestions: haiku, 1 message, 0 tools) never get an `assistant` row → stay unjoined ("—" in the UI).
   - Rows carry `entrypoint` (`claude-desktop`/`cli`) and `cwd`; the router fills `sessions.cwd` from `cwd`.
+  - Names: `custom-title` rows (`customTitle`, last wins) → `sessions.title`, else the first `user` row with string content (reminders stripped, 60 chars);
+    rows can precede the router's session row, so titles upsert. `agent-name` rows so far only appear in *main* files (= the session name), not subagent files.
+  - Subagents: parent = the `<session>` dir; name = `agent-name` row, else `description` from the sibling `agent-<id>.meta.json`, else first prompt; their `requestId`s set `requests.agent_id`.
 - **Fingerprint gotchas:** the CLI's first system block is `x-anthropic-billing-header: cc_version=…; cch=…` and changes per request —
   excluded from `system_hash` or every turn would look like a system-prompt change. The first user message is mostly
   `<system-reminder>` blocks; `first_user_hash` hashes the remaining typed text (falls back to all text).

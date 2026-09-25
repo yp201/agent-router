@@ -249,7 +249,7 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
     return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(readFileSync(`${import.meta.dirname}/ui.html`));
   if (m === 'GET' && what === 'health')
     return json(res, 200, { ok: true, transparent: tlsOn, launchd: /agent-router/.test(process.env.XPC_SERVICE_NAME ?? ''), upstream: { host: UP_HOST, port: UP_PORT, ip: await upstreamIp().catch(() => null) }, uptime: process.uptime(),
-      ...one('select (select count(*) from accounts) accounts, (select count(*) from sessions) sessions, (select count(*) from requests) requests, (select count(*) from migrations) migrations') });
+      ...one('select (select count(*) from accounts) accounts, (select count(*) from sessions where account_id is not null) sessions, (select count(*) from requests) requests, (select count(*) from migrations) migrations') });
   if (m === 'GET' && what === 'stats') return json(res, 200, all('select * from requests order by id desc limit 100'));
   if (m === 'GET' && what === 'settings') return json(res, 200, settings());
   if (m === 'PUT' && what === 'settings') {

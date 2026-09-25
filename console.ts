@@ -107,8 +107,11 @@ function sessions() {
   return all(`select s.*, (select coalesce(r.in_tok + r.cache_read + r.cache_create, r.context_est) from requests r
         where r.session_key = s.session_key and r.context_est is not null order by r.ts desc limit 1) context_est,
       (select ua_kind from requests r where r.session_key = s.session_key and ua_kind is not null order by r.ts desc limit 1) source
-    from sessions s order by last_ts desc limit 100`)
-    .map((s) => ({ ...s, project: s.cwd?.split('/').pop() ?? null, switch_cost_est: s.context_est == null ? null : Math.round(s.context_est * 1.25) }));
+    from sessions s where account_id is not null order by last_ts desc limit 100`) // transcript-only rows (a title, never routed) have no pin
+    .map((s) => ({ ...s, title: s.title ?? s.session_key.slice(0, 8), project: s.cwd?.split('/').pop() ?? null,
+      switch_cost_est: s.context_est == null ? null : Math.round(s.context_est * 1.25),
+      agents: all(`select a.agent_id, coalesce(a.name, a.agent_id) name, count(r.id) requests, sum(r.cache_read) cache_read, sum(r.cache_create) cache_create, a.last_ts
+        from agents a left join requests r on r.agent_id = a.agent_id where a.session_key = ? group by a.agent_id order by a.first_ts`, s.session_key) }));
 }
 
 function cache(q: URLSearchParams) {

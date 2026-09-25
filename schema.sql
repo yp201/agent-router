@@ -18,7 +18,8 @@ create table if not exists sessions (
   request_count   integer default 0,
   forced_switches integer default 0,
   last_model      text,
-  cwd             text                      -- from the transcript (P3)
+  cwd             text,                     -- from the transcript (P3)
+  title           text                      -- transcript custom-title, else first typed prompt (60 chars)
 );
 create table if not exists requests (
   id             integer primary key,
@@ -42,7 +43,8 @@ create table if not exists requests (
   first_user_tok integer,             -- its length / 4
   context_est integer,                -- decoded body bytes / 4
   tool_names_json text,               -- tool names only (no schemas), stored the first time a tools_hash is seen
-  ua_kind text                        -- 'desktop' | 'cli' from the inbound user-agent
+  ua_kind text,                       -- 'desktop' | 'cli' from the inbound user-agent
+  agent_id text                       -- subagent that made it (from <session>/subagents/agent-<id>.jsonl); null = the session itself
 );
 create table if not exists migrations (
   ts integer, session_key text, from_account text, to_account text,
@@ -51,6 +53,7 @@ create table if not exists migrations (
   reason text                         -- '429 five_hour' | 'unhealthy: cooling' | 'manual' ...
 );
 create index if not exists requests_session_ts on requests(session_key, ts);
+create table if not exists agents (agent_id text primary key, session_key text, name text, first_ts integer, last_ts integer); -- subagents
 create table if not exists tool_uses (id text primary key, request_id text, name text); -- tool_use blocks from transcripts
 create table if not exists tail_offsets (path text primary key, offset integer);   -- tailer resume points
 create table if not exists settings (key text primary key, value text);             -- JSON values; defaults in ledger.ts

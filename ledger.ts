@@ -7,12 +7,15 @@ db.exec('pragma journal_mode = wal; pragma busy_timeout = 2000'); // UI/tests re
 db.exec(readFileSync(`${dir}/schema.sql`, 'utf8'));
 // `create if not exists` skips tables older ledgers already have; add their missing columns
 const addCol = (t: string, c: string) => {
-  try { db.exec(`alter table ${t} add column ${c}`); } catch (e: any) { if (!/duplicate column/.test(e.message)) throw e; }
+  try { db.exec(`alter table ${t} add column ${c}`); return true; } catch (e: any) { if (!/duplicate column/.test(e.message)) throw e; }
 };
 for (const c of ['config_dir text', 'cooling_reason text', 'last_status integer', 'last_ratelimit_json text', 'last_seen integer', 'needs_login integer default 0'])
   addCol('accounts', c);
 addCol('migrations', 'reason text');
 addCol('sessions', 'cwd text');
+if (addCol('sessions', 'title text')) db.exec('delete from tail_offsets'); // re-read the last 7 days once for titles/subagents; joins are idempotent
+addCol('requests', 'agent_id text');
+db.exec('create index if not exists requests_agent on requests(agent_id)');
 const FP = ['system_hash', 'tools_hash', 'tools_count', 'msg_count', 'first_user_hash', 'first_user_tok', 'context_est', 'tool_names_json', 'ua_kind'];
 for (const c of ['model_from_transcript', ...FP]) addCol('requests', `${c} ${/count|tok|est/.test(c) ? 'integer' : 'text'}`);
 db.exec(`insert or ignore into accounts (id, kind) values ('home', 'home')`);

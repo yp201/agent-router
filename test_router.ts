@@ -432,6 +432,26 @@ test('tailer: joins transcript usage on requestId, records tool_use, persists of
   h.noLeak();
 });
 
+test('session titles + subagents: custom-title over first prompt, project, agent rows nested with joined counts', async (t) => {
+  const proj = mkdtempSync(`${tmpdir()}/router-proj-`);
+  const h = await setup(t, { CLAUDE_PROJECTS_DIR: proj });
+  await h.msg('st'); await h.msg('st'); // req_1 (session), req_2 (its subagent: same metadata session_id)
+  mkdirSync(`${proj}/-tmp-proj-x/st/subagents`, { recursive: true });
+  const f = `${proj}/-tmp-proj-x/st.jsonl`, row = (o: any) => JSON.stringify(o) + '\n';
+  writeFileSync(f, row({ type: 'user', sessionId: 'st', cwd: '/tmp/proj-x', message: { role: 'user', content: '<system-reminder>r</system-reminder>fix the  login\nbug' } })
+    + arow('req_1', { in: 1, read: 100, create: 10 }, undefined, 'st'));
+  const title = async () => (await h.api('sessions')).find((s: any) => s.session_key === 'st')?.title;
+  await until(async () => (await title()) === 'fix the login bug', 'fallback title from first typed prompt');
+  appendFileSync(f, row({ type: 'custom-title', customTitle: 'Login fix', sessionId: 'st' }));
+  writeFileSync(`${proj}/-tmp-proj-x/st/subagents/agent-x.jsonl`, row({ type: 'user', sessionId: 'st', message: { role: 'user', content: 'Investigate the login flow' } })
+    + row({ type: 'agent-name', agentName: 'login-scout', sessionId: 'st' }) + arow('req_2', { in: 5, read: 300, create: 40 }, undefined, 'st'));
+  const s = await until(async () => (await h.api('sessions')).find((s: any) => s.title === 'Login fix' && s.agents[0]?.requests), 'title + agent joined');
+  assert.deepEqual([s.session_key, s.project, s.request_count], ['st', 'proj-x', 2], 'session counts stay totals');
+  assert.deepEqual(s.agents.map(({ last_ts, ...a }: any) => a), [{ agent_id: 'x', name: 'login-scout', requests: 1, cache_read: 300, cache_create: 40 }]);
+  assert.deepEqual((await h.rows('select request_id, agent_id from requests order by id')).map((r) => [r.request_id, r.agent_id]), [['req_1', null], ['req_2', 'x']]);
+  h.noLeak();
+});
+
 test('burst attribution: tool list change on turn 3 (avoidable), idle gap on turn 5 (not)', async (t) => {
   const proj = mkdtempSync(`${tmpdir()}/router-proj-`);
   const h = await setup(t, { CLAUDE_PROJECTS_DIR: proj });

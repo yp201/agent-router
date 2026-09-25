@@ -4,6 +4,9 @@ A local proxy for Claude Code that routes each session to one of several Claude 
 and shows you where your tokens go. Works with the Claude desktop app (transparent mode) and the terminal CLI.
 Zero dependencies: Node 24 + SQLite (built in) + `openssl`.
 
+**Status:** early, macOS first (Linux/Windows via CLI-only mode below). Use it with subscriptions **you own** — it is
+not a way to share one account between people. MIT licensed.
+
 - **Sticky routing.** A session stays on one account (its cache lives there). New sessions start on the account with
   the most headroom. Rate-limited → cooldown, replay on another account, logged.
 - **Ledger.** Every request joined to your session transcripts by request id: cache read/write per turn, bursts and
