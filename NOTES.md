@@ -201,3 +201,30 @@ If the tab errors with a certificate failure, the CLI isn't seeing `NODE_EXTRA_C
 60 s → replayed on acct-b (real API, 200, `retry_of` set) → migration `429`, est 62k → **actual 74 tokens** because
 acct-b had a warm cache for the same prefix from other Haiku sessions within the hour. Prefix caches are per account,
 not per session: the cheapest fallback is the account that recently served the same kind of session (unused signal).
+
+## Proactive switch + notifications (2026-09-26)
+- **Rule** (`router.ts proactive()`, before sending): a `/v1/messages` request whose session is pinned to a healthy A with
+  `uA = max(util_5h, util_7d) >= proactive_switch_pct` (0.95) moves to the healthy B with the lowest `uB`, if `uB <= uA - proactive_min_gain`
+  (0.2). No failed request, no cooldown (A is full, not broken); pin moves, `migrations.reason = proactive: A at NN%`. Unknown
+  utilization = 0; `util()` now reads 0 for a window whose reset has passed (it never expired before), which also fixes stale
+  headers in new-session placement and the Accounts/Cost views. Never under policy `manual`. Subagents share the session key, so
+  they follow the pin. If B then 429s, the replay lands back on A and no migration is logged.
+- **Ping-pong guard:** at most one proactive move per session per 10 min (last `proactive%` migration of that session in the ledger,
+  so it survives restarts).
+- **Notifications** (`advisor.ts notify()`, osascript; off via `settings.notify = false` or `NOTIFY=0`; no-op without `/usr/bin/osascript`;
+  `NOTIFY_LOG=<file>` appends instead, for tests). Every fire also logs `notify: <msg>` to router.log. Fired on: proactive move,
+  forced 429/529/401 replay (`home rate-limited — replayed ‘title’ on acct-b, home cools for 60 s`), unhealthy pinned account,
+  context advice (existing), and the first time an account's window crosses `warn_pct`: one per account per window instance, keyed
+  by the window's reset in `accounts.warned_5h / warned_7d`, so restarts don't repeat it. Manual pins don't notify (you did it).
+- **Drill hooks** exist only with `DRILLS=1` in the router's env (404 otherwise): `fault429` and
+  `POST /router/accounts/:id/fake-util {util_5h?, util_7d?, reset_in_s? = 3600}`, which merges synthetic `…-{5h,7d}-utilization/-reset`,
+  `-5h-status: allowed`, `-status: allowed` into `last_ratelimit_json` (logged as `DRILL fake-util …`); the account's next real
+  response overwrites it. `AGENT_ROUTER_DRILLS=1 ./agent-router.sh restart` writes `DRILLS` into the plist; a plain restart drops it.
+- **Drill recipe:** `AGENT_ROUTER_DRILLS=1 ./agent-router.sh restart`; fresh `claude -p … --model haiku` (note: `~/.claude/settings.json`
+  env beats the process env, so a dev router on another port needs `--settings '{"env":{"ANTHROPIC_BASE_URL":…}}'`); find its key/account
+  in `/router/sessions`; `fake-util` A to 0.96 both windows; `claude -p --resume <key> …`; check ledger rows, `migrations`, the pin and
+  `grep notify: ~/.agent-router/router.log`. Faking A moves *every* session pinned to A on its next request, not only the drill session.
+- **Live drill (2026-09-26), policy `manual`, acct-b/raymond paused:** fresh session → home; fake-util home 0.96/0.96 → `notify: home at 96%
+  of its 5h window, resets Sat 03:18`; resumed turn stayed on home (manual never moves), no migration; home's next real response put it
+  back at 39%/16%. The proactive move itself is covered by the fake-upstream test only until a drill runs with a non-manual policy.
+

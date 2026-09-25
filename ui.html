@@ -243,7 +243,7 @@ const views = {
       <div class="table">
         <div class="tr th" style="${MC}"><span>time</span><span>session</span><span>from → to</span><span>reason</span><span>cost est → actual</span></div>
         ${migs.slice(0, 20).map((g) => `<div class="tr" style="${MC}"><span class="muted">${new Date(g.ts).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</span>
-          <span class="nm">${sname(byKey(sessions), g.session_key)}</span><span>${esc(g.from_account ?? '—')} → ${esc(g.to_account)}</span><span class="nm">${esc(g.reason)}</span>
+          <span class="nm">${sname(byKey(sessions), g.session_key)}</span><span>${esc(g.from_account ?? '—')} → ${esc(g.to_account)}</span><span class="nm ${/^proactive/.test(g.reason) ? 'amber' : /^(429|529)/.test(g.reason) ? 'clay' : g.reason === 'manual' ? 'muted' : ''}">${esc(g.reason)}</span>
           <span>${g.est_cost_tokens == null ? NA : '≈' + tok(g.est_cost_tokens)} → ${g.actual_cost_tokens == null ? NA : `<span class="clay">${tok(g.actual_cost_tokens)}</span>`}</span></div>`).join('') || '<div class="note">No switches yet.</div>'}
       </div>
     </section>`],
@@ -311,8 +311,10 @@ const views = {
       </div>
       <form class="panel" id="budgets">
         <h2>Budgets &amp; alerts</h2>
-        ${[['warn_pct', 'Warn me when any account passes'], ['route_cutoff_pct', 'Stop starting new sessions on an account above'], ['weekly_reserve_pct', 'Reserve for the weekly window']].map(([k, l]) =>
+        ${[['warn_pct', 'Warn me when any account passes'], ['route_cutoff_pct', 'Stop starting new sessions on an account above'], ['weekly_reserve_pct', 'Reserve for the weekly window'],
+          ['proactive_switch_pct', 'Move a pinned session off an account above'], ['proactive_min_gain', '…to one with at least this much more headroom']].map(([k, l]) =>
           `<label class="between"><span>${l}</span><span class="row"><input type="number" min="0" max="100" step="1" name="${k}" value="${Math.round(st[k] * 100)}">%</span></label>`).join('')}
+        <label class="row"><input type="checkbox" name="notify" ${st.notify ? 'checked' : ''}><span>macOS notification on every account switch and warning</span></label>
         <details ${ui.open.rate ? 'open' : ''} data-k="rate"><summary>Rate card for dollar estimates (${Object.keys(rc).length ? Object.keys(rc).length + ' models' : 'not set'})</summary>
           <div class="col" style="gap:8px;margin-top:8px">
             ${Object.entries(rc).map(([m, r]) => `<div class="between small mono"><span>${esc(m)}: in ${r.input} · out ${r.output} · read ${r.cache_read} · write ${r.cache_write} $/Mtok</span><button type="button" class="sm" data-act="rate-del" data-m="${esc(m)}">Remove</button></div>`).join('')}
@@ -453,7 +455,8 @@ document.addEventListener('change', (e) => {
   if (d.act === 'cache-session') { ui.cacheSession = t.value; refresh(true); }
   if (d.act === 'cache-days') { ui.cacheDays = Number(t.value); refresh(true); }
   if (t.name === 'policy') putSettings({ policy: t.value });
-  if (t.closest('#budgets') && /_pct$/.test(t.name)) {
+  if (t.name === 'notify') putSettings({ notify: t.checked });
+  if (t.closest('#budgets') && /_pct$|_gain$/.test(t.name)) {
     const v = Number(t.value);
     if (v >= 0 && v <= 100) putSettings({ [t.name]: v / 100 }); else alert('Enter 0–100');
   }

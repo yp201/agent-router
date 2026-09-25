@@ -21,7 +21,8 @@ db.exec(readFileSync(`${dir}/schema.sql`, 'utf8'));
 const addCol = (t: string, c: string) => {
   try { db.exec(`alter table ${t} add column ${c}`); return true; } catch (e: any) { if (!/duplicate column/.test(e.message)) throw e; }
 };
-for (const c of ['config_dir text', 'cooling_reason text', 'last_status integer', 'last_ratelimit_json text', 'last_seen integer', 'needs_login integer default 0'])
+for (const c of ['config_dir text', 'cooling_reason text', 'last_status integer', 'last_ratelimit_json text', 'last_seen integer', 'needs_login integer default 0',
+  'warned_5h integer', 'warned_7d integer']) // warned_*: reset (epoch s) of the window last notified past warn_pct
   addCol('accounts', c);
 addCol('migrations', 'reason text');
 const added = addCol('migrations', 'actual_cost_tokens integer'); addCol('migrations', 'actual_request_id text');
@@ -48,6 +49,7 @@ export const logRequest = (row: Record<string, string | number | null>) =>
 // Settings: JSON per key, defaults here. Unknown keys are rejected by the PUT handler.
 export const DEFAULTS: Record<string, any> = {
   warn_pct: 0.8, route_cutoff_pct: 0.9, weekly_reserve_pct: 0.2,
+  proactive_switch_pct: 0.95, proactive_min_gain: 0.2, notify: true, // move a pinned session off an account this full, to one this much emptier
   policy: 'sticky_least_utilized', // | 'prefer_home_until_80' | 'manual'
   rate_card: {},                   // { [model]: { input, output, cache_read, cache_write } } in $/Mtok
   context_rules: [

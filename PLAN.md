@@ -176,6 +176,10 @@ the ledger can't compute a number yet (dollars without a rate card, weekly-windo
 first joined turn after a switch; `/router/sessions/:key/timeline` + lane SVG in Sessions; `advisor.ts` (warn/urgent advice with a
 transcript breakdown + Haiku via `claude -p`, handoff summaries, `/router/advice`). 17/17 tests. See NOTES.md "Advisor".
 
+**Status (2026-09-26): ✅ proactive switch + notifications** — pinned sessions leave an account past `proactive_switch_pct` (0.95) for one
+`proactive_min_gain` (0.2) emptier, before sending, max once per 10 min; osascript notification on every switch and on each warn_pct
+crossing (once per window); `fake-util`/`fault429` drill hooks behind `DRILLS=1`. 19/19 tests. See NOTES.md "Proactive switch".
+
 ### P5 — remote / shared pool
 Same binary, `--listen 0.0.0.0 --require-key`. Adds:
 - `users` table (id, key_hash, quota_tokens_per_day, pool_id); requests get `user_id`.

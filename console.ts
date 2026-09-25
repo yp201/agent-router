@@ -6,8 +6,12 @@ const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
 const MSG = (t = '') => `(${t}path = '/v1/messages' or ${t}path like '/v1/messages?%')`;
 const RL = 'anthropic-ratelimit-unified-';
+// a window whose reset has passed reads 0 utilization (headers are only refreshed by the next response)
 export const util = (json: string | null, w: '5h' | '7d', k = 'utilization'): number | null => {
-  try { const v = JSON.parse(json ?? '{}')[`${RL}${w}-${k}`]; return v == null ? null : Number(v); } catch { return null; }
+  try {
+    const r = JSON.parse(json ?? '{}'), v = r[`${RL}${w}-${k}`], reset = Number(r[`${RL}${w}-reset`]);
+    return v == null ? null : k === 'utilization' && reset * 1000 < Date.now() ? 0 : Number(v);
+  } catch { return null; }
 };
 const today = () => new Date().setHours(0, 0, 0, 0);
 const sum = (rows: any[], f: (r: any) => number) => rows.reduce((a, r) => a + (f(r) || 0), 0);

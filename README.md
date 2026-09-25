@@ -10,7 +10,8 @@ Zero dependencies: Node 24 + SQLite (built in) + `openssl`.
 not a way to share one account between people. MIT licensed.
 
 - **Sticky routing.** A session stays on one account (its cache lives there). New sessions start on the account with
-  the most headroom. Rate-limited → cooldown, replay on another account, logged.
+  the most headroom. Rate-limited → cooldown, replay on another account, logged. A session whose account passes 95% of a
+  window moves to one with more headroom *before* it gets rate-limited, and every switch posts a macOS notification.
 - **Ledger.** Every request joined to your session transcripts by request id: cache read/write per turn, bursts and
   why they happened, per-window headroom, per-session cost.
 - **Console** at `http://localhost:4001/router/`: accounts, sessions (switch with one click), cache manager, budgets, insights.

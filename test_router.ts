@@ -126,7 +126,7 @@ const WHO: Record<string, string> = { 'Bearer tok-home-fake': 'home', 'Bearer to
 async function setup(t: TestContext, env: Record<string, string> = {}) {
   const s = {
     seen: [] as { who: string; xkey?: string; body: string; enc?: string }[],
-    util: {} as Record<string, number>, fail: {} as Record<string, number>,
+    util: {} as Record<string, number>, util7: {} as Record<string, number>, fail: {} as Record<string, number>,
     refreshes: [] as any[], refreshStatus: 200, n: 0,
   };
   const handler = (req: IncomingMessage, res: ServerResponse) => {
@@ -139,7 +139,8 @@ async function setup(t: TestContext, env: Record<string, string> = {}) {
       }
       const who = WHO[req.headers.authorization ?? ''] ?? 'unknown';
       s.seen.push({ who, xkey: req.headers['x-api-key'] as string, body, enc: req.headers['content-encoding'] as string });
-      const h = { 'content-type': 'application/json', 'request-id': `req_${++s.n}`, 'anthropic-ratelimit-unified-5h-utilization': String(s.util[who] ?? 0), 'anthropic-ratelimit-unified-5h-status': 'allowed' };
+      const h = { 'content-type': 'application/json', 'request-id': `req_${++s.n}`, 'anthropic-ratelimit-unified-5h-utilization': String(s.util[who] ?? 0), 'anthropic-ratelimit-unified-5h-status': 'allowed',
+        ...(who in s.util7 && { 'anthropic-ratelimit-unified-7d-utilization': String(s.util7[who]) }) };
       if (s.fail[who] > 0) {
         s.fail[who]--;
         return res.writeHead(429, { ...h, 'retry-after': '1', 'anthropic-ratelimit-unified-representative-claim': 'five_hour' }).end('{"type":"error","error":{"type":"rate_limit_error"}}');
@@ -303,6 +304,7 @@ test('management API: add, disable, manual pin, remove, UI', async (t) => {
   assert.deepEqual([m.session_key, m.from_account, m.to_account], ['s1', 'home', 'acct-b']);
 
   assert.equal((await h.api('accounts/home/remove', {})).error.type, 'cannot_remove_home');
+  for (const d of ['fault429', 'fake-util']) assert.equal((await fetch(`${h.base}/router/accounts/home/${d}`, { method: 'POST', body: '{}' })).status, 404, `${d} needs DRILLS=1`);
   assert.equal((await h.api('accounts/acct-b/remove', {})).ok, true);
   assert.equal((await h.msg('s1')).who, 'home', 'pin to a removed account falls back');
   assert.match((await h.rows(`select reason from migrations order by ts desc limit 1`))[0].reason, /removed/);
@@ -601,6 +603,44 @@ test('context advisor: breakdown + fake Haiku on warn, no repeat, urgent, handof
   assert.equal((await h.api('health')).claude_bin, bin);
   const dir = dirname(h.ledger);
   assert.ok(!readdirSync(dir).map((x) => readFileSync(`${dir}/${x}`, 'latin1')).join('').includes('TOOL-OUTPUT'), 'tool_result content stored');
+  h.noLeak();
+});
+
+test('proactive switch before a pinned account fills up; notifications once per switch / warn window; fake-util drill hook', async (t) => {
+  const log = `${mkdtempSync(`${tmpdir()}/router-notify-`)}/notify.log`;
+  const h = await setup(t, { DRILLS: '1', NOTIFY: '0', NOTIFY_LOG: log });
+  const notes = () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []);
+  const put = (b: unknown) => fetch(`${h.base}/router/settings`, { method: 'PUT', body: JSON.stringify(b) });
+  await h.addAcct('acct-b', 'tok-b-fake');
+  h.s.util = h.s.util7 = { home: 0.96, 'acct-b': 0.1 };
+  await h.api('sessions/s0/pin', { account_id: 'acct-b' }); await h.msg('s0'); // acct-b now reads 10%
+  await h.api('accounts/acct-b/pause', {});
+  assert.equal((await h.msg('s1')).who, 'home'); // home now reads 96% on both windows
+  assert.equal((await h.msg('s2')).who, 'home', 'only healthy account');
+  assert.deepEqual(notes(), ['home at 96% of its 5h window'], 'warn crossing: one notification per window, not per response');
+  await h.api('accounts/acct-b/resume', {});
+  await put({ proactive_min_gain: 0.95 });
+  assert.equal((await h.msg('s1')).who, 'home', 'acct-b is not 95 points emptier');
+  await put({ proactive_min_gain: 0.2, policy: 'manual' });
+  assert.equal((await h.msg('s1')).who, 'home', 'manual policy never moves a session');
+  await put({ policy: 'sticky_least_utilized' });
+  assert.equal((await h.msg('s1')).who, 'acct-b', 'moved before sending');
+  const [m, ...more] = await h.rows(`select * from migrations where session_key = 's1'`);
+  assert.deepEqual([m.session_key, m.from_account, m.to_account, m.reason, more.length], ['s1', 'home', 'acct-b', 'proactive: home at 96%', 0]);
+  assert.equal((await h.rows('select * from requests where status >= 400')).length, 0, 'no failed request, no 429 row');
+  assert.equal((await h.rows(`select cooling_until from accounts where id = 'home'`))[0].cooling_until, null, 'home is full, not broken: no cooldown');
+  await new Promise((ok) => setTimeout(ok, 1000));
+  // a subagent shares the parent's session key (different first message) -> follows the pin
+  assert.equal((await h.msg('s1', { messages: [{ role: 'user', content: 'subagent task' }] })).who, 'acct-b', 'stays on acct-b');
+  assert.deepEqual(notes(), ['home at 96% of its 5h window', 'home is at 96% of its 5h window — moved ‘s1’ to acct-b']);
+  // fake-util: synthetic headers every reader sees; ping-pong guard holds s1 on acct-b for 10 min; the next real response overwrites
+  const f = await h.api('accounts/acct-b/fake-util', { util_5h: 0.97, reset_in_s: 3600 });
+  assert.equal(f.ratelimit['anthropic-ratelimit-unified-5h-status'], 'allowed');
+  assert.equal((await h.api('accounts')).find((a: any) => a.id === 'acct-b').util_5h, 0.97);
+  await h.api('accounts/home/fake-util', { util_5h: 0.1, util_7d: 0.1 });
+  assert.equal((await h.msg('s1')).who, 'acct-b', 'one proactive move per session per 10 min');
+  assert.equal((await h.api('accounts')).find((a: any) => a.id === 'acct-b').util_5h, 0.1, 'real response overwrote the fake');
+  assert.equal(notes().length, 3); assert.match(notes()[2], /^acct-b at 97% of its 5h window, resets \w{3} \d\d:\d\d$/);
   h.noLeak();
 });
 

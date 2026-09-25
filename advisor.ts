@@ -1,7 +1,7 @@
 // Context advisor: when a session's context first crosses warn/urgent of its window, break down what fills it (names, targets,
 // sizes from the local transcript, never tool output) and ask Haiku, via the user's own `claude -p`, what to do about it.
 import { execFile, execFileSync } from 'node:child_process';
-import { createReadStream } from 'node:fs';
+import { createReadStream, appendFileSync, existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { homedir, tmpdir } from 'node:os';
 import { db, settings } from './ledger.ts';
@@ -79,10 +79,16 @@ const ADVISE = (pct: number, w: number) => `You are advising a developer whose C
 const HANDOFF = 'Summarize this session for a fresh session that will continue the work. Include: the goal, what\'s done (with file paths), what\'s in progress, decisions made and why, open questions, and the exact next step. Omit exploration that led nowhere. Under 800 tokens.';
 const ins = db.prepare(`insert into advice (session_key, ts, level, pct, context_total, window, breakdown_json, text, model, request_id)
   values (:sk, :ts, :level, :pct, :ctx, :w, :b, :text, :model, :rid)`);
-const title = (sk: string) => one('select title from sessions where session_key = ?', sk)?.title ?? sk.slice(0, 8);
+export const title = (sk: string) => one('select title from sessions where session_key = ?', sk)?.title ?? sk.slice(0, 8);
 const q = (s: string) => s.replace(/["\\]/g, '\\$&');
-const notify = (msg: string) => process.env.NOTIFY !== '0' && process.platform === 'darwin' &&
-  execFile('osascript', ['-e', `display notification "${q(msg)}" with title "agent-router"`], () => {});
+// macOS notification. Off with settings.notify = false or NOTIFY=0; NOTIFY_LOG=<file> appends instead (tests); no osascript (Linux) = no-op.
+export function notify(msg: string) {
+  if (!settings().notify) return;
+  console.log(`notify: ${msg}`);
+  if (process.env.NOTIFY_LOG) return appendFileSync(process.env.NOTIFY_LOG, msg + '\n');
+  if (process.env.NOTIFY !== '0' && existsSync('/usr/bin/osascript'))
+    execFile('/usr/bin/osascript', ['-e', `display notification "${q(msg)}" with title "agent-router"`], () => {});
+}
 
 const busy = new Set<string>();
 // Tailer hook, after each usage join. Main thread only (subagents have their own, smaller context); live rows only, so a first

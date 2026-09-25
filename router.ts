@@ -12,7 +12,7 @@ import { resolve } from 'node:path';
 import { db, logRequest, settings, putSetting, DEFAULTS } from './ledger.ts';
 import { startTailer, joined } from './tailer.ts';
 import { consoleApi, util, timeline, advice } from './console.ts';
-import { CLAUDE_BIN, handoff } from './advisor.ts';
+import { CLAUDE_BIN, handoff, notify, title } from './advisor.ts';
 import { type Account, listAccounts, getAccount, setAcct, healthy, token, forget, expiresAt } from './accounts.ts';
 
 const { UPSTREAM_IP, UPSTREAM_CA, TLS_DIR = `${homedir()}/.agent-router/ca` } = process.env;
@@ -109,6 +109,27 @@ export function newSession(ok: Account[]): { a?: Account; why: string } {
   const a = pool.sort((x, y) => util5h(x) - util5h(y) || Number(y.kind === 'home') - Number(x.kind === 'home'))[0];
   return { a, why: a ? `lowest 5h utilization (${pct(a)})${skipped}` : 'no healthy account' };
 }
+// Proactive switch: the session's pinned account is past proactive_switch_pct on either window and a healthy account has
+// proactive_min_gain more headroom -> move before sending (no failed request, no cooldown). One move per session per 10 min.
+const uOf = (a: Account) => Math.max(util(a.last_ratelimit_json, '5h') ?? 0, util(a.last_ratelimit_json, '7d') ?? 0);
+function proactive(a: Account, key: string) {
+  const st = settings(), u = uOf(a);
+  if (st.policy === 'manual' || u < st.proactive_switch_pct) return;
+  if (one(`select 1 from migrations where session_key = ? and reason like 'proactive%' and ts > ?`, key, Date.now() - 10 * 60_000)) return;
+  const b = listAccounts().filter((x) => x.id !== a.id && healthy(x) && uOf(x) <= u - st.proactive_min_gain).sort((x, y) => uOf(x) - uOf(y))[0];
+  const w = (util(a.last_ratelimit_json, '7d') ?? 0) > (util(a.last_ratelimit_json, '5h') ?? 0) ? '7d' : '5h', p = Math.round(u * 100);
+  return b && { b, why: `proactive: ${a.id} at ${p}%`, note: `${a.id} is at ${p}% of its ${w} window — moved ‘${title(key)}’ to ${b.id}` };
+}
+// First time an account's window crosses warn_pct: one notification per window (keyed by its reset, persisted so restarts don't repeat).
+function warnCheck(id: string, j: string) {
+  const warn = settings().warn_pct;
+  const hit = (['5h', '7d'] as const).map((w) => ({ w, u: util(j, w) ?? 0, reset: util(j, w, 'reset') ?? 0 }))
+    .filter((x) => x.u >= warn && db.prepare(`update accounts set warned_${x.w} = ? where id = ? and warned_${x.w} is not ?`).run(x.reset, id, x.reset).changes)
+    .sort((x, y) => y.u - x.u)[0];
+  if (hit) notify(`${id} at ${Math.round(hit.u * 100)}% of its ${hit.w} window${hit.reset ? `, resets ${new Date(hit.reset * 1000)
+    .toLocaleString('en-US', { weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false })}` : ''}`);
+}
+
 // pick + token; an oauth account whose token can't be loaded is skipped for this request
 async function choose(key: string | null, nonMsg: boolean, exclude: string[] = []) {
   for (let a; (a = pick(key, exclude, nonMsg)); exclude.push(a.id)) {
@@ -117,8 +138,10 @@ async function choose(key: string | null, nonMsg: boolean, exclude: string[] = [
   }
 }
 
-// fault injection for live drills: POST /router/accounts/:id/fault429 {count} → the next N /v1/messages on that account are
-// treated as an upstream 429 (retry-after 60) without dialing, so cooldown + replay run against the real API elsewhere
+// Live drills (only with DRILLS=1, else 404): POST /router/accounts/:id/fault429 {count} → the next N /v1/messages on that account are
+// treated as an upstream 429 (retry-after 60) without dialing, so cooldown + replay run against the real API elsewhere.
+// POST /router/accounts/:id/fake-util {util_5h?, util_7d?, reset_in_s?} writes synthetic ratelimit headers; the next real response overwrites them.
+const DRILLS = process.env.DRILLS === '1';
 const faults: Record<string, number> = {};
 const forced = (status: number, a: Account) => status === 429 || status === 529 || (status === 401 && a.kind === 'oauth');
 function cool(a: Account, up: IncomingMessage) {
@@ -189,6 +212,9 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   const pinned = isMsg ? pinOf(key) : undefined;
   let from = pinned && pinned !== c.a.id ? pinned : null;
   let reason = from ? `unhealthy: ${statusOf(getAccount(from))}` : null;
+  let note = from && `${from} is ${statusOf(getAccount(from))} — moved ‘${title(key!)}’ to ${c.a.id}`;
+  const p = key && pinned === c.a.id ? proactive(c.a, key) : undefined;
+  if (p) try { c = { a: p.b, tok: p.b.kind === 'oauth' ? (await token(p.b)).accessToken : null }; [from, reason, note] = [pinned!, p.why, p.note]; } catch {}
 
   const send = async ({ a, tok }: { a: Account; tok: string | null }) => {
     const h = { ...headers };
@@ -204,6 +230,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const s = JSON.stringify(r);
     db.prepare(`update accounts set last_status = ?, last_seen = ?, last_ratelimit_json = case when ? = '{}' then last_ratelimit_json else ? end where id = ?`)
       .run(up.statusCode!, Date.now(), s, s, a.id);
+    if (s !== '{}') warnCheck(a.id, s);
     return { up, rl: s, rid: (up.headers['request-id'] as string) ?? null, why: isMsg && forced(up.statusCode!, a) ? cool(a, up) : null };
   };
 
@@ -215,16 +242,20 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     if (next) {
       r.up.resume(); // drain so the keep-alive socket is reused
       retryOf = log(c.a.id, r.up.statusCode!, r.rid, r.rl, null);
-      if (!from) { from = c.a.id; reason = r.why; }
+      if (!from) {
+        [from, reason] = [c.a.id, r.why];
+        note = `${from} ${/^401/.test(r.why!) ? 'needs login' : 'rate-limited'} — replayed ‘${title(key!)}’ on ${next.a.id}, ${from} cools for ${Math.round((getAccount(from)!.cooling_until! - Date.now()) / 1000)} s`;
+      }
       c = next;
       r = await send(c);
     }
     ({ up: { statusCode: status = 502 }, rid: requestId, rl: ratelimit } = r);
+    if (from === c.a.id) from = null; // a proactive target that 429'd replayed back on the pinned account: no move
     if (isMsg && key) { // persist the pin before the client sees the response
       db.prepare(`insert into sessions (session_key, account_id, created_ts, last_ts, request_count, forced_switches, last_model) values (:key, :acct, :ts, :ts, 1, :sw, :model) on conflict (session_key) do update set
         account_id = :acct, last_ts = :ts, request_count = request_count + 1, forced_switches = forced_switches + :sw, last_model = coalesce(:model, last_model)`)
         .run({ key, acct: c.a.id, ts: start, sw: from ? 1 : 0, model });
-      if (from) migrate(start, key, from, c.a.id, est, requestId, reason);
+      if (from) { migrate(start, key, from, c.a.id, est, requestId, reason); notify(note!); }
     }
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(r.up.headers)) if (!SKIP_RES.has(k)) out[k] = v;
@@ -242,7 +273,7 @@ const accountsView = () => {
   const today = new Date().setHours(0, 0, 0, 0);
   return listAccounts().map((a) => {
     const r = rl(a);
-    return { ...a, status: statusOf(a), util_5h: num(r[`${RL}5h-utilization`]), util_7d: num(r[`${RL}7d-utilization`]),
+    return { ...a, status: statusOf(a), util_5h: util(a.last_ratelimit_json, '5h'), util_7d: util(a.last_ratelimit_json, '7d'),
       reset_5h: num(r[`${RL}5h-reset`]), reset_7d: num(r[`${RL}7d-reset`]), token_expires_at: expiresAt(a.id),
       pinned_sessions: one('select count(*) n from sessions where account_id = ?', a.id).n,
       requests_today: one(`select count(*) n from requests where account_id = ? and ts >= ? and (path = '/v1/messages' or path like '/v1/messages?%')`, a.id, today).n };
@@ -300,10 +331,19 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
   }
   if (m === 'POST' && what === 'accounts' && action) {
     const a = getAccount(id);
-    if (!a) return json(res, 404, { error: { type: 'not_found' } });
+    if (!a || (!DRILLS && /^(fault429|fake-util)$/.test(action))) return json(res, 404, { error: { type: 'not_found' } });
     if (['disable', 'enable', 'pause', 'resume'].includes(action)) setAcct(id, { disabled: action === 'disable' || action === 'pause' ? 1 : 0 });
     else if (action === 'clear-cooldown') setAcct(id, { cooling_until: null, cooling_reason: null });
-    else if (action === 'fault429') { faults[id] = Math.max(0, Number(input?.count ?? 1)); console.warn(`fault429 armed: ${id} × ${faults[id]}`); return json(res, 200, { ok: true, pending: faults[id] }); }
+    else if (action === 'fault429') { faults[id] = Math.max(0, Number(input?.count ?? 1)); console.warn(`DRILL fault429 armed: ${id} × ${faults[id]}`); return json(res, 200, { ok: true, pending: faults[id] }); }
+    else if (action === 'fake-util') {
+      const r = rl(a), reset = String(Math.round(now / 1000 + Number(input.reset_in_s ?? 3600)));
+      for (const w of ['5h', '7d']) if (input[`util_${w}`] != null) Object.assign(r, { [`${RL}${w}-utilization`]: String(Number(input[`util_${w}`])), [`${RL}${w}-reset`]: reset });
+      const j = JSON.stringify(Object.assign(r, { [`${RL}5h-status`]: 'allowed', [`${RL}status`]: 'allowed' }));
+      setAcct(id, { last_ratelimit_json: j });
+      console.warn(`DRILL fake-util ${id}: ${j} (synthetic until its next real response)`);
+      warnCheck(id, j);
+      return json(res, 200, { ok: true, ratelimit: r });
+    }
     else if (action === 'remove') {
       if (a.kind === 'home') return json(res, 400, { error: { type: 'cannot_remove_home' } });
       db.prepare('delete from accounts where id = ?').run(id);

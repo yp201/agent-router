@@ -2,6 +2,7 @@
 # agent-router transparent mode: local CA + api.anthropic.com leaf + LaunchAgent plist.
 # Never runs sudo; prints the commands that need it. Idempotent: certs are kept, the plist is rewritten only if it would change.
 # `setup.sh --into DIR [--host NAME]` only makes the certs (the test uses this).
+# AGENT_ROUTER_DRILLS=1 at setup/restart time adds DRILLS=1 to the plist (fault429 / fake-util endpoints); any later run without it drops it.
 set -euo pipefail
 DIR=~/.agent-router/ca HOST=api.anthropic.com CERTS_ONLY=
 while [ $# -gt 0 ]; do case $1 in
@@ -45,7 +46,7 @@ NEW=$(cat <<PL
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$HOME/.agent-router/router.log</string>
   <key>StandardErrorPath</key><string>$HOME/.agent-router/router.log</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$(dirname "$NODE"):/usr/bin:/bin</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$(dirname "$NODE"):/usr/bin:/bin</string>$([ "${AGENT_ROUTER_DRILLS:-}" = 1 ] && printf '<key>DRILLS</key><string>1</string>')</dict>
 </dict></plist>
 PL
 )
