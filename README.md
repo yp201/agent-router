@@ -15,15 +15,19 @@ not a way to share one account between people. MIT licensed.
 
 ## Setup (macOS)
 
+**Homebrew** (run `brew update` first if your Homebrew is older than 4.x):
+
 ```bash
 brew tap yp201/tap && brew install agent-router && brew services start agent-router && agent-router install
 ```
 
-Or from source:
+**Plain Node** (any Node 24+, no Homebrew):
 
 ```bash
 git clone https://github.com/yp201/agent-router.git && cd agent-router && ./agent-router.sh install
 ```
+
+Both do the same thing; pick whichever you prefer. Upgrading: `brew upgrade agent-router` or `git pull && ./agent-router.sh restart`. Releases: `docs/RELEASING.md`.
 
 It checks for Node 24, generates a local CA, asks for `sudo` twice (trust the CA, point `api.anthropic.com` at this
 machine), registers the router with launchd so it's always on, and health-checks itself. Then **quit and reopen the

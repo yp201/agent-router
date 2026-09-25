@@ -396,8 +396,11 @@ async function refresh(force) {
       <div>${h.launchd ? 'launchd' : 'manual run'} · up ${dur(h.uptime)}</div><div class="mono">${h.transparent ? 'api.anthropic.com → 127.0.0.1' : 'explicit :4001 only'}</div>
       <div>${h.requests.toLocaleString()} requests · ${h.sessions} sessions</div>`;
     // never yank a control out from under the user; the next tick catches up
-    const f = document.activeElement;
-    if (!force && f && $('#main').contains(f) && /^(INPUT|SELECT|TEXTAREA)$/.test(f.tagName)) return;
+    const f = document.activeElement, main = $('#main');
+    // never yank a control out from under the user: focus anywhere in a form (buttons included) or a half-typed
+    // field means the poll waits; clicking Create used to move focus to the button and get the form re-rendered away
+    const dirty = [...main.querySelectorAll('input, textarea')].some((i) => i.type !== 'radio' && i.type !== 'checkbox' && i.value !== i.defaultValue);
+    if (!force && ((f && main.contains(f) && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(f.tagName)) || dirty)) return;
     $('#main').innerHTML = render(...data);
     document.title = `agent-router`;
   } catch (e) {
@@ -457,13 +460,13 @@ document.addEventListener('change', (e) => {
 document.addEventListener('toggle', (e) => { if (e.target.dataset?.k) ui.open[e.target.dataset.k] = e.target.open; }, true);
 document.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const f = new FormData(e.target);
-  if (e.target.id === 'add') {
+  const f = new FormData(e.target), fid = e.target.getAttribute('id'); // form.id is shadowed by the <input name="id"> inside #add
+  if (fid === 'add') {
     const id = String(f.get('id')).trim(), r = await act('accounts', { id });
     if (r.login_cmd) { ui.added = { id, login_cmd: r.login_cmd }; refresh(true); }
   }
-  if (e.target.id === 'rule-add') putSettings({ context_rules: [...S.context_rules, { id: `r${Date.now()}`, text: String(f.get('text')), enabled: true, state: 'proposed' }] });
-  if (e.target.id === 'ov') putSettings({ openvikings_endpoint: String(f.get('endpoint')).trim() || null });
+  if (fid === 'rule-add') putSettings({ context_rules: [...S.context_rules, { id: `r${Date.now()}`, text: String(f.get('text')), enabled: true, state: 'proposed' }] });
+  if (fid === 'ov') putSettings({ openvikings_endpoint: String(f.get('endpoint')).trim() || null });
 });
 addEventListener('hashchange', () => refresh(true));
 refresh(true);

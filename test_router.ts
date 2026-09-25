@@ -603,3 +603,7 @@ test('context advisor: breakdown + fake Haiku on warn, no repeat, urgent, handof
   assert.ok(!readdirSync(dir).map((x) => readFileSync(`${dir}/${x}`, 'latin1')).join('').includes('TOOL-OUTPUT'), 'tool_result content stored');
   h.noLeak();
 });
+
+test('ui.html never reads form.id (shadowed by <input name="id">)', () => {
+  assert.ok(!readFileSync(new URL('./ui.html', import.meta.url), 'utf8').includes('e.target.id ==='), 'form.id is shadowed by <input name="id">; use getAttribute'); // regression: Add account did nothing
+});

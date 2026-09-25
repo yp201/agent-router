@@ -256,7 +256,7 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
   let input: any = {};
   try { input = JSON.parse(body.toString() || '{}'); } catch {}
   if (m === 'GET' && (what === '' || what === 'ui'))
-    return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(readFileSync(`${import.meta.dirname}/ui.html`));
+    return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(readFileSync(`${import.meta.dirname}/ui.html`));
   if (m === 'GET' && what === 'health')
     return json(res, 200, { ok: true, transparent: tlsOn, launchd: /agent-router/.test(process.env.XPC_SERVICE_NAME ?? ''), upstream: { host: UP_HOST, port: UP_PORT, ip: await upstreamIp().catch(() => null) }, uptime: process.uptime(), claude_bin: CLAUDE_BIN,
       ...one('select (select count(*) from accounts) accounts, (select count(*) from sessions where account_id is not null) sessions, (select count(*) from requests) requests, (select count(*) from migrations) migrations') });

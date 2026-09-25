@@ -13,12 +13,12 @@ class AgentRouter < Formula
   def install
     libexec.install Dir["*"]
     # `agent-router` on PATH → the control script; node from Homebrew is first on PATH for it
-    (bin/"agent-router").write_env_script libexec/"agent-router.sh", PATH: "#{formula_opt_bin("node")}:$PATH"
+    (bin/"agent-router").write_env_script libexec/"agent-router.sh", PATH: "#{Formula["node"].opt_bin}:$PATH"
   end
 
   # `brew services start agent-router` = the launchd job (KeepAlive, log under brew's var/log)
   service do
-    run [formula_opt_bin("node")/"node", opt_libexec/"router.ts"]
+    run [Formula["node"].opt_bin/"node", opt_libexec/"router.ts"]
     keep_alive true
     working_dir opt_libexec
     log_path var/"log/agent-router.log"
