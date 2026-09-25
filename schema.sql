@@ -50,11 +50,16 @@ create table if not exists migrations (
   ts integer, session_key text, from_account text, to_account text,
   est_cost_tokens integer,            -- ESTIMATE: request body bytes / 4; P3 replaces with transcript cache_creation
   request_id text,
-  reason text                         -- '429 five_hour' | 'unhealthy: cooling' | 'manual' ...
+  reason text,                        -- '429 five_hour' | 'unhealthy: cooling' | 'manual' ...
+  actual_cost_tokens integer,         -- cache_create of the first /v1/messages request after the switch (from the transcript)
+  actual_request_id text
 );
 create index if not exists requests_session_ts on requests(session_key, ts);
 create table if not exists agents (agent_id text primary key, session_key text, name text, first_ts integer, last_ts integer); -- subagents
 create table if not exists tool_uses (id text primary key, request_id text, name text); -- tool_use blocks from transcripts
 create table if not exists tail_offsets (path text primary key, offset integer);   -- tailer resume points
+-- context advisor: one row per session per level ('warn' | 'urgent'), plus 'handoff' summaries; names/targets/sizes only, never tool output
+create table if not exists advice (id integer primary key, session_key text, ts integer, level text, pct real, context_total integer, window integer,
+  breakdown_json text, text text, model text, request_id text);
 create table if not exists settings (key text primary key, value text);             -- JSON values; defaults in ledger.ts
 create index if not exists requests_ts on requests(ts);

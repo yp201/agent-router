@@ -1,5 +1,6 @@
 // Read-only views for the console UI: pure SQL + JS over the ledger. Nothing here writes.
 import { db, settings } from './ledger.ts';
+import { windowOf } from './advisor.ts';
 
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
@@ -23,7 +24,7 @@ const FIX: Record<string, string> = {
 
 // /v1/messages rows (2xx/3xx) since `since`, each annotated with `i` (turn in session), `switched`, and `burst`.
 function turns(since: number, session?: string | null) {
-  const rows = all(`select r.id, r.ts, r.request_id, r.session_key, r.account_id, r.model, r.latency_ms, r.tools_hash, r.tools_count,
+  const rows = all(`select r.id, r.ts, r.request_id, r.session_key, r.account_id, r.model, r.latency_ms, r.status, r.agent_id, r.tools_hash, r.tools_count,
       r.system_hash, r.first_user_hash, r.msg_count, r.context_est, r.cache_read, r.cache_create, r.in_tok, r.out_tok,
       exists (select 1 from migrations m where r.request_id is not null and m.request_id = r.request_id) migrated
     from requests r where ${MSG()} and status < 400 and session_key is not null and ts >= ? ${session ? 'and session_key = ?' : ''} order by ts`,
@@ -104,15 +105,29 @@ function overview(accounts: any[]) {
   };
 }
 
+const parse = (a: any) => a && { ...a, breakdown: JSON.parse(a.breakdown_json ?? 'null'), breakdown_json: undefined };
+export const advice = (sk?: string) => (sk ? all('select * from advice where session_key = ? order by id desc', sk)
+  : all(`select a.*, s.title from advice a left join sessions s using (session_key) where a.id in (select max(id) from advice where level != 'handoff' group by session_key) order by a.id desc`)).map(parse);
+
 function sessions() {
+  const st = settings();
   return all(`select s.*, (select coalesce(r.in_tok + r.cache_read + r.cache_create, r.context_est) from requests r
         where r.session_key = s.session_key and r.context_est is not null order by r.ts desc limit 1) context_est,
+      (select actual_cost_tokens from migrations m where m.session_key = s.session_key and actual_cost_tokens is not null order by ts desc limit 1) last_switch_cost_actual,
       (select ua_kind from requests r where r.session_key = s.session_key and ua_kind is not null order by r.ts desc limit 1) source
     from sessions s where account_id is not null order by last_ts desc limit 100`) // transcript-only rows (a title, never routed) have no pin
-    .map((s) => ({ ...s, title: s.title ?? s.session_key.slice(0, 8), project: s.cwd?.split('/').pop() ?? null,
+    .map((s) => {
+      // context meter: the main thread's last joined turn (the context that auto-compacts), same basis as the advisor
+      const m = one(`select in_tok + cache_read + cache_create ctx, model from requests where session_key = ? and agent_id is null
+        and cache_create is not null order by ts desc limit 1`, s.session_key);
+      return { ...s, title: s.title ?? s.session_key.slice(0, 8), project: s.cwd?.split('/').pop() ?? null,
       switch_cost_est: s.context_est == null ? null : Math.round(s.context_est * 1.25),
+      context_main: m?.ctx ?? null, context_pct: m ? m.ctx / windowOf(m.model, m.ctx) : null, warn_pct: st.context_warn_pct, urgent_pct: st.context_urgent_pct,
+      advice: parse(one(`select * from advice where session_key = ? and level != 'handoff' order by id desc limit 1`, s.session_key)),
+      handoff: one(`select text, ts from advice where session_key = ? and level = 'handoff' order by id desc limit 1`, s.session_key) ?? null,
       agents: all(`select a.agent_id, coalesce(a.name, a.agent_id) name, count(r.id) requests, sum(r.cache_read) cache_read, sum(r.cache_create) cache_create, a.last_ts
-        from agents a left join requests r on r.agent_id = a.agent_id where a.session_key = ? group by a.agent_id order by a.first_ts`, s.session_key) }));
+        from agents a left join requests r on r.agent_id = a.agent_id where a.session_key = ? group by a.agent_id order by a.first_ts`, s.session_key) };
+    });
 }
 
 function cache(q: URLSearchParams) {
@@ -199,6 +214,20 @@ function insights() {
     burst_hours: [...hours].map(([hour, count]) => ({ hour, count })).sort((a, b) => b.count - a.count),
     totals: { tokens_saved_est: sum(avoid, (r) => r.burst.delta), bursts_avoidable: avoid.length, bursts: bursts.length },
   };
+}
+
+// One session's /v1/messages turns in order, with account, joined usage, burst and the migration each turn paid for.
+export function timeline(key: string) {
+  const rows = turns(0, key), names = new Map(all('select agent_id, name from agents where session_key = ?', key).map((a) => [a.agent_id, a.name]));
+  for (const m of all('select * from migrations where session_key = ? order by ts', key)) {
+    const t = rows.find((r) => (m.request_id ? r.request_id === m.request_id : r.ts >= m.ts)); // manual pins: the first turn after
+    if (t) t.migration = { from: m.from_account, to: m.to_account, reason: m.reason, est: m.est_cost_tokens, actual: m.actual_cost_tokens };
+  }
+  return { session_key: key, title: one('select title from sessions where session_key = ?', key)?.title ?? key.slice(0, 8),
+    turns: rows.map((r) => ({ i: r.i, ts: r.ts, request_id: r.request_id, account_id: r.account_id, model: r.model, agent_id: r.agent_id,
+      agent_name: r.agent_id ? names.get(r.agent_id) ?? r.agent_id : null, in_tok: r.in_tok, cache_read: r.cache_read, cache_create: r.cache_create, out_tok: r.out_tok,
+      context_total: r.cache_create == null ? null : (r.in_tok ?? 0) + (r.cache_read ?? 0) + r.cache_create, latency_ms: r.latency_ms, status: r.status,
+      burst: r.burst ? { cause: r.burst.cause, avoidable: r.burst.avoidable } : null, migration: r.migration ?? null })) };
 }
 
 export function consoleApi(what: string, q: URLSearchParams, accounts?: any[]): any {

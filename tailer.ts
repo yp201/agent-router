@@ -4,7 +4,8 @@
 import { watch, readdirSync, statSync, readFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { db } from './ledger.ts';
+import { db, fillActual } from './ledger.ts';
+import { check } from './advisor.ts';
 
 const ROOT = process.env.CLAUDE_PROJECTS_DIR ?? `${homedir()}/.claude/projects`;
 const CHUNK = 4 << 20; // read in 4 MB slices and yield between them so a big first scan never stalls proxying
@@ -31,9 +32,12 @@ const setOff = db.prepare('insert into tail_offsets values (?, ?) on conflict (p
 // The CLI writes a response's rows while it streams; the router logs the request row only when the stream ends
 // (observed: up to minutes later). Unmatched recent rows wait here until the router calls joined(requestId).
 const pending = new Map<string, { at: number; p: Record<string, any>; s: Record<string, any> }>();
+const joinedRow = db.prepare('select request_id rid, session_key sk, ts, cache_create cc from requests where request_id = ?');
 function apply(p: Record<string, any>, s: Record<string, any>) {
   if (!upd.run(p).changes) return false;
   sess.run(s);
+  const r = joinedRow.get(p.rid) as any;
+  if (r?.sk && r.cc != null) { fillActual.run(r); check(p.rid); } // actual switch cost; context advisor
   return true;
 }
 export function joined(rid: string | null) {

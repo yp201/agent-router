@@ -36,6 +36,15 @@ you switch them.
 CLAUDE_CONFIG_DIR=~/.agent-router/accounts/<name> claude auth login
 ```
 
+## Context advisor
+
+When a session's context first passes 70% of its window (85% again as "urgent"), the router reads that session's transcript
+locally, sizes what fills it — biggest tool results, files read more than once, tokens per tool — and asks Haiku, through
+your own `claude` CLI, for the three biggest avoidable items and whether to hand off now. You get a macOS notification and an
+advice card under the session in the console, with a **Write handoff summary** button that drafts a summary to paste into a
+fresh session. Only tool names, targets and sizes are stored, never tool output. Thresholds, per-model windows and the model
+live in settings (`context_warn_pct`, `context_urgent_pct`, `context_windows`, `advisor_model`, `advisor_enabled`); `NOTIFY=0` mutes it.
+
 ## Day to day
 
 ```bash
@@ -64,10 +73,10 @@ which ignores that setting.
 ## Development
 
 ```bash
-node --test test_router.ts   # 14 tests, fake upstream, no network
+node --test test_router.ts   # 17 tests, fake upstream, no network
 ```
 
-`router.ts` proxy + routing · `accounts.ts` token store · `tailer.ts` transcript join · `console.ts` analytics ·
+`router.ts` proxy + routing · `accounts.ts` token store · `tailer.ts` transcript join · `console.ts` analytics · `advisor.ts` context advisor ·
 `ui.html` console · `agent-router.sh` install/status/uninstall. Plan and findings: `PLAN.md`, `NOTES.md`, `docs/`.
 
 Tokens are read from the official CLI's credential store at request time and never written to disk, logs or the UI.

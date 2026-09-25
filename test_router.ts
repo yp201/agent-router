@@ -525,3 +525,81 @@ test('settings: defaults, validation, prefer_home_until_80 keeps new sessions on
   assert.equal((await h.msg('p1')).who, 'acct-b', 'existing pins still served');
   h.noLeak();
 });
+
+// ---- migration actual cost, session timeline, context advisor ----
+test('migration actual cost: forced 429 replay names its request; a manual pin takes the next request', async (t) => {
+  const proj = mkdtempSync(`${tmpdir()}/router-proj-`);
+  const h = await setup(t, { CLAUDE_PROJECTS_DIR: proj });
+  await h.addAcct('acct-b', 'tok-b-fake');
+  h.s.util = { home: 0.1, 'acct-b': 0.5 };
+  await h.msg('ma'); h.s.fail.home = 1; await h.msg('ma'); // req_1 home; req_2 429 home -> req_3 acct-b
+  await h.api('accounts/home/clear-cooldown', {});
+  await h.api('sessions/ma/pin', { account_id: 'home' });
+  await h.msg('ma'); // req_4 home
+  mkdirSync(`${proj}/p`);
+  writeFileSync(`${proj}/p/ma.jsonl`, [['req_1', 20000], ['req_3', 21000], ['req_4', 21500]].map(([rid, c]) => arow(rid as string, { in: 5, read: 0, create: c as number }, undefined, 'ma')).join(''));
+  const migs = () => h.api('migrations');
+  const ms = await until(async () => { const m = await migs(); return m.every((x: any) => x.actual_cost_tokens != null) && m; }, 'actuals filled');
+  assert.deepEqual(ms.map((m: any) => [m.reason, m.request_id, m.actual_request_id, m.actual_cost_tokens, m.est_cost_tokens > 0]),
+    [['manual', null, 'req_4', 21500, false], ['429 five_hour', 'req_3', 'req_3', 21000, true]]);
+  assert.equal((await h.api('sessions')).find((s: any) => s.session_key === 'ma').last_switch_cost_actual, 21500);
+  h.noLeak();
+});
+
+test('session timeline: ordered turns per account, migration and burst attached', async (t) => {
+  const proj = mkdtempSync(`${tmpdir()}/router-proj-`);
+  const h = await setup(t, { CLAUDE_PROJECTS_DIR: proj });
+  await h.addAcct('acct-b', 'tok-b-fake');
+  await h.msg('tl'); await h.msg('tl'); // req_1, req_2 home
+  await h.api('sessions/tl/pin', { account_id: 'acct-b' });
+  await h.msg('tl'); // req_3 acct-b: re-writes the whole context
+  mkdirSync(`${proj}/p`);
+  writeFileSync(`${proj}/p/tl.jsonl`, [[0, 20000], [20000, 500], [0, 20600]].map(([read, create], i) => arow(`req_${i + 1}`, { in: 10, read, create }, undefined, 'tl')).join(''));
+  const tl = await until(async () => { const x = await h.api('sessions/tl/timeline'); return x.turns.at(-1)?.context_total && x; }, 'joined');
+  assert.equal(tl.session_key, 'tl');
+  assert.deepEqual(tl.turns.map((r: any) => [r.i, r.request_id, r.account_id, r.context_total]), [[1, 'req_1', 'home', 20010], [2, 'req_2', 'home', 20510], [3, 'req_3', 'acct-b', 20610]]);
+  assert.deepEqual(tl.turns[2].migration, { from: 'home', to: 'acct-b', reason: 'manual', est: null, actual: 20600 });
+  assert.deepEqual(tl.turns[2].burst, { cause: 'account switch', avoidable: false });
+  assert.deepEqual([tl.turns[0].burst, tl.turns[0].migration, tl.turns[1].burst], [null, null, null], 'cold start is not a burst');
+  h.noLeak();
+});
+
+test('context advisor: breakdown + fake Haiku on warn, no repeat, urgent, handoff; no tool output stored', async (t) => {
+  const proj = mkdtempSync(`${tmpdir()}/router-proj-`), bin = `${proj}/fake-claude`;
+  writeFileSync(bin, '#!/bin/sh\ncat >/dev/null; echo FAKE ADVICE\n', { mode: 0o755 });
+  const h = await setup(t, { CLAUDE_PROJECTS_DIR: proj, CLAUDE_BIN: bin, NOTIFY: '0' });
+  await fetch(`${h.base}/router/settings`, { method: 'PUT', body: JSON.stringify({ context_windows: { default: 100000 } }) });
+  for (let i = 0; i < 4; i++) await h.msg('adv'); // req_1..4
+  const row = (o: any) => JSON.stringify({ sessionId: 'adv', timestamp: new Date().toISOString(), ...o }) + '\n';
+  const use = (id: string, name: string, input: any) => arow('req_1', { in: 10, read: 0, create: 30000 }, [{ type: 'tool_use', id, name, input }], 'adv');
+  const result = (id: string, n: number) => row({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'TOOL-OUTPUT-' + 'x'.repeat(n - 12) }] } });
+  const f = `${proj}/p/adv.jsonl`;
+  mkdirSync(`${proj}/p`);
+  writeFileSync(f, row({ type: 'user', message: { role: 'user', content: 'fix the parser' } })
+    + ['r1', 'r2', 'r3'].map((id) => use(id, 'Read', { file_path: '/src/parser.ts' }) + result(id, 16000)).join('')
+    + use('b1', 'Bash', { command: 'npm test', description: 'run tests' }) + result('b1', 80000)
+    + arow('req_2', { in: 10, read: 50000, create: 22000 }, undefined, 'adv')); // 72% of 100k -> warn
+  const adv = (): Promise<any[]> => h.api('sessions/adv/advice');
+  const [warn] = await until(async () => { const a = await adv(); return a.length && a; }, 'warn advice');
+  assert.deepEqual([warn.level, warn.text, warn.window, warn.context_total], ['warn', 'FAKE ADVICE', 100000, 72010]);
+  assert.deepEqual(warn.breakdown.top_results[0], { tool: 'Bash', target: 'npm test', tokens: 20000, count: 1 });
+  assert.deepEqual(warn.breakdown.files_read_repeatedly, [{ target: '/src/parser.ts', count: 3, tokens: 12000 }]);
+  assert.equal(warn.breakdown.pct, 72);
+  appendFileSync(f, arow('req_3', { in: 10, read: 72000, create: 3000 }, undefined, 'adv')); // 75%: same level
+  await until(async () => (await h.rows(`select cache_create from requests where request_id = 'req_3'`))[0].cache_create === 3000, 'req_3 joined');
+  await new Promise((ok) => setTimeout(ok, 200));
+  assert.equal((await adv()).length, 1, 'same level does not repeat');
+  appendFileSync(f, arow('req_4', { in: 10, read: 75000, create: 15000 }, undefined, 'adv')); // 90% -> urgent
+  const [urgent] = await until(async () => { const a = await adv(); return a.length === 2 && a; }, 'urgent advice');
+  assert.deepEqual([urgent.level, urgent.text], ['urgent', 'FAKE ADVICE']);
+  assert.equal((await h.api('advice'))[0].level, 'urgent');
+  const ho = await fetch(`${h.base}/router/sessions/adv/handoff`, { method: 'POST' }).then((x) => x.json());
+  assert.equal(ho.text, 'FAKE ADVICE');
+  assert.deepEqual((await adv()).map((a) => a.level), ['handoff', 'urgent', 'warn']);
+  const s = (await h.api('sessions')).find((x: any) => x.session_key === 'adv');
+  assert.deepEqual([s.advice.level, s.handoff.text, Math.round(s.context_pct * 100)], ['urgent', 'FAKE ADVICE', 90]);
+  assert.equal((await h.api('health')).claude_bin, bin);
+  const dir = dirname(h.ledger);
+  assert.ok(!readdirSync(dir).map((x) => readFileSync(`${dir}/${x}`, 'latin1')).join('').includes('TOOL-OUTPUT'), 'tool_result content stored');
+  h.noLeak();
+});

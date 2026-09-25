@@ -164,3 +164,33 @@ If the tab errors with a certificate failure, the CLI isn't seeing `NODE_EXTRA_C
   `> max(20k, 3 × session median)`, which flagged ordinary big turns on large sessions (9 of 10 read "context growth / unknown"). Account switch = migration row for the request *or* account differs from the previous turn
   (manual pins log their migration with request_id null).
 - 7d projection uses the window's average rate so far (util × 7d / elapsed); a 60-min burn stretched over days projected 300%+.
+
+## Advisor, switch cost, timeline (2026-09-25)
+- **Actual switch cost:** `migrations.actual_cost_tokens` = `cache_create` of the first `/v1/messages` request (status < 400) in the
+  session at or after the migration's ts, filled when the tailer joins that request (forced replays: `migrations.request_id` names it).
+  Existing ledgers are backfilled once from joins already present. Live data: switching *back* to an account within the hour
+  costs almost nothing (29–225 tokens) because that account's cache is still warm; real switches cost 4k–23k.
+- **Timeline** (`/router/sessions/:key/timeline`) reuses `turns()` from console.ts, so it has the same thread-aware bursts and
+  excludes failed attempts (a 429 before a replay is not a turn). A manual pin attaches to the first turn at or after it.
+- **Advisor trigger:** after every usage join, for main-thread rows (`agent_id is null`) logged in the last 30 min:
+  `pct = (in + cache_read + cache_create) / window(model)`. First time a session reaches `context_warn_pct` (0.7) or
+  `context_urgent_pct` (0.85) → one `advice` row for that level; a level never repeats, `urgent` never downgrades to `warn`.
+  The 30-min guard keeps a first scan of old transcripts from firing a Haiku call per old session.
+- **Window:** longest matching prefix in `settings.context_windows`, else 1M if the model contains `[1m]`, else `default` (200k).
+  The API body never carries `[1m]` (it's the CLI's alias; the body says e.g. `claude-opus-5-5`), so a request that succeeded
+  with more context than its window is taken as proof of the 1M window. For 1M sessions below 200k that can't be known:
+  set a prefix override (`{"claude-opus-5-5": 1000000}`) if you always run that model at 1M.
+- **Breakdown** (deterministic, from `requests.jsonl_path` of the main transcript, since the last `compact_boundary`): each
+  `tool_result` sized chars/4 (text blocks only; images not counted), keyed by its `tool_use` name + target (first string input,
+  60 chars, for Read/Edit/Write/Grep/Glob/Bash; else the tool name). Sizes and names only, never result content.
+- **Prompts** (verbatim in `advisor.ts`): the advice prompt ("You are advising a developer whose Claude Code session is at
+  {pct}% …", then the breakdown JSON) and the handoff prompt ("Summarize this session for a fresh session …", then
+  `{title, user_prompts (300 chars, reminders stripped, isMeta skipped), files_touched (Read/Edit/Write targets), last_assistant_text (3 × 500 chars)}`).
+- **Subprocess:** `claude -p --model <advisor_model> --output-format text --no-session-persistence --tools ""`, prompt on stdin,
+  cwd = tmpdir, 60 s timeout, env = the router's env minus every `CLAUDE_CODE_*` and `ANTHROPIC_*` (PATH/HOME kept). The extra
+  two flags keep the call out of `~/.claude/projects` and stop Haiku from calling tools. The call itself goes through this
+  router like any client (it shows up as a short untitled session). Binary: `CLAUDE_BIN` env, else `settings.claude_bin`, else
+  `which claude`, else `~/.local/bin/claude` (launchd's PATH has no `~/.local/bin`, so the fallback is what runs there);
+  shown in `/router/health`. Failure → advice stored with `text = null`, one log line, never a crash.
+- Notification: `osascript display notification` on macOS unless `NOTIFY=0`.
+- Dry run on a copy of the live ledger: real Haiku advice in ~11 s (two API calls, 0.9 s + 9.3 s), handoff in ~20 s.

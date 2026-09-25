@@ -172,6 +172,10 @@ the ledger can't compute a number yet (dollars without a rate card, weekly-windo
 - Actions come later and are 3 endpoints: disable account, clear cooldown, force pin. Add when you actually want to click them.
 **Skip:** framework, build step, auth (localhost only).
 
+**Status (2026-09-25): ✅ actual switch cost, session timeline, context advisor** — `migrations.actual_cost_tokens` from the
+first joined turn after a switch; `/router/sessions/:key/timeline` + lane SVG in Sessions; `advisor.ts` (warn/urgent advice with a
+transcript breakdown + Haiku via `claude -p`, handoff summaries, `/router/advice`). 17/17 tests. See NOTES.md "Advisor".
+
 ### P5 — remote / shared pool
 Same binary, `--listen 0.0.0.0 --require-key`. Adds:
 - `users` table (id, key_hash, quota_tokens_per_day, pool_id); requests get `user_id`.

@@ -60,6 +60,8 @@ input[type=number] { width: 72px; font-family: var(--mono); }
 pre, .cmd { font: 12px var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 0; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
 details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .err { color: var(--clay); }
+.plain { border: 0; background: none; padding: 0; font: inherit; text-align: left; max-width: 100%; } .plain:hover { color: var(--clay); }
+.meter .bar { height: 4px; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 @media (max-width: 1000px) { .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid2 { grid-template-columns: 1fr; } }
 @media (max-width: 720px) {
@@ -96,14 +98,50 @@ const until = (epochS) => epochS ? dur(epochS - Date.now() / 1000) : '—';
 const hms = (ms) => new Date(ms).toLocaleTimeString('en-GB');
 const short = (k) => esc((k ?? '').slice(0, 8));
 // a session by name: title + muted project, key as tooltip; `m` = Map from byKey(sessions), unknown keys fall back to the short key
-const SC = 'grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) 80px 90px 90px 100px 210px'; // Sessions table
+const SC = 'grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) 80px 90px 110px 100px 210px'; // Sessions table
+const MC = 'grid-template-columns:120px minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr) 170px'; // Migrations table
 const byKey = (sessions) => new Map(sessions.map((s) => [s.session_key, s]));
 const sname = (m, k, s = m.get(k)) => `<span title="${esc(k)}">${s ? `${esc(s.title)}${s.project ? ` <span class="muted">${esc(s.project)}</span>` : ''}` : short(k)}</span>`;
 const model = (m) => esc((m ?? '—').replace(/^claude-/, '').replace(/-\d{8}$/, ''));
 const get = (p) => fetch(`/router/${p}`).then((r) => r.json());
 const send = (method, p, body) => fetch(`/router/${p}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) }).then((r) => r.json());
 let S = {};            // last settings
-const ui = { cacheSession: 'all', cacheDays: 7, dollars: false, open: {}, added: null }; // view state that survives re-renders
+const ui = { cacheSession: 'all', cacheDays: 7, dollars: false, open: {}, added: null, tl: null, busy: {} }; // view state that survives re-renders
+const kt = (n) => n == null ? '—' : `${Math.round(n / 1000)}k`;
+const ctxColor = (s) => s.context_pct >= s.urgent_pct ? 'clay' : s.context_pct >= s.warn_pct ? 'amber' : 'muted';
+// Session timeline: x = turn, one lane per account (first appearance order), bar = context (teal read + clay write cap)
+const timelineSvg = (tl) => {
+  const T = tl.turns; if (!T.length) return '<div class="note">No /v1/messages turns for this session yet.</div>';
+  const lanes = [...new Set(T.map((r) => r.account_id))], now = T.at(-1).account_id, LH = 64, top = 34, x0 = 96, W = 680, step = W / T.length;
+  const bw = Math.max(1, Math.min(14, step * .75)), max = Math.max(1, ...T.map((r) => r.context_total ?? 0)), H = top + lanes.length * LH + 18;
+  const X = (k) => x0 + k * step, base = (a) => top + (lanes.indexOf(a) + 1) * LH - 6, hgt = (v) => v / max * (LH - 18), f = (n) => n.toFixed(1);
+  let mi = 0;
+  const marks = T.map((r, k) => { if (!r.migration) return ''; const m = r.migration, c = m.actual ?? m.est, x = X(k), end = x > x0 + W - 140;
+    return `<line x1="${f(x)}" y1="${top - 6}" x2="${f(x)}" y2="${H - 18}" stroke="#D97757" stroke-dasharray="3 3"/><text x="${f(end ? x - 3 : x + 3)}" y="${mi++ % 2 ? 26 : 13}" text-anchor="${end ? 'end' : 'start'}" font-family="IBM Plex Mono" font-size="10" fill="#F3EFE7">${esc(`${m.from ?? '—'} → ${m.to}${c == null ? '' : ` · ${kt(c)}`}`)}</text>`; }).join('');
+  const bars = T.map((r, k) => {
+    const x = f(X(k)), y0 = base(r.account_id), j = r.context_total != null, read = j ? hgt(r.context_total - r.cache_create) : 0, cap = j ? hgt(r.cache_create) : 0;
+    const tip = `turn ${r.i} · ${hms(r.ts)} · ${r.account_id} · ${r.model ?? ''}${r.agent_name ? `\nsubagent: ${r.agent_name}` : ''}\n${j ? `context ${kt(r.context_total)} · read ${kt(r.cache_read)} · write ${kt(r.cache_create)}` : 'usage not joined yet'}${r.burst ? `\nburst: ${r.burst.cause}` : ''}`;
+    return `<g${r.agent_id ? ' opacity=".45"' : ''}><title>${esc(tip)}</title>${j ? `<rect x="${x}" y="${f(y0 - read)}" width="${f(bw)}" height="${f(read)}" fill="#5FB3A1"/><rect x="${x}" y="${f(y0 - read - cap)}" width="${f(bw)}" height="${f(cap)}" fill="#D97757"/>`
+      : `<rect x="${x}" y="${y0 - 3}" width="${f(bw)}" height="3" fill="#4A453D"/>`}${r.burst ? `<circle cx="${f(X(k) + bw / 2)}" cy="${f(y0 - read - cap - 6)}" r="3" fill="${r.burst.avoidable ? '#E0A458' : '#A39E93'}"/>` : ''}</g>`; }).join('');
+  const lanesSvg = lanes.map((a) => `<line x1="${x0 - 4}" y1="${base(a)}" x2="${x0 + W}" y2="${base(a)}" stroke="#2C2925"/><text x="4" y="${base(a) - 4}" font-family="IBM Plex Mono" font-size="11" fill="${a === now ? '#5FB3A1' : '#A39E93'}">${esc(a === now ? `now on ${a}` : a)}</text>`).join('');
+  const key = (c, l, extra = '') => `<span class="row"><span class="dot" style="border-radius:2px;background:${c}${extra}"></span>${l}</span>`;
+  return `<div class="row small muted" style="flex-wrap:wrap;gap:14px">${key('#5FB3A1', 'cache read')}${key('#D97757', 'cache write')}${key('#5FB3A1', 'subagent turn', ';opacity:.45')}${key('#E0A458', 'avoidable burst', ';border-radius:50%')}${key('#A39E93', 'burst', ';border-radius:50%')}<span class="clay">┆ account switch · cost (actual, else est.)</span><span>height = context · peak ${kt(max)}</span></div>
+    <svg viewBox="0 0 790 ${H}" width="100%" role="img" aria-label="Timeline of ${T.length} turns across ${lanes.length} account${lanes.length === 1 ? '' : 's'}; now on ${esc(now)}">${lanesSvg}${bars}${marks}
+      <text x="${x0}" y="${H - 4}" font-family="IBM Plex Mono" font-size="10" fill="#A39E93">turn ${T[0].i}</text><text x="${x0 + W}" y="${H - 4}" text-anchor="end" font-family="IBM Plex Mono" font-size="10" fill="#A39E93">turn ${T.at(-1).i}</text></svg>`;
+};
+const adviceCard = (s) => { const a = s.advice, b = a.breakdown ?? {}, k = esc(s.session_key);
+  const line = (l, v) => `<div class="between mono"><span class="nm">${l}</span><span>${tok(v)}</span></div>`;
+  return `<div class="inset" style="margin:2px 0 8px;border-color:${a.level === 'urgent' ? '#5A3328' : '#4A3A2E'}">
+    <div class="between"><b>Context at ${pct(a.pct)} of ${tok(a.window)} — ${a.level === 'urgent' ? 'auto-compact is close' : 'before compact'}</b><span class="chip ${a.level === 'urgent' ? 'bad' : 'warn'}">${esc(a.level)} · ${ago(a.ts)}</span></div>
+    <div class="grid2" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)">
+      <div class="col small"><span class="muted">Largest tool results in context</span>${(b.top_results ?? []).map((r) => line(`${esc(r.tool)}${r.target !== r.tool ? ` <span class="muted">${esc(r.target)}</span>` : ''}${r.count > 1 ? ` ×${r.count}` : ''}`, r.tokens)).join('') || '<span class="muted">none</span>'}</div>
+      <div class="col small"><span class="muted">Files read repeatedly</span>${(b.files_read_repeatedly ?? []).map((r) => line(`${esc(r.target)} ×${r.count}`, r.tokens)).join('') || '<span class="muted">none</span>'}
+        <span class="muted" style="margin-top:6px">thinking ${tok(b.thinking_tokens_total)} · ${b.turns ?? '—'} turns · ${b.subagent_turns ?? 0} subagent turns</span></div>
+    </div>
+    ${a.text ? `<div class="note" style="white-space:pre-wrap;color:var(--fg)">${esc(a.text)}</div>` : '<div class="note">No recommendation text (the advisor call failed or <span class="mono">claude</span> was not found) — the breakdown above is exact.</div>'}
+    <div class="row"><button class="sm" data-handoff="${k}" ${ui.busy[s.session_key] ? 'disabled' : ''}>${ui.busy[s.session_key] ? 'Writing handoff…' : s.handoff ? 'Rewrite handoff summary' : 'Write handoff summary'}</button>
+      ${s.handoff ? `<button class="sm" data-copy="${k}">Copy</button><span class="small muted">${ago(s.handoff.ts)}</span>` : ''}</div>
+    ${s.handoff ? `<pre data-ho="${k}">${esc(s.handoff.text)}</pre>` : ''}</div>`; };
 const uColor = (u) => u == null ? 'var(--gray)' : u >= (S.warn_pct ?? .8) ? 'var(--clay)' : u >= .5 ? 'var(--amber)' : 'var(--teal)';
 const badge = (st) => `<span class="chip ${st === 'ok' || st === 'unknown' ? 'ok' : st === 'cooling' ? 'warn' : st === 'needs_login' ? 'bad' : ''}">${st === 'ok' || st === 'unknown' ? 'healthy' : esc(st)}</span>`;
 const ring = (u, c) => { const L = 150.8, f = Math.min(1, u ?? 0) * L;
@@ -156,7 +194,7 @@ const views = {
     </section>`;
   }],
 
-  accounts: [['accounts', 'sessions', 'settings'], (accts, sessions) => head('Accounts &amp; routing', 'Sticky per session. New sessions start on the account with the most headroom.',
+  accounts: [['accounts', 'sessions', 'migrations', () => ui.tl ? `sessions/${encodeURIComponent(ui.tl)}/timeline` : 'advice', 'settings'], (accts, sessions, migs, tl) => head('Accounts &amp; routing', 'Sticky per session. New sessions start on the account with the most headroom.',
       `<button class="primary" data-act="focus-add">Add account</button>`)
     + `<section class="cards">${accts.map((a) => `<div class="panel" style="gap:16px">
         <div class="between"><div class="row"><span style="font-size:18px;font-weight:600">${esc(a.id)}</span>${badge(a.status)}</div><span class="small muted">${esc(acctLine(a))}</span></div>
@@ -181,20 +219,33 @@ const views = {
       <div class="table">
         <div class="tr th" style="${SC}"><span>session · project</span><span>model</span><span>requests</span><span>account</span><span>context</span><span>switch cost</span><span>route to</span></div>
         ${sessions.map((s) => `<div class="tr" style="${SC}">
-          <span class="nm">${sname(null, s.session_key, s)}</span>
+          <span class="nm"><button class="plain nm" data-tl="${esc(s.session_key)}" aria-expanded="${ui.tl === s.session_key}" title="Show timeline">${sname(null, s.session_key, s)}</button></span>
           <span>${model(s.last_model)} ${s.source ? `<span class="chip">${s.source === 'cli' ? 'terminal' : 'desktop'}</span>` : ''}</span>
-          <span>${s.request_count}</span><span${s.account_id !== 'home' ? ' class="amber"' : ''}>${esc(s.account_id)}</span><span>${tok(s.context_est)}</span><span>${s.switch_cost_est == null ? NA : '≈' + tok(s.switch_cost_est)}</span>
+          <span>${s.request_count}</span><span${s.account_id !== 'home' ? ' class="amber"' : ''}>${esc(s.account_id)}</span><div class="col meter" style="gap:3px"><span>${tok(s.context_main ?? s.context_est)} <span class="${ctxColor(s)}">${pct(s.context_pct)}</span></span>${s.context_pct == null ? '' : bar([[s.context_pct, `var(--${ctxColor(s) === 'muted' ? 'teal' : ctxColor(s)})`]])}</div>
+          <span>${s.last_switch_cost_actual != null ? `<span title="last switch, actual cache write">${tok(s.last_switch_cost_actual)}</span>` : s.switch_cost_est == null ? NA : '≈' + tok(s.switch_cost_est)}</span>
           <div class="row"><select class="sm" aria-label="Route session ${short(s.session_key)} to account" data-s="${esc(s.session_key)}">${accts.map((a) => `<option ${a.id === (ui.open[`pin-${s.session_key}`] ?? s.account_id) ? 'selected' : ''}>${esc(a.id)}</option>`).join('')}</select>
-            <button class="sm" data-pin="${esc(s.session_key)}" data-cost="${s.switch_cost_est ?? ''}">Switch</button></div></div>`
+            <button class="sm" data-pin="${esc(s.session_key)}" data-cost="${s.switch_cost_est ?? ''}" data-actual="${s.last_switch_cost_actual ?? ''}">Switch</button></div></div>`
+          + (ui.tl === s.session_key && tl?.turns ? `<div class="inset" style="margin:2px 0 8px"><div class="between"><b>Timeline — ${esc(tl.title)}</b><span class="small muted">${tl.turns.length} turns · hover a bar for its numbers</span></div>${timelineSvg(tl)}</div>` : '')
+          + (s.advice ? adviceCard(s) : '')
           + s.agents.map((a) => `<div class="tr" style="${SC}"><span class="nm muted" style="padding-left:14px" title="${esc(a.agent_id)}">↳ ${esc(a.name)}</span>
             <span class="small muted">read ${tok(a.cache_read)} · write ${tok(a.cache_create)}</span><span>${a.requests}</span><span></span><span></span><span></span><span></span></div>`).join('')).join('') || '<div class="note">No sessions yet.</div>'}
       </div>
       ${sessions.some((s) => s.agents.length) ? '<div class="note">↳ rows are subagents. Their requests are included in the parent\'s count and follow the parent\'s pin — switch the parent to move them.</div>' : ''}
+      <div class="note">Click a session's name for its turn-by-turn timeline.</div>
       <fieldset class="inset" style="margin:0"><legend class="small muted" style="padding:0 4px">Routing policy</legend>
         ${[['sticky_least_utilized', 'Sticky, least-utilized for new sessions', ' <span class="muted">(recommended)</span>'], ['prefer_home_until_80', 'Prefer home until 80%', ''], ['manual', 'Manual only', ' <span class="muted">(new sessions stay on home)</span>']].map(([v, l, x]) =>
           `<label class="row"><input type="radio" name="policy" value="${v}" ${S.policy === v ? 'checked' : ''}> ${l}${x}</label>`).join('')}
         <div class="small muted">Forced switch on 429 / 529 · cooldown from reset headers · new sessions avoid accounts over ${pct(S.route_cutoff_pct)} (5h) or inside the ${pct(S.weekly_reserve_pct)} weekly reserve</div>
       </fieldset>
+    </section>
+    <section class="panel">
+      <div class="between"><h2>Migrations</h2><span class="small muted">est = request bytes / 4 · actual = cache write of the first turn after, from the transcript</span></div>
+      <div class="table">
+        <div class="tr th" style="${MC}"><span>time</span><span>session</span><span>from → to</span><span>reason</span><span>cost est → actual</span></div>
+        ${migs.slice(0, 20).map((g) => `<div class="tr" style="${MC}"><span class="muted">${new Date(g.ts).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</span>
+          <span class="nm">${sname(byKey(sessions), g.session_key)}</span><span>${esc(g.from_account ?? '—')} → ${esc(g.to_account)}</span><span class="nm">${esc(g.reason)}</span>
+          <span>${g.est_cost_tokens == null ? NA : '≈' + tok(g.est_cost_tokens)} → ${g.actual_cost_tokens == null ? NA : `<span class="clay">${tok(g.actual_cost_tokens)}</span>`}</span></div>`).join('') || '<div class="note">No switches yet.</div>'}
+      </div>
     </section>`],
 
   cache: [[() => `cache?session=${encodeURIComponent(ui.cacheSession)}&days=${ui.cacheDays}`, 'sessions', 'settings'], (c, sessions) => {
@@ -284,7 +335,7 @@ const views = {
     </section>`;
   }],
 
-  insights: [['insights', 'settings'], (n) => {
+  insights: [['insights', 'advice', 'settings'], (n, adv) => {
     const cards = [
       ...n.recurring_preambles.map((p) => [`The same ${tok(p.est_tokens)}-token preamble opens ${p.sessions} sessions`, 'make it a skill',
         `Pasted as the first message in ${p.sessions} sessions across ${p.projects} project${p.projects === 1 ? '' : 's'}. As a skill it lives in the cached system prefix instead of the uncached first turn.`, `≈${tok(p.est_tokens * p.sessions)} tok re-sent uncached`]),
@@ -305,6 +356,12 @@ const views = {
           || '<div class="note">No recurring patterns yet. They show up once the ledger has a few days of joined sessions.</div>'}
       </div>
       <div class="col" style="gap:16px">
+        <div class="panel"><div class="between"><h2>Context health</h2><span class="small muted">sessions past ${pct(S.context_warn_pct)} of their window</span></div>
+          ${adv.map((a) => { const top = a.breakdown?.top_results?.[0];
+            return `<div class="inset"><div class="between"><b class="nm">${esc(a.title ?? a.session_key.slice(0, 8))}</b><span class="chip ${a.level === 'urgent' ? 'bad' : 'warn'}">${esc(a.level)} · ${pct(a.pct)}</span></div>
+              <div class="note">${a.text ? esc(a.text.length > 280 ? a.text.slice(0, 280) + '…' : a.text) : top ? `Largest tool result: ${esc(top.tool)} ${esc(top.target)} (${tok(top.tokens)}).` : 'Breakdown only.'}</div>
+              <div class="small muted">${ago(a.ts)} · <a href="#accounts">full breakdown in Sessions →</a></div></div>`; }).join('') || '<div class="note">No session has crossed the warning threshold yet.</div>'}
+        </div>
         <div class="panel">
           <div class="between"><h2>Global context rules</h2><span class="small muted row"><span class="dot" style="background:${S.openvikings_endpoint ? 'var(--teal)' : 'var(--gray)'}"></span>${S.openvikings_endpoint ? 'OpenVikings endpoint set' : 'OpenVikings not connected'}</span></div>
           <div class="note">Rules are stored locally. Syncing them to OpenVikings, so every harness applies them, is a placeholder until that endpoint exists.</div>
@@ -361,9 +418,16 @@ document.addEventListener('click', (e) => {
   const d = t.dataset;
   if (d.session) { ui.cacheSession = d.session; return; } // then the #cache link navigates
   if (d.a) { const [id, action] = d.a.split('/'); if (action !== 'remove' || confirm(`Remove ${id}? Its sessions fall back to another account.`)) act(`accounts/${encodeURIComponent(id)}/${action}`); }
+  if (d.tl) { ui.tl = ui.tl === d.tl ? null : d.tl; refresh(true); }
+  if (d.handoff) {
+    ui.busy[d.handoff] = true; refresh(true);
+    send('POST', `sessions/${encodeURIComponent(d.handoff)}/handoff`).then((r) => { if (r?.error) alert(`Handoff failed: ${r.error.type}`); }).finally(() => { delete ui.busy[d.handoff]; refresh(true); });
+  }
+  if (d.copy) navigator.clipboard.writeText(document.querySelector(`pre[data-ho="${CSS.escape(d.copy)}"]`).textContent).then(() => { t.textContent = 'Copied'; });
   if (d.pin) {
     const acct = document.querySelector(`select[data-s="${CSS.escape(d.pin)}"]`).value;
-    if (confirm(`Route session ${d.pin.slice(0, 8)} to ${acct}?\nIts next turn re-writes the whole cache on ${acct}${d.cost ? `: ≈${Number(d.cost).toLocaleString()} tokens` : ''}.`))
+    const cost = d.actual ? ` — last switch cost ${kt(Number(d.actual))} tokens` : d.cost ? `: ≈${Number(d.cost).toLocaleString()} tokens` : '';
+    if (confirm(`Route session ${d.pin.slice(0, 8)} to ${acct}?\nIts next turn re-writes the whole cache on ${acct}${cost}.`))
       act(`sessions/${encodeURIComponent(d.pin)}/pin`, { account_id: acct }).then(() => delete ui.open[`pin-${d.pin}`]);
   }
   if (d.act === 'pause-routing') putSettings({ policy: S.policy === 'manual' ? 'sticky_least_utilized' : 'manual' });

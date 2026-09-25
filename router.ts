@@ -10,7 +10,8 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { db, logRequest, settings, putSetting, DEFAULTS } from './ledger.ts';
 import { startTailer, joined } from './tailer.ts';
-import { consoleApi, util } from './console.ts';
+import { consoleApi, util, timeline, advice } from './console.ts';
+import { CLAUDE_BIN, handoff } from './advisor.ts';
 import { type Account, listAccounts, getAccount, setAcct, healthy, token, forget, expiresAt } from './accounts.ts';
 
 const { UPSTREAM_IP, UPSTREAM_CA, TLS_DIR = `${homedir()}/.agent-router/ca` } = process.env;
@@ -53,7 +54,7 @@ const json = (res: ServerResponse, status: number, body: unknown) =>
   res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
-const migrate = (...r: any[]) => db.prepare('insert into migrations values (?, ?, ?, ?, ?, ?, ?)').run(...r);
+const migrate = (...r: any[]) => db.prepare('insert into migrations (ts, session_key, from_account, to_account, est_cost_tokens, request_id, reason) values (?, ?, ?, ?, ?, ?, ?)').run(...r);
 
 const h16 = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, 16);
 const texts = (c: any): string[] => typeof c === 'string' ? [c] : Array.isArray(c) ? c.filter((b: any) => b?.type === 'text').map((b: any) => String(b.text)) : [];
@@ -248,16 +249,16 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
   if (m === 'GET' && (what === '' || what === 'ui'))
     return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(readFileSync(`${import.meta.dirname}/ui.html`));
   if (m === 'GET' && what === 'health')
-    return json(res, 200, { ok: true, transparent: tlsOn, launchd: /agent-router/.test(process.env.XPC_SERVICE_NAME ?? ''), upstream: { host: UP_HOST, port: UP_PORT, ip: await upstreamIp().catch(() => null) }, uptime: process.uptime(),
+    return json(res, 200, { ok: true, transparent: tlsOn, launchd: /agent-router/.test(process.env.XPC_SERVICE_NAME ?? ''), upstream: { host: UP_HOST, port: UP_PORT, ip: await upstreamIp().catch(() => null) }, uptime: process.uptime(), claude_bin: CLAUDE_BIN,
       ...one('select (select count(*) from accounts) accounts, (select count(*) from sessions where account_id is not null) sessions, (select count(*) from requests) requests, (select count(*) from migrations) migrations') });
   if (m === 'GET' && what === 'stats') return json(res, 200, all('select * from requests order by id desc limit 100'));
   if (m === 'GET' && what === 'settings') return json(res, 200, settings());
   if (m === 'PUT' && what === 'settings') {
     const enums: Record<string, string[]> = { policy: ['sticky_least_utilized', 'prefer_home_until_80', 'manual'] };
     for (const [k, v] of Object.entries(input ?? {})) {
-      const ok = !(k in DEFAULTS) ? false : k.endsWith('_pct') ? typeof v === 'number' && v >= 0 && v <= 1
-        : enums[k] ? enums[k].includes(v as string) : k === 'openvikings_endpoint' ? v === null || typeof v === 'string'
-        : k === 'context_rules' ? Array.isArray(v) : typeof v === 'object' && v !== null && !Array.isArray(v);
+      const d = DEFAULTS[k], ok = !(k in DEFAULTS) ? false : k.endsWith('_pct') ? typeof v === 'number' && v >= 0 && v <= 1
+        : enums[k] ? enums[k].includes(v as string) : d === null ? v === null || typeof v === 'string'
+        : k === 'context_rules' ? Array.isArray(v) : typeof d !== 'object' ? typeof v === typeof d : typeof v === 'object' && v !== null && !Array.isArray(v);
       if (!ok) return json(res, 400, { error: { type: 'invalid_setting', key: k } });
     }
     for (const [k, v] of Object.entries(input)) putSetting(k, v);
@@ -268,6 +269,13 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
     return json(res, 200, { ...consoleApi('overview', url.searchParams, accountsView()), policy_line: n.a ? `new sessions start on ${n.a.id} — ${n.why}` : n.why });
   }
   if (m === 'GET' && ['cache', 'cost', 'insights', 'sessions'].includes(what) && !id) return json(res, 200, consoleApi(what, url.searchParams));
+  if (m === 'GET' && what === 'sessions' && action === 'timeline') return json(res, 200, timeline(id));
+  if (m === 'GET' && what === 'sessions' && action === 'advice') return json(res, 200, advice(id));
+  if (m === 'GET' && what === 'advice') return json(res, 200, advice());
+  if (m === 'POST' && what === 'sessions' && action === 'handoff') {
+    const r = await handoff(id);
+    return !r ? json(res, 404, { error: { type: 'no_transcript' } }) : r.text ? json(res, 200, r) : json(res, 502, { error: { type: 'advisor_failed' } });
+  }
   if (m === 'GET' && what === 'migrations') return json(res, 200, all('select * from migrations order by ts desc limit 100'));
   if (m === 'GET' && what === 'accounts') return json(res, 200, accountsView());
 

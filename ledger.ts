@@ -24,6 +24,14 @@ const addCol = (t: string, c: string) => {
 for (const c of ['config_dir text', 'cooling_reason text', 'last_status integer', 'last_ratelimit_json text', 'last_seen integer', 'needs_login integer default 0'])
   addCol('accounts', c);
 addCol('migrations', 'reason text');
+const added = addCol('migrations', 'actual_cost_tokens integer'); addCol('migrations', 'actual_request_id text');
+// actual switch cost: the first /v1/messages request after the migration (forced replays name it in request_id); filled on its usage join
+export const fillActual = db.prepare(`update migrations set actual_cost_tokens = :cc, actual_request_id = :rid
+  where session_key = :sk and actual_cost_tokens is null and (request_id = :rid or request_id is null and ts <= :ts and :rid =
+    (select request_id from requests r where r.session_key = :sk and (path = '/v1/messages' or path like '/v1/messages?%') and status < 400 and r.ts >= migrations.ts order by r.ts limit 1))`);
+if (added) // one-time backfill from joins already in the ledger
+  for (const r of db.prepare(`select request_id rid, session_key sk, ts, cache_create cc from requests where cache_create is not null
+    and session_key in (select session_key from migrations) order by ts`).all()) fillActual.run(r as any);
 addCol('sessions', 'cwd text');
 if (addCol('sessions', 'title text')) db.exec('delete from tail_offsets'); // re-read the last 7 days once for titles/subagents; joins are idempotent
 addCol('requests', 'agent_id text');
@@ -49,6 +57,9 @@ export const DEFAULTS: Record<string, any> = {
     { id: 'preamble-skills', text: 'Promote repeated preambles to skills automatically', enabled: false, state: 'proposed' },
   ],
   openvikings_endpoint: null,
+  // context advisor: window per model prefix (longest wins; a model containing [1m] defaults to 1M), thresholds, the Haiku subprocess
+  context_windows: { default: 200000 }, context_warn_pct: 0.7, context_urgent_pct: 0.85,
+  advisor_model: 'haiku', advisor_enabled: true, claude_bin: null,
 };
 export const settings = (): Record<string, any> => ({
   ...DEFAULTS,
