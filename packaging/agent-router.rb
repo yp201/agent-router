@@ -4,20 +4,21 @@ class AgentRouter < Formula
   desc "Sticky multi-account router and cache doctor for Claude Code (desktop + CLI)"
   homepage "https://github.com/yp201/agent-router"
   url "https://github.com/yp201/agent-router/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "REPLACE_WITH_sha256_OF_THE_TARBALL"   # shasum -a 256 v0.1.0.tar.gz
+  sha256 "a632cc9d46104d7b225f957838ccb3b226973c0fce188549ad7ee3381ba07172"
   license "MIT"
+  head "https://github.com/yp201/agent-router.git", branch: "main"
 
-  depends_on "node"   # Node 24+ (the router uses node:sqlite and runs .ts directly)
+  depends_on "node" # Node 24+ (the router uses node:sqlite and runs .ts directly)
 
   def install
     libexec.install Dir["*"]
     # `agent-router` on PATH → the control script; node from Homebrew is first on PATH for it
-    (bin/"agent-router").write_env_script libexec/"agent-router.sh", PATH: "#{Formula["node"].opt_bin}:$PATH"
+    (bin/"agent-router").write_env_script libexec/"agent-router.sh", PATH: "#{formula_opt_bin("node")}:$PATH"
   end
 
   # `brew services start agent-router` = the launchd job (KeepAlive, log under brew's var/log)
   service do
-    run [Formula["node"].opt_bin/"node", opt_libexec/"router.ts"]
+    run [formula_opt_bin("node")/"node", opt_libexec/"router.ts"]
     keep_alive true
     working_dir opt_libexec
     log_path var/"log/agent-router.log"
