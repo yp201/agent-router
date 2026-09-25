@@ -8,6 +8,7 @@ set -uo pipefail
 PROJ=$(cd "$(dirname "$0")" && pwd); CA=~/.agent-router/ca/ca.pem
 PLIST=~/Library/LaunchAgents/com.agent-router.plist; LABEL=gui/$(id -u)/com.agent-router
 KC=/Library/Keychains/System.keychain; CN="agent-router local CA"
+case $PROJ in /opt/homebrew/*|/usr/local/Cellar/*|/home/linuxbrew/*) BREW=1 ;; *) BREW= ;; esac  # under Homebrew, the service is `brew services`
 say() { printf '  %-28s %s\n' "$1" "$2"; }
 trusted()  { security find-certificate -c "$CN" "$KC" >/dev/null 2>&1; }
 hosted()   { grep -q '^127\.0\.0\.1[[:space:]]*api\.anthropic\.com' /etc/hosts 2>/dev/null; }
@@ -32,8 +33,11 @@ cmd_install() {
     echo "-> adding api.anthropic.com -> loopback to /etc/hosts (sudo)"
     printf '127.0.0.1 api.anthropic.com\n::1 api.anthropic.com\n' | sudo tee -a /etc/hosts >/dev/null && say "/etc/hosts" "ok"; fi
   launchctl setenv NODE_EXTRA_CA_CERTS "$CA" && say "NODE_EXTRA_CA_CERTS" "set (lost on reboot: re-run install)"
-  pkill -f 'node router.ts' 2>/dev/null && sleep 0.5
-  reload; wait_up && say "router (launchd)" "up" || { say "router (launchd)" "NOT UP — see ~/.agent-router/router.log"; exit 1; }
+  if [ -n "$BREW" ]; then brew services restart agent-router >/dev/null 2>&1; wait_up && say "router (brew services)" "up" || { say "router (brew services)" "NOT UP — brew services info agent-router"; exit 1; }
+  else
+    pkill -f 'node router.ts' 2>/dev/null && sleep 0.5
+    reload; wait_up && say "router (launchd)" "up" || { say "router (launchd)" "NOT UP — see ~/.agent-router/router.log"; exit 1; }
+  fi
   say "transparent path" "HTTP $(transp) from api.anthropic.com via :443"
   cat <<MSG
 
@@ -53,7 +57,7 @@ cmd_status() {
   say "CA trust"           "$(trusted && echo yes || echo no)"
   say "/etc/hosts"         "$(hosted && echo 'api.anthropic.com -> loopback' || echo 'not set')"
   v=$(launchctl getenv NODE_EXTRA_CA_CERTS); say "NODE_EXTRA_CA_CERTS" "${v:-unset}"
-  say "launchd"            "$(loaded && echo loaded || echo 'not loaded')"
+  if [ -n "$BREW" ]; then say "brew services" "$(brew services list 2>/dev/null | awk '$1=="agent-router"{print $2}')"; else say "launchd" "$(loaded && echo loaded || echo 'not loaded')"; fi
   h=$(health); say "router :4001" "${h:-DOWN}"
   say "transparent :443"   "$([ -f "$CA" ] && echo "HTTP $(transp)" || echo 'no certs')"
 }
@@ -61,9 +65,9 @@ case ${1:-} in
   install)   cmd_install ;;
   uninstall) cmd_uninstall ;;
   status)    cmd_status ;;
-  start)     loaded && launchctl kickstart "$LABEL" || launchctl bootstrap "gui/$(id -u)" "$PLIST"; wait_up && echo up ;;
-  stop)      loaded && launchctl bootout "$LABEL"; pkill -f 'node router.ts' 2>/dev/null; echo stopped ;;
-  restart)   NO_HINTS=1 "$PROJ/setup.sh" >/dev/null && reload && wait_up && echo up || { echo "NOT UP — see ~/.agent-router/router.log"; exit 1; } ;;
+  start)     if [ -n "$BREW" ]; then brew services start agent-router; else loaded && launchctl kickstart "$LABEL" || launchctl bootstrap "gui/$(id -u)" "$PLIST"; fi; wait_up && echo up ;;
+  stop)      if [ -n "$BREW" ]; then brew services stop agent-router; else loaded && launchctl bootout "$LABEL"; fi; pkill -f 'node router.ts' 2>/dev/null; echo stopped ;;
+  restart)   if [ -n "$BREW" ]; then brew services restart agent-router; else NO_HINTS=1 "$PROJ/setup.sh" >/dev/null && reload; fi; wait_up && echo up || { echo "NOT UP — see ~/.agent-router/router.log"; exit 1; } ;;
   logs)      tail -f ~/.agent-router/router.log ;;
   ui)        open http://localhost:4001/router/ ;;
   *)         echo "usage: $0 install|uninstall|status|start|stop|restart|logs|ui"; exit 2 ;;
