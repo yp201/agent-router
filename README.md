@@ -13,7 +13,7 @@ Zero dependencies: Node 24 + SQLite (built in) + `openssl`.
 ## Setup — one command (macOS)
 
 ```bash
-git clone https://github.com/YOUR-GITHUB-USER/agent-router.git && cd agent-router && ./agent-router.sh install
+git clone https://github.com/yp201/agent-router.git && cd agent-router && ./agent-router.sh install
 ```
 
 It checks for Node 24, generates a local CA, asks for `sudo` twice (trust the CA, point `api.anthropic.com` at this
