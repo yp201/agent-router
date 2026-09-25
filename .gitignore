@@ -1,0 +1,5 @@
+ledger.sqlite*
+router.log
+*.bak
+node_modules/
+.DS_Store

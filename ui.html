@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-router</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root { color-scheme: dark; --bg: #151412; --rail: #1A1816; --panel: #1E1C19; --line: #2C2925; --fg: #F3EFE7; --muted: #A39E93;
+  --clay: #D97757; --teal: #5FB3A1; --amber: #E0A458; --gray: #4A453D; --serif: 'Instrument Serif', Georgia, serif;
+  --sans: 'IBM Plex Sans', system-ui, sans-serif; --mono: 'IBM Plex Mono', ui-monospace, monospace; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); }
+a { color: var(--fg); text-decoration: none; } a:hover { color: var(--clay); }
+.app { display: flex; min-height: 100vh; }
+.rail { width: 220px; flex-shrink: 0; padding: 24px 16px; display: flex; flex-direction: column; gap: 4px; border-right: 1px solid var(--line); background: var(--rail); position: sticky; top: 0; height: 100vh; }
+.brand { font: 26px var(--serif); padding: 4px 12px 20px; }
+.rail a { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px; color: var(--muted); }
+.rail a[aria-current] { background: var(--line); color: var(--fg); font-weight: 500; }
+.rail svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; flex-shrink: 0; }
+.grow { flex-grow: 1; }
+main { flex-grow: 1; min-width: 0; padding: 28px 32px; display: flex; flex-direction: column; gap: 20px; }
+header.top { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+h1 { margin: 0; font: 400 34px var(--serif); } h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.panel { padding: 20px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.inset { padding: 12px 14px; border-radius: 10px; background: var(--bg); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+.warnbox { background: #2A2320; border-color: #4A3A2E; flex-direction: row; gap: 12px; }
+.row { display: flex; align-items: center; gap: 8px; } .between { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.col { display: flex; flex-direction: column; gap: 4px; }
+.grid4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+.grid2 { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+.kpi { padding: 18px 20px; gap: 6px; }
+.label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.big { font: 30px var(--mono); }
+.muted { color: var(--muted); } .small { font-size: 12px; } .note { font-size: 13px; color: var(--muted); line-height: 1.5; }
+.mono { font-family: var(--mono); } .teal { color: var(--teal); } .clay { color: var(--clay); } .amber { color: var(--amber); }
+.chip { font-size: 11px; padding: 2px 7px; border-radius: 99px; background: var(--line); color: var(--muted); white-space: nowrap; }
+.chip.ok { background: #23342F; color: var(--teal); } .chip.warn { background: #3A2E24; color: var(--amber); } .chip.bad { background: #3A2420; color: var(--clay); }
+button, select, input { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+button { cursor: pointer; font-weight: 500; } button:hover:not(:disabled) { border-color: var(--muted); } button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--clay); border-color: var(--clay); color: var(--bg); font-weight: 600; }
+button.sm, select.sm { padding: 6px 10px; border-radius: 6px; }
+input[type=number] { width: 72px; font-family: var(--mono); }
+:focus-visible { outline: 2px solid var(--clay); outline-offset: 2px; }
+.seg { display: flex; gap: 4px; padding: 4px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); }
+.seg button { border: none; background: transparent; color: var(--muted); padding: 7px 12px; }
+.seg button[aria-pressed=true] { background: var(--line); color: var(--fg); }
+.bar { height: 10px; border-radius: 5px; background: var(--line); overflow: hidden; display: flex; flex-grow: 1; }
+.bar > div { height: 100%; }
+.table { display: flex; flex-direction: column; gap: 2px; overflow-x: auto; }
+.tr { display: grid; gap: 12px; padding: 10px; border-radius: 8px; align-items: center; font: 13px var(--mono); min-width: 760px; }
+.tr:nth-child(even) { background: var(--bg); } .tr.th { color: var(--muted); font: 12px var(--sans); }
+.live .tr { grid-template-columns: 70px 76px 1fr 56px 64px; gap: 8px; padding: 8px; font-size: 12px; min-width: 420px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--teal); display: inline-block; flex-shrink: 0; }
+.status { padding: 12px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); }
+.dashed { background: var(--rail); border-style: dashed; border-color: var(--gray); }
+pre, .cmd { font: 12px var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 0; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.err { color: var(--clay); }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+@media (max-width: 1000px) { .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid2 { grid-template-columns: 1fr; } }
+@media (max-width: 720px) {
+  .app { flex-direction: column; } .rail { width: auto; height: auto; position: static; flex-direction: row; flex-wrap: wrap; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand { padding: 4px 12px 4px 0; font-size: 22px; } .grow, .status { display: none; } main { padding: 20px 16px; } .grid4 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="rail" aria-label="Sections">
+    <div class="brand">agent-router</div>
+    <a href="#overview"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>Overview</a>
+    <a href="#accounts"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/></svg>Accounts &amp; routing</a>
+    <a href="#cache"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>Cache</a>
+    <a href="#cost"><svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg>Cost &amp; budgets</a>
+    <a href="#insights"><svg viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/><circle cx="12" cy="12" r="5"/></svg>Insights</a>
+    <div class="grow"></div>
+    <div class="status" id="status" aria-live="polite">connecting…</div>
+  </nav>
+  <main id="main"></main>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const NA = '<span class="muted">—</span>';
+const tok = (n) => n == null ? NA : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(Math.round(n));
+const pct = (x) => x == null ? NA : `${Math.round(x * 100)}%`;
+const two = (n) => String(n).padStart(2, '0');
+const dur = (s) => { if (s == null || s < 0) return '—'; s = Math.round(s);
+  return s >= 86400 ? `${Math.floor(s / 86400)}d ${two(Math.floor(s % 86400 / 3600))}h` : s >= 3600 ? `${Math.floor(s / 3600)}h ${two(Math.floor(s % 3600 / 60))}m` : s >= 60 ? `${Math.floor(s / 60)}m` : `${s}s`; };
+const ago = (ms) => ms ? `${dur((Date.now() - ms) / 1000)} ago` : 'never';
+const until = (epochS) => epochS ? dur(epochS - Date.now() / 1000) : '—';
+const hms = (ms) => new Date(ms).toLocaleTimeString('en-GB');
+const short = (k) => esc((k ?? '').slice(0, 8));
+const model = (m) => esc((m ?? '—').replace(/^claude-/, '').replace(/-\d{8}$/, ''));
+const get = (p) => fetch(`/router/${p}`).then((r) => r.json());
+const send = (method, p, body) => fetch(`/router/${p}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) }).then((r) => r.json());
+let S = {};            // last settings
+const ui = { cacheSession: 'all', cacheDays: 7, dollars: false, open: {}, added: null }; // view state that survives re-renders
+const uColor = (u) => u == null ? 'var(--gray)' : u >= (S.warn_pct ?? .8) ? 'var(--clay)' : u >= .5 ? 'var(--amber)' : 'var(--teal)';
+const badge = (st) => `<span class="chip ${st === 'ok' || st === 'unknown' ? 'ok' : st === 'cooling' ? 'warn' : st === 'needs_login' ? 'bad' : ''}">${st === 'ok' || st === 'unknown' ? 'healthy' : esc(st)}</span>`;
+const ring = (u, c) => { const L = 150.8, f = Math.min(1, u ?? 0) * L;
+  return `<svg width="56" height="56" viewBox="0 0 56 56" role="img" aria-label="5-hour window ${u == null ? 'unknown' : Math.round(u * 100) + '%'}"><circle cx="28" cy="28" r="24" fill="none" stroke="#2C2925" stroke-width="6"/><circle cx="28" cy="28" r="24" fill="none" stroke="${c}" stroke-width="6" stroke-linecap="round" stroke-dasharray="${f.toFixed(1)} ${L}" transform="rotate(-90 28 28)"/><text x="28" y="32" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F3EFE7">${u == null ? '—' : Math.round(u * 100) + '%'}</text></svg>`; };
+const bar = (parts) => `<div class="bar">${parts.map(([w, c]) => `<div style="width:${Math.max(0, Math.min(100, w * 100)).toFixed(1)}%;background:${c}"></div>`).join('')}</div>`;
+const kpi = (label, value, sub, cls = '') => `<div class="panel kpi"><div class="label">${label}</div><div class="big ${cls}">${value}</div><div class="small muted">${sub}</div></div>`;
+const head = (title, sub, right = '') => `<header class="top"><div class="col"><h1>${title}</h1><div class="muted">${sub}</div></div>${right}</header>`;
+const acctLine = (a) => a.kind === 'home' ? 'desktop login · never stored'
+  : `oauth · ${a.token_expires_at ? `token refreshes in ${dur((a.token_expires_at - Date.now()) / 1000)}` : 'token not loaded yet'}`;
+
+// ---------- views: each returns [paths to fetch, render(data)] ----------
+const views = {
+  overview: [['overview', 'settings'], (o) => {
+    const accts = o.accounts, paused = S.policy === 'manual';
+    const src = o.sources ?? {}, srcLine = Object.keys(src).length ? `${src.desktop ?? 0} desktop · ${src.cli ?? 0} terminal sessions` : 'no user-agent data yet';
+    const sw = o.switches, write = o.live.find((r) => r.cache === 'write');
+    return head('Today', `${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' })} · ${accts.length} accounts · ${o.live_sessions} live sessions`,
+      `<div class="row"><button data-act="pause-routing" aria-pressed="${paused}" title="Manual policy: new sessions stay on home">${paused ? 'Resume routing' : 'Pause routing'}</button>
+       <button class="primary" data-act="goto-add">Add account</button></div>`)
+    + `<section class="grid4">
+      ${kpi('Requests', o.requests_today, srcLine)}
+      ${kpi('Cache hit rate', pct(o.cache_hit_rate), `${tok(o.per_turn.cache_read_avg)} read · ${tok(o.per_turn.cache_create_avg)} written per turn`, 'teal')}
+      ${kpi('Switches', sw.manual + sw.forced + sw.ratelimited, `${sw.manual} manual · ${sw.forced} forced · ${sw.ratelimited} rate-limited`)}
+      ${kpi('Headroom (5h)', pct(o.headroom_5h_pct), `of one account, pooled · resets ${dur(o.reset_in_s)}`)}
+    </section>
+    <section class="grid2">
+      <div class="panel">
+        <div class="between"><h2>Accounts</h2><a href="#accounts" class="small muted">Manage →</a></div>
+        ${accts.map((a) => `<div class="inset" style="flex-direction:row;align-items:center;gap:16px;padding:14px">
+          ${ring(a.util_5h, uColor(Math.max(a.util_5h ?? 0, a.util_7d ?? 0)))}
+          <div class="col" style="flex-grow:1"><div class="row"><b>${esc(a.id)}</b>${badge(a.status)}<span class="small muted">${a.kind === 'home' ? 'desktop login' : esc(acctLine(a))}</span></div>
+            <div class="small muted">5h ${pct(a.util_5h)} · ${(a.util_7d ?? 0) > (a.util_5h ?? 0) && (a.util_7d ?? 0) >= .5 ? `<span class="amber">7d ${pct(a.util_7d)} — weekly window is the constraint</span>` : `7d ${pct(a.util_7d)}`}
+              · ${a.pinned_sessions} pinned · reset in ${until(a.reset_5h)}</div></div>
+          <div class="mono small muted">${a.requests_today} req</div></div>`).join('')}
+        <div class="inset warnbox" style="margin-top:auto">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#D97757" stroke-width="2" style="flex-shrink:0;margin-top:2px" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+          <div class="col"><b>Router policy: ${esc(o.policy_line.split(' — ')[0])}</b><div class="note">${esc(o.policy_line.split(' — ')[1] ?? '')}. Live sessions stay pinned — a switch re-writes their whole cache.</div></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="between"><h2>Live</h2><span class="small muted row"><span class="dot" style="width:6px;height:6px"></span>polling 3s</span></div>
+        <div class="table live">
+          <div class="tr th"><span>time</span><span>account</span><span>session · model</span><span>cache</span><span>latency</span></div>
+          ${o.live.map((r) => (r.migration ? `<div class="tr"><span class="muted">${hms(r.ts)}</span><span class="muted">—</span><span class="muted">${esc(r.migration.reason)} switch · ${short(r.session_key)} ${esc(r.migration.from ?? '—')} → ${esc(r.migration.to)}</span><span></span><span></span></div>` : '')
+            + `<div class="tr"><span class="muted">${hms(r.ts)}</span><span${r.account !== 'home' ? ' class="amber"' : ''}>${esc(r.account)}</span><span>${short(r.session_key)} · ${model(r.model)}${r.status >= 400 ? ` <span class="clay">${r.status}</span>` : ''}</span>
+              <span class="${r.cache === 'hit' ? 'teal' : r.cache === 'write' ? 'clay' : 'muted'}">${r.cache}</span><span>${(r.latency_ms / 1000).toFixed(2)}s</span></div>`).join('') || '<div class="note">No /v1/messages traffic yet.</div>'}
+        </div>
+        ${write ? `<a href="#cache" data-session="${esc(write.session_key)}" class="inset" style="margin-top:auto;text-align:center;font-size:13px">Why did ${hms(write.ts)} write ${tok(write.cache_create)}?</a>` : ''}
+      </div>
+    </section>`;
+  }],
+
+  accounts: [['accounts', 'sessions', 'settings'], (accts, sessions) => head('Accounts &amp; routing', 'Sticky per session. New sessions start on the account with the most headroom.',
+      `<button class="primary" data-act="focus-add">Add account</button>`)
+    + `<section class="cards">${accts.map((a) => `<div class="panel" style="gap:16px">
+        <div class="between"><div class="row"><span style="font-size:18px;font-weight:600">${esc(a.id)}</span>${badge(a.status)}</div><span class="small muted">${esc(acctLine(a))}</span></div>
+        ${[['5-hour window', a.util_5h, a.reset_5h], ['7-day window', a.util_7d, a.reset_7d]].map(([l, u, r]) =>
+          `<div class="col"><div class="small muted">${l}</div>${bar([[u ?? 0, uColor(u)]])}<div class="small mono">${pct(u)} · resets ${until(r)}</div></div>`).join('')}
+        ${a.status === 'cooling' ? `<div class="small amber">cooling ${dur((a.cooling_until - Date.now()) / 1000)} · ${esc(a.cooling_reason)}</div>` : ''}
+        <div class="small muted">${a.pinned_sessions} pinned session${a.pinned_sessions === 1 ? '' : 's'} · ${a.requests_today} requests today · last seen ${ago(a.last_seen)}</div>
+        ${ui.open[`relogin-${a.id}`] ? `<div class="cmd">CLAUDE_CONFIG_DIR=${esc(a.config_dir)} claude auth login</div>` : ''}
+        <div class="row" style="flex-wrap:wrap">
+          <button class="sm" data-a="${esc(a.id)}/${a.disabled ? 'resume' : 'pause'}">${a.disabled ? 'Resume' : 'Pause'}</button>
+          <button class="sm" data-a="${esc(a.id)}/clear-cooldown" ${a.cooling_until > Date.now() ? '' : 'disabled'}>Clear cooldown</button>
+          ${a.kind === 'home' ? '' : `<button class="sm" data-a="${esc(a.id)}/check">Check</button><button class="sm" data-act="relogin" data-id="${esc(a.id)}">Re-login</button><button class="sm" data-a="${esc(a.id)}/remove">Remove</button>`}
+        </div></div>`).join('')}
+      <form class="panel dashed" id="add" style="gap:12px">
+        <div style="font-size:15px;font-weight:600">Add another account</div>
+        <div class="note">Give it a name, then run the login command it prints in any terminal. The official OAuth flow stores the token; the router reads it at request time and never displays it.</div>
+        <label class="col small muted">Account name<input name="id" id="add-id" placeholder="acct-c" pattern="[\\w.\\-]{1,64}" required></label>
+        ${ui.added ? `<div class="cmd">${esc(ui.added.login_cmd)}</div><button type="button" class="sm" data-a="${esc(ui.added.id)}/check">Check login</button>` : '<button class="sm">Create</button>'}
+      </form></section>
+    <section class="panel">
+      <div class="between"><h2>Sessions</h2><span class="small muted">Switch cost = a full cache re-write of that session's context. Shown before you confirm.</span></div>
+      <div class="table">
+        <div class="tr th" style="grid-template-columns:110px 1fr 80px 90px 90px 100px 210px"><span>session</span><span>project · model</span><span>requests</span><span>account</span><span>context</span><span>switch cost</span><span>route to</span></div>
+        ${sessions.map((s) => `<div class="tr" style="grid-template-columns:110px 1fr 80px 90px 90px 100px 210px">
+          <span title="${esc(s.session_key)}">${short(s.session_key)}</span>
+          <span>${esc(s.project ?? '—')} · ${model(s.last_model)} ${s.source ? `<span class="chip">${s.source === 'cli' ? 'terminal' : 'desktop'}</span>` : ''}</span>
+          <span>${s.request_count}</span><span${s.account_id !== 'home' ? ' class="amber"' : ''}>${esc(s.account_id)}</span><span>${tok(s.context_est)}</span><span>${s.switch_cost_est == null ? NA : '≈' + tok(s.switch_cost_est)}</span>
+          <div class="row"><select class="sm" aria-label="Route session ${short(s.session_key)} to account" data-s="${esc(s.session_key)}">${accts.map((a) => `<option ${a.id === (ui.open[`pin-${s.session_key}`] ?? s.account_id) ? 'selected' : ''}>${esc(a.id)}</option>`).join('')}</select>
+            <button class="sm" data-pin="${esc(s.session_key)}" data-cost="${s.switch_cost_est ?? ''}">Switch</button></div></div>`).join('') || '<div class="note">No sessions yet.</div>'}
+      </div>
+      <fieldset class="inset" style="margin:0"><legend class="small muted" style="padding:0 4px">Routing policy</legend>
+        ${[['sticky_least_utilized', 'Sticky, least-utilized for new sessions', ' <span class="muted">(recommended)</span>'], ['prefer_home_until_80', 'Prefer home until 80%', ''], ['manual', 'Manual only', ' <span class="muted">(new sessions stay on home)</span>']].map(([v, l, x]) =>
+          `<label class="row"><input type="radio" name="policy" value="${v}" ${S.policy === v ? 'checked' : ''}> ${l}${x}</label>`).join('')}
+        <div class="small muted">Forced switch on 429 / 529 · cooldown from reset headers · new sessions avoid accounts over ${pct(S.route_cutoff_pct)} (5h) or inside the ${pct(S.weekly_reserve_pct)} weekly reserve</div>
+      </fieldset>
+    </section>`],
+
+  cache: [[() => `cache?session=${encodeURIComponent(ui.cacheSession)}&days=${ui.cacheDays}`, 'sessions', 'settings'], (c, sessions) => {
+    const t = c.turns.slice(-60), max = Math.max(1, ...t.map((r) => (r.cache_read ?? 0) + (r.cache_create ?? 0) + (r.in_tok ?? 0)));
+    const step = 700 / Math.max(t.length, 1), bw = Math.min(22, step - 4), y = (v) => (v / max) * 200;
+    const bars = t.map((r, k) => { const x = 44 + k * step; let top = 260; const seg = (v, fill) => { const h = y(v ?? 0); top -= h; return h > 0 ? `<rect x="${x.toFixed(1)}" y="${top.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${fill}"/>` : ''; };
+      return `<g><title>turn ${r.i}${ui.cacheSession === 'all' ? ` (${(r.session_key ?? '').slice(0, 8)})` : ''} · ${hms(r.ts)}\nread ${r.cache_read ?? '—'} · write ${r.cache_create ?? '—'} · uncached ${r.in_tok ?? '—'}${r.burst ? `\nburst: ${r.burst.cause}` : ''}</title>${seg(r.cache_read, '#5FB3A1')}${seg(r.cache_create, '#D97757')}${seg(r.in_tok, '#4A453D')}
+        ${r.burst ? `<text x="${(x + bw / 2).toFixed(1)}" y="276" text-anchor="middle" font-family="IBM Plex Mono" font-size="10" fill="#D97757">${r.i}</text>` : ''}</g>`; }).join('');
+    const DESC = { 'account switch': 'Cache is per account, so the full context was re-written.', 'MCP tool list': 'Tools sit before the conversation in the prefix, so everything after them was invalidated.',
+      'system prompt': 'Anything in the system block invalidates the entire cache.', 'first turn': 'First request of this thread: nothing to reuse yet.',
+      'context growth': 'No prefix change detected: the context grew, or the cache was evicted.' };
+    const desc = (b) => b.cause.startsWith('idle') ? `Gap of ${dur(b.gap_s)} between turns. The 1h cache lapsed. Not avoidable unless you keep the session warm.` : Object.entries(DESC).find(([k]) => b.cause.startsWith(k))?.[1] ?? '';
+    const label = ui.cacheSession === 'all' ? 'all sessions' : `session ${short(ui.cacheSession)}`;
+    return head('Cache', 'Every turn re-sends the whole conversation. What\'s cached is nearly free; what isn\'t is the bill.',
+      `<div class="row"><label class="sr" for="cs">Session</label><select id="cs" data-act="cache-session"><option value="all">All sessions</option>${sessions.map((s) => `<option value="${esc(s.session_key)}" ${s.session_key === ui.cacheSession ? 'selected' : ''}>Session ${short(s.session_key)} · ${esc(s.project ?? '')}</option>`).join('')}</select>
+       <label class="sr" for="cd">Days</label><select id="cd" data-act="cache-days">${[1, 7, 30].map((d) => `<option value="${d}" ${d === ui.cacheDays ? 'selected' : ''}>${d === 1 ? '24 hours' : d + ' days'}</option>`).join('')}</select></div>`)
+    + `<section class="grid4">
+        ${kpi('Hit rate', pct(c.hit_rate), 'of input tokens read from cache', 'teal')}
+        ${kpi('Cache reads', tok(c.reads_per_turn), 'per turn · 1h TTL · billed at 0.1×')}
+        ${kpi('Cache writes', tok(c.last_write), 'last turn · billed at 2× for 1h TTL', 'clay')}
+        ${kpi('Avoidable writes', c.avoidable.total ? `${c.avoidable.count} of ${c.avoidable.total}` : NA, 'bursts with a known cause you control')}
+      </section>
+      <section class="grid2" style="grid-template-columns:1.4fr 1fr">
+        <div class="panel">
+          <div class="between"><h2>Input tokens per turn — ${label}</h2><div class="row small muted"><span class="dot" style="border-radius:2px;background:#5FB3A1"></span>cache read <span class="dot" style="border-radius:2px;background:#D97757"></span>cache write <span class="dot" style="border-radius:2px;background:#4A453D"></span>uncached</div></div>
+          ${t.length ? `<svg viewBox="0 0 760 300" width="100%" role="img" aria-label="Stacked bars of cache read, cache write and uncached input tokens for the last ${t.length} joined turns; bursts numbered in red">
+            <line x1="40" y1="260" x2="750" y2="260" stroke="#2C2925"/><line x1="40" y1="160" x2="750" y2="160" stroke="#2C2925" stroke-dasharray="3 4"/><line x1="40" y1="60" x2="750" y2="60" stroke="#2C2925" stroke-dasharray="3 4"/>
+            <text x="4" y="264" font-family="IBM Plex Mono" font-size="10" fill="#A39E93">0</text><text x="4" y="164" font-family="IBM Plex Mono" font-size="10" fill="#A39E93">${esc(tok(max / 2))}</text><text x="4" y="64" font-family="IBM Plex Mono" font-size="10" fill="#A39E93">${esc(tok(max))}</text>
+            ${bars}<text x="395" y="295" text-anchor="middle" font-family="IBM Plex Sans" font-size="11" fill="#A39E93">turn</text></svg>`
+            : '<div class="note">No joined turns in this range yet. Usage appears once the transcript tailer matches a request id.</div>'}
+          <div class="note">Numbered columns are cache bursts: the prefix changed and the context was written again. Hover a column for its numbers and cause.</div>
+        </div>
+        <div class="panel">
+          <h2>Cache bursts — why the cache was rewritten</h2>
+          ${c.bursts.slice(0, 12).map((b) => `<div class="inset" style="${b.avoidable ? 'border-color:#4A3A2E' : ''}">
+              <div class="between"><span class="row" style="font-weight:600">Turn ${b.i}${ui.cacheSession === 'all' ? ` <span class="small muted mono">${short(b.session_key)}</span>` : ''} · ${esc(b.cause)}${b.avoidable ? '<span class="chip warn">avoidable</span>' : ''}</span><span class="mono small clay">+${tok(b.delta)} written</span></div>
+              <div class="note">${esc(desc(b))}</div>${b.fix && b.avoidable ? `<div class="small">Fix: ${esc(b.fix)}</div>` : ''}</div>`).join('') || '<div class="note">No bursts in this range.</div>'}
+          <div class="note">If the avoidable bursts had not happened, ${label} would have written <span class="mono" style="color:var(--fg)">${tok(c.savings_if_avoided_tokens)}</span> fewer tokens — about <span class="mono" style="color:var(--fg)">${pct(c.savings_pct_of_5h)}</span> of a 5-hour window.</div>
+        </div>
+      </section>`;
+  }],
+
+  cost: [['cost', 'accounts'], (c, accts) => {
+    const w5 = c.windows['5h'], w7 = c.windows['7d'], st = c.settings, rc = st.rate_card ?? {};
+    const resets = w5.map((w) => w.reset).filter(Boolean), firstReset = resets.length ? new Date(Math.min(...resets) * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '—';
+    const warnings = [...w7.filter((w) => (w.projected_at_reset ?? 0) > 1 - st.weekly_reserve_pct).map((w) => `${w.account} will reach its ${pct(st.weekly_reserve_pct)} weekly reserve before reset at the current rate (${pct(w.projected_at_reset)} projected).`),
+      ...w5.filter((w) => (w.util ?? 0) >= st.warn_pct).map((w) => `${w.account} is past the ${pct(st.warn_pct)} warning on its 5-hour window.`)];
+    const maxShare = Math.max(0.0001, ...c.per_session.map((s) => s.share ?? 0));
+    const cols = 'grid-template-columns:120px 1fr 80px 100px 100px 90px 120px';
+    const cell = (s) => ui.dollars ? (s.dollars == null ? NA : `$${s.dollars.toFixed(2)}`) : tok(s.switch_overhead || null);
+    return head('Cost &amp; budgets', 'On a subscription the currency is window headroom. Dollar equivalents use the rate card you set.',
+      `<div class="seg" role="group" aria-label="Units"><button data-act="units" data-v="0" aria-pressed="${!ui.dollars}">Windows</button><button data-act="units" data-v="1" aria-pressed="${ui.dollars}">Dollars (est.)</button></div>`)
+    + `<section class="grid2" style="grid-template-columns:1.3fr 1fr">
+      <div class="panel">
+        <div class="between"><h2>Pooled 5-hour window</h2><span class="small muted">first reset ${firstReset}</span></div>
+        ${w5.map((w) => `<div class="row" style="gap:12px"><span class="mono" style="width:80px">${esc(w.account)}</span>${bar([[w.util ?? 0, uColor(w.util)], [Math.max(0, (w.projected_at_reset ?? 0) - (w.util ?? 0)), '#2E4A42']])}
+          <span class="mono small ${(w.projected_at_reset ?? 0) > 1 ? 'amber' : 'muted'}" style="width:170px">${pct(w.util)} · ${w.projected_at_reset == null ? 'no projection yet' : `+${pct(Math.max(0, w.projected_at_reset - (w.util ?? 0)))} projected`}</span></div>`).join('')}
+        <div class="note">Projection = the last hour's burn rate carried to the window reset. The lighter segment is what's still coming at that rate.</div>
+        <h2>7-day window</h2>
+        ${w7.map((w) => `<div class="row" style="gap:12px"><span class="mono" style="width:80px">${esc(w.account)}</span>${bar([[w.util ?? 0, uColor(w.util)], [Math.max(0, (w.projected_at_reset ?? 0) - (w.util ?? 0)), '#4A3A2E']])}
+          <span class="mono small ${(w.projected_at_reset ?? 0) > 1 - st.weekly_reserve_pct ? 'amber' : 'muted'}" style="width:170px">${pct(w.util)} · ${w.projected_at_reset == null ? `resets ${w.reset ? new Date(w.reset * 1000).toLocaleDateString('en-GB', { weekday: 'short' }) : '—'}` : `${pct(w.projected_at_reset)} by reset`}</span></div>`).join('')}
+      </div>
+      <form class="panel" id="budgets">
+        <h2>Budgets &amp; alerts</h2>
+        ${[['warn_pct', 'Warn me when any account passes'], ['route_cutoff_pct', 'Stop starting new sessions on an account above'], ['weekly_reserve_pct', 'Reserve for the weekly window']].map(([k, l]) =>
+          `<label class="between"><span>${l}</span><span class="row"><input type="number" min="0" max="100" step="1" name="${k}" value="${Math.round(st[k] * 100)}">%</span></label>`).join('')}
+        <details ${ui.open.rate ? 'open' : ''} data-k="rate"><summary>Rate card for dollar estimates (${Object.keys(rc).length ? Object.keys(rc).length + ' models' : 'not set'})</summary>
+          <div class="col" style="gap:8px;margin-top:8px">
+            ${Object.entries(rc).map(([m, r]) => `<div class="between small mono"><span>${esc(m)}: in ${r.input} · out ${r.output} · read ${r.cache_read} · write ${r.cache_write} $/Mtok</span><button type="button" class="sm" data-act="rate-del" data-m="${esc(m)}">Remove</button></div>`).join('')}
+            <label class="col small muted">Model prefix<input name="rc_model" placeholder="claude-opus-5"></label>
+            <div class="row" style="flex-wrap:wrap">${['input', 'output', 'cache_read', 'cache_write'].map((k) => `<label class="col small muted">${k.replace('_', ' ')} $/Mtok<input type="number" min="0" step="0.01" name="rc_${k}"></label>`).join('')}</div>
+            <button type="button" class="sm" data-act="rate-add">Save rate</button>
+          </div></details>
+        ${warnings.map((x) => `<div class="inset warnbox"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#E0A458" stroke-width="2" style="flex-shrink:0" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg><span class="small">${esc(x)}</span></div>`).join('')}
+      </form>
+    </section>
+    <section class="panel">
+      <div class="between"><h2>Where the tokens went — today</h2><span class="small muted">from the session transcripts, not estimates</span></div>
+      <div class="table">
+        <div class="tr th" style="${cols}"><span>session</span><span>share of window</span><span>turns</span><span>cache read</span><span>cache write</span><span>output</span><span>${ui.dollars ? 'dollars (est.)' : 'switch overhead'}</span></div>
+        ${c.per_session.map((s) => `<div class="tr" style="${cols}"><span title="${esc(s.session_key)}">${short(s.session_key)}</span>${bar([[(s.share ?? 0) / maxShare, '#D97757']])}
+          <span>${s.turns}</span><span>${tok(s.joined ? s.cache_read : null)}</span><span>${tok(s.joined ? s.cache_create : null)}</span><span>${tok(s.joined ? s.out_tok : null)}</span><span>${cell(s)}</span></div>`).join('')}
+        <div class="tr" style="${cols}"><span>${c.one_shots.count} one-shots</span>${bar([[(c.one_shots.share ?? 0) / maxShare, '#A39E93']])}<span>${c.one_shots.count}</span><span>${NA}</span><span>${NA}</span><span>${tok(c.one_shots.out_tok || null)}</span><span>${NA}</span></div>
+      </div>
+      <div class="note">"One-shots" are single-message requests with no tools — the desktop's side requests: title generation, prompt suggestions, summaries. Many never reach a transcript, so their usage often stays "—".</div>
+    </section>`;
+  }],
+
+  insights: [['insights', 'settings'], (n) => {
+    const cards = [
+      ...n.recurring_preambles.map((p) => [`The same ${tok(p.est_tokens)}-token preamble opens ${p.sessions} sessions`, 'make it a skill',
+        `Pasted as the first message in ${p.sessions} sessions across ${p.projects} project${p.projects === 1 ? '' : 's'}. As a skill it lives in the cached system prefix instead of the uncached first turn.`, `≈${tok(p.est_tokens * p.sessions)} tok re-sent uncached`]),
+      ...(n.unused_tools.loaded ? [[`${n.unused_tools.loaded} tools loaded, ${n.unused_tools.used} ever called`, 'context',
+        `${n.unused_tools.never_used.length} tool definitions were never called in any transcript. They sit in every request's prefix and cause bursts whenever a server reconnects.`,
+        `<details data-k="unused" ${ui.open.unused ? 'open' : ''}><summary>Show unused tools</summary><div class="mono small" style="margin-top:6px">${n.unused_tools.never_used.map(esc).join(', ')}</div></details>`]] : []),
+      ...(n.big_context_sessions.length ? [[`${n.big_context_sessions.length} session${n.big_context_sessions.length === 1 ? '' : 's'} crossed 120k context`, 'context',
+        `Each later turn re-reads all of it. ${n.big_context_sessions.map((b) => `${b.session_key.slice(0, 8)} peaked at ${tok(b.max_context_est)} (${b.turns_over_120k} turns over 120k)`).map(esc).join('; ')}. Starting fresh with a summary around 100k keeps the same work cheaper.`, '']] : []),
+      ...(n.burst_hours.length ? [[`Cache bursts cluster at ${two(n.burst_hours[0].hour)}:00–${two((n.burst_hours[0].hour + 1) % 24)}:00`, 'habit',
+        `${n.burst_hours[0].count} of ${n.totals.bursts} bursts this week started in that hour. Sessions left idle over 1h come back cold; one cheap turn before 60 minutes keeps the 1h cache alive.`, '']] : []),
+    ];
+    const rules = S.context_rules ?? [];
+    return head('Insights', 'Patterns across every session, and the context rules that come out of them.',
+      `<span class="small muted">Learned from ${n.window.days} days · ${n.window.turns.toLocaleString()} turns · ${n.window.sessions} sessions</span>`)
+    + `<section class="grid2" style="grid-template-columns:1.2fr 1fr">
+      <div class="panel"><h2>Recurring patterns</h2>
+        ${cards.map(([t, chip, body, foot]) => `<div class="inset"><div class="between"><b>${esc(t)}</b><span class="chip ${chip === 'habit' ? '' : 'warn'}">${chip}</span></div><div class="note">${body.startsWith('<') ? body : esc(body)}</div>${foot ? `<div class="small mono amber">${foot}</div>` : ''}</div>`).join('')
+          || '<div class="note">No recurring patterns yet. They show up once the ledger has a few days of joined sessions.</div>'}
+      </div>
+      <div class="col" style="gap:16px">
+        <div class="panel">
+          <div class="between"><h2>Global context rules</h2><span class="small muted row"><span class="dot" style="background:${S.openvikings_endpoint ? 'var(--teal)' : 'var(--gray)'}"></span>${S.openvikings_endpoint ? 'OpenVikings endpoint set' : 'OpenVikings not connected'}</span></div>
+          <div class="note">Rules are stored locally. Syncing them to OpenVikings, so every harness applies them, is a placeholder until that endpoint exists.</div>
+          ${rules.map((r) => `<label class="inset" style="flex-direction:row;align-items:center;gap:10px"><input type="checkbox" data-rule="${esc(r.id)}" ${r.enabled ? 'checked' : ''}><span style="flex-grow:1">${esc(r.text)}</span><span class="chip ${r.state === 'synced' ? 'ok' : ''}">${esc(r.state)}</span></label>`).join('')}
+          <form id="rule-add" class="row"><label class="sr" for="rule-text">New rule</label><input id="rule-text" name="text" placeholder="New rule…" required style="flex-grow:1"><button class="sm">Add</button></form>
+          <form id="ov" class="row" style="flex-wrap:wrap"><label class="row small muted" style="flex-grow:1">Endpoint<input name="endpoint" value="${esc(S.openvikings_endpoint ?? '')}" placeholder="not set" style="flex-grow:1"></label><button class="sm">Save</button>
+            <button type="button" class="sm" disabled title="Placeholder: sync is not built yet">Sync now</button></form>
+        </div>
+        <div class="panel"><h2>This week, if you took every suggestion</h2>
+          <div class="grid4" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+            <div class="col"><span class="small muted">tokens saved</span><span class="mono" style="font-size:24px">${n.totals.tokens_saved_est ? '≈' + tok(n.totals.tokens_saved_est) : NA}</span></div>
+            <div class="col"><span class="small muted">of one weekly window</span><span class="mono" style="font-size:24px">${NA}</span></div>
+            <div class="col"><span class="small muted">bursts avoided</span><span class="mono" style="font-size:24px">${n.totals.bursts_avoidable}</span></div>
+          </div>
+          <div class="note">Counted from avoidable cache bursts in your own transcripts, joined to the router's ledger by request id. They change as the ledger grows.</div>
+        </div>
+      </div></section>`;
+  }],
+};
+
+// ---------- routing, polling, rendering ----------
+const route = () => { const r = location.hash.slice(1).split('?')[0]; return views[r] ? r : 'overview'; };
+let seq = 0;
+async function refresh(force) {
+  const r = route(), [paths, render] = views[r], my = ++seq;
+  document.querySelectorAll('.rail a').forEach((a) => a.toggleAttribute('aria-current', a.getAttribute('href') === `#${r}`));
+  try {
+    const [h, ...data] = await Promise.all(['health', ...paths.map((p) => (typeof p === 'function' ? p() : p))].map(get));
+    if (my !== seq) return; // a newer refresh (route change) superseded this one
+    if (data.at(-1)?.policy) S = data.at(-1); else if (data[0]?.settings) S = data[0].settings;
+    $('#status').innerHTML = `<div class="row"><span class="dot" style="background:${h.transparent ? 'var(--teal)' : 'var(--amber)'}"></span><span style="color:var(--fg)">Transparent mode ${h.transparent ? 'on' : 'off'}</span></div>
+      <div>${h.launchd ? 'launchd' : 'manual run'} · up ${dur(h.uptime)}</div><div class="mono">${h.transparent ? 'api.anthropic.com → 127.0.0.1' : 'explicit :4001 only'}</div>
+      <div>${h.requests.toLocaleString()} requests · ${h.sessions} sessions</div>`;
+    // never yank a control out from under the user; the next tick catches up
+    const f = document.activeElement;
+    if (!force && f && $('#main').contains(f) && /^(INPUT|SELECT|TEXTAREA)$/.test(f.tagName)) return;
+    $('#main').innerHTML = render(...data);
+    document.title = `agent-router`;
+  } catch (e) {
+    $('#status').innerHTML = `<span class="err">router unreachable: ${esc(e.message)}</span>`;
+  }
+}
+async function act(path, body, method = 'POST') {
+  const r = await send(method, path, body);
+  if (r?.error || r?.ok === false) alert(JSON.stringify(r.error ?? r));
+  await refresh(true);
+  return r;
+}
+const putSettings = (patch) => act('settings', patch, 'PUT');
+
+document.addEventListener('click', (e) => {
+  const t = e.target.closest('button, a[data-session]');
+  if (!t) return;
+  const d = t.dataset;
+  if (d.session) { ui.cacheSession = d.session; return; } // then the #cache link navigates
+  if (d.a) { const [id, action] = d.a.split('/'); if (action !== 'remove' || confirm(`Remove ${id}? Its sessions fall back to another account.`)) act(`accounts/${encodeURIComponent(id)}/${action}`); }
+  if (d.pin) {
+    const acct = document.querySelector(`select[data-s="${CSS.escape(d.pin)}"]`).value;
+    if (confirm(`Route session ${d.pin.slice(0, 8)} to ${acct}?\nIts next turn re-writes the whole cache on ${acct}${d.cost ? `: ≈${Number(d.cost).toLocaleString()} tokens` : ''}.`))
+      act(`sessions/${encodeURIComponent(d.pin)}/pin`, { account_id: acct }).then(() => delete ui.open[`pin-${d.pin}`]);
+  }
+  if (d.act === 'pause-routing') putSettings({ policy: S.policy === 'manual' ? 'sticky_least_utilized' : 'manual' });
+  if (d.act === 'focus-add') $('#add-id')?.focus();
+  if (d.act === 'goto-add') { location.hash = '#accounts'; setTimeout(() => $('#add-id')?.focus(), 400); }
+  if (d.act === 'relogin') { ui.open[`relogin-${d.id}`] = !ui.open[`relogin-${d.id}`]; refresh(true); }
+  if (d.act === 'units') { ui.dollars = d.v === '1'; refresh(true); }
+  if (d.act === 'rate-del') { const rc = { ...S.rate_card }; delete rc[d.m]; putSettings({ rate_card: rc }); }
+  if (d.act === 'rate-add') {
+    const f = new FormData($('#budgets')), m = String(f.get('rc_model')).trim();
+    if (!m) return alert('Model prefix is required');
+    putSettings({ rate_card: { ...S.rate_card, [m]: Object.fromEntries(['input', 'output', 'cache_read', 'cache_write'].map((k) => [k, Number(f.get(`rc_${k}`)) || 0])) } });
+  }
+});
+document.addEventListener('change', (e) => {
+  const t = e.target, d = t.dataset;
+  if (d.s) ui.open[`pin-${d.s}`] = t.value;
+  if (d.act === 'cache-session') { ui.cacheSession = t.value; refresh(true); }
+  if (d.act === 'cache-days') { ui.cacheDays = Number(t.value); refresh(true); }
+  if (t.name === 'policy') putSettings({ policy: t.value });
+  if (t.closest('#budgets') && /_pct$/.test(t.name)) {
+    const v = Number(t.value);
+    if (v >= 0 && v <= 100) putSettings({ [t.name]: v / 100 }); else alert('Enter 0–100');
+  }
+  if (d.rule) putSettings({ context_rules: S.context_rules.map((r) => (r.id === d.rule ? { ...r, enabled: t.checked } : r)) });
+});
+document.addEventListener('toggle', (e) => { if (e.target.dataset?.k) ui.open[e.target.dataset.k] = e.target.open; }, true);
+document.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  if (e.target.id === 'add') {
+    const id = String(f.get('id')).trim(), r = await act('accounts', { id });
+    if (r.login_cmd) { ui.added = { id, login_cmd: r.login_cmd }; refresh(true); }
+  }
+  if (e.target.id === 'rule-add') putSettings({ context_rules: [...S.context_rules, { id: `r${Date.now()}`, text: String(f.get('text')), enabled: true, state: 'proposed' }] });
+  if (e.target.id === 'ov') putSettings({ openvikings_endpoint: String(f.get('endpoint')).trim() || null });
+});
+addEventListener('hashchange', () => refresh(true));
+refresh(true);
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
