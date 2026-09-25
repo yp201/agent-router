@@ -3,8 +3,8 @@
 class AgentRouter < Formula
   desc "Sticky multi-account router and cache doctor for Claude Code (desktop + CLI)"
   homepage "https://github.com/yp201/agent-router"
-  url "https://github.com/yp201/agent-router/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "b06cbfffdcdb4d62f8ef72ba8d897893b6c6be90eab511b2f04c02c8e6530eb3"
+  url "https://github.com/yp201/agent-router/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "9ebdf83d7c7a0b67c1dbcd437d22b85e67dd1984d01f0a91bcf95eca8c515d53"
   license "MIT"
   head "https://github.com/yp201/agent-router.git", branch: "main"
 
