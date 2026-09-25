@@ -3,6 +3,7 @@ import { createServer as createTls, request as httpsRequest } from 'node:https';
 import { rootCertificates } from 'node:tls';
 import { Resolver } from 'node:dns/promises';
 import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { gunzipSync, inflateSync, brotliDecompressSync } from 'node:zlib';
@@ -116,6 +117,9 @@ async function choose(key: string | null, nonMsg: boolean, exclude: string[] = [
   }
 }
 
+// fault injection for live drills: POST /router/accounts/:id/fault429 {count} → the next N /v1/messages on that account are
+// treated as an upstream 429 (retry-after 60) without dialing, so cooldown + replay run against the real API elsewhere
+const faults: Record<string, number> = {};
 const forced = (status: number, a: Account) => status === 429 || status === 529 || (status === 401 && a.kind === 'oauth');
 function cool(a: Account, up: IncomingMessage) {
   const g = (k: string) => up.headers[k] as string | undefined, ra = Number(g('retry-after')), now = Date.now();
@@ -189,7 +193,12 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   const send = async ({ a, tok }: { a: Account; tok: string | null }) => {
     const h = { ...headers };
     if (tok) { h.authorization = `Bearer ${tok}`; delete h['x-api-key']; }
-    const up = await dial({ method: req.method, path: req.url, headers: h }, hasBody ? body : undefined);
+    let up: any;
+    if (isMsg && faults[a.id] > 0) {
+      faults[a.id]--; console.warn(`fault429 injected for ${a.id} (${faults[a.id]} left)`);
+      up = Object.assign(Readable.from([Buffer.from('{"type":"error","error":{"type":"rate_limit_error","message":"injected by agent-router fault429"}}')]),
+        { statusCode: 429, headers: { 'retry-after': '60', 'request-id': `fault_${Date.now()}`, 'content-type': 'application/json' } });
+    } else up = await dial({ method: req.method, path: req.url, headers: h }, hasBody ? body : undefined);
     const r: Record<string, string> = {};
     for (const [k, v] of Object.entries(up.headers)) if (k.startsWith('anthropic-ratelimit-')) r[k] = String(v);
     const s = JSON.stringify(r);
@@ -294,6 +303,7 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
     if (!a) return json(res, 404, { error: { type: 'not_found' } });
     if (['disable', 'enable', 'pause', 'resume'].includes(action)) setAcct(id, { disabled: action === 'disable' || action === 'pause' ? 1 : 0 });
     else if (action === 'clear-cooldown') setAcct(id, { cooling_until: null, cooling_reason: null });
+    else if (action === 'fault429') { faults[id] = Math.max(0, Number(input?.count ?? 1)); console.warn(`fault429 armed: ${id} × ${faults[id]}`); return json(res, 200, { ok: true, pending: faults[id] }); }
     else if (action === 'remove') {
       if (a.kind === 'home') return json(res, 400, { error: { type: 'cannot_remove_home' } });
       db.prepare('delete from accounts where id = ?').run(id);

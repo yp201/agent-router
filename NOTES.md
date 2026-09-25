@@ -194,3 +194,10 @@ If the tab errors with a certificate failure, the CLI isn't seeing `NODE_EXTRA_C
   shown in `/router/health`. Failure → advice stored with `text = null`, one log line, never a crash.
 - Notification: `osascript display notification` on macOS unless `NOTIFY=0`.
 - Dry run on a copy of the live ledger: real Haiku advice in ~11 s (two API calls, 0.9 s + 9.3 s), handoff in ~20 s.
+
+## Live 429 drill (2026-09-25)
+`POST /router/accounts/:id/fault429 {count}` makes the next N `/v1/messages` on that account behave as an upstream 429
+(`retry-after: 60`) without dialing. Drill on a fresh Haiku session pinned to raymond: injected 429 → raymond cooled
+60 s → replayed on acct-b (real API, 200, `retry_of` set) → migration `429`, est 62k → **actual 74 tokens** because
+acct-b had a warm cache for the same prefix from other Haiku sessions within the hour. Prefix caches are per account,
+not per session: the cheapest fallback is the account that recently served the same kind of session (unused signal).
