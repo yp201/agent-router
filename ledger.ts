@@ -44,6 +44,7 @@ if (addCol('requests', 'usage_src text')) db.exec(`update requests set usage_src
 addCol('requests', 'source text');
 addCol('tool_uses', 'arg text');
 addCol('brain_sessions', 'trivial integer'); // 1 = a probe one-shot the brain keeps no note for; null = a note from before that test, judged on the next capture pass
+addCol('brain_sessions', 'scan_usd real'); addCol('brain_sessions', 'extract_usd real');
 db.exec('create index if not exists tool_uses_arg on tool_uses(arg)');
 db.exec(`insert or ignore into accounts (id, kind) values ('home', 'home')`);
 // Clock: Date.now() plus a skew only the DRILLS hook `POST /router/clock {skew_ms}` sets (tests roll a budget period with it).

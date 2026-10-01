@@ -395,3 +395,31 @@ Spec: `docs/COST-INSIGHTS.md`. Code: `console.ts` (prices, `cost()`, `why()`, `t
   next idle pass removed 22 of 42 notes (all one prompt, at most two tool calls: `reply with exactly: ok` probes and the like); the 20
   left include two-prompt drills, which the rule keeps. `brain_sessions.trivial`: null = not judged yet (judged once), 1 = one-shot.
 
+
+## Brain pipeline, graph, Obsidian link (2026-10-01)
+Code: `brain.ts` (`pipeline()`, `batch()`, `graph()`, `open()`, `gate1()` split out of `distill1()`), `ui.html` (Brain views Pipeline · Notes · Graph).
+- **Scan and extract are separate calls now.** `POST brain/scan` = pre-filter + classifier, stored; `distill` reuses a stored scan only if no
+  writer has used it and it is newer than the session's last turn (so "Distill again" and the idle tick still re-gate, and the 3×(classifier +
+  writer) count in the existing test holds). A scan over the cap is a 409, never queued: the tick would run the writer on a queued session.
+- **Cost per step** is the brain-tagged spend logged between the call's start and end (`scan_usd`, `extract_usd`), a window rather than a
+  per-call tag: two brain calls at once would both be counted in each. The estimate in the confirm is count × the mean of the last 20.
+  Sessions distilled before this have no measured cost, so the first estimate is empty.
+- **Pre-filter in the pipeline view** is read off the note (`## Tools` counts, non-empty Files/Commands lists), not the transcript: same
+  verdict as `distill`, no transcript read per poll. Both views read every note per poll; fine at this size, marked `ponytail`.
+- **Provenance was one-way.** The session linked `skills/candidates/<name>/SKILL`, the skill linked nothing. Now `skills/<name>.md` exists
+  for a candidate that has a source session and links the session, the project and the SKILL.md; the session's line points at that note and
+  is rebuilt from `brain_skills` on every `index()`. An imported candidate still has no note (nothing to point at), which keeps "demote
+  removes the note" true for imports.
+- **Graph layout:** first constants (repulsion 2400/d, no cut-off, gravity 0.02) spread 40 notes over 3,500 units; with a 200-unit cut-off,
+  300/d, springs of 35 and gravity 0.06/0.1 (x/y) the live vault is 540 × 360. Measured in the browser: 40 notes 1–6 ms (38 ms cold),
+  200 synthetic notes 25–37 ms, 500 notes 123 ms; drawing 200 notes 2 ms. Type tags (`session`, `project`, `daily`, `skill`) and the
+  project's own tag are not drawn as tag nodes.
+- **Obsidian** is not installed here: `obsidian://` did nothing. The button now goes through `POST brain/open`; the test puts a fake `open`
+  first on PATH, so no window opens.
+- **Dry run on a copy of the live vault and ledger:** pipeline 20 captured / 5 scanned / 3 extracted / 1 candidate / 0 promoted, 8 to scan;
+  graph 55 nodes (20 sessions, 10 projects, 9 days, 1 candidate, 15 tags) and 57 edges (21 project, 20 day, 15 tag, 1 source); the candidate
+  has 2 edges (its session, `reel-radar`). One real scan with the tightened question (a 176-tool-call publish-and-deploy session, Haiku 4.5,
+  3,135 in / 110 out, $0.0037, 3.5 s): `reusable = true (0.85)`, `kind = skill (0.80)`, `matches = incremental-prototype-with-real-data-eval (0.75)`,
+  so no new skill is asked for.
+- **Not built:** touch-screen pinch is handled, but there is no keyboard navigation of the graph; nodes can be un-pinned only all at once
+  (Reset layout); scan-all does not resume after a restart (the progress is in memory).

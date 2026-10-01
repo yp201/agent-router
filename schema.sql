@@ -72,6 +72,7 @@ create index if not exists requests_ts on requests(ts);
 create table if not exists budget_events (budget_id text, period_key text, threshold real, ts integer);
 -- brain (brain.ts): what was captured / gated / distilled per session, and every skill candidate it knows
 create table if not exists brain_sessions (session_key text primary key, last_captured_ts integer, note_path text, gate_json text, gate_backend text,
-  gated_ts integer, distilled_ts integer, skill_candidate text, queued integer default 0, trivial integer);
+  gated_ts integer, distilled_ts integer, skill_candidate text, queued integer default 0, trivial integer,
+  scan_usd real, extract_usd real); -- what the classifier / writer call for this session cost (brain-tagged spend while it ran); null = not measured
 create table if not exists brain_skills (name text primary key, status text, -- 'candidate' | 'promoted' | 'rejected'
   source text, source_session text, created_ts integer, promoted_ts integer);

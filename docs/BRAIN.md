@@ -19,7 +19,7 @@ log.md                append-only: what the router wrote and why
 wiki/logs/            one note per session (what happened)            generated, free
 wiki/projects/        one note per project (what is true): decisions, learnings, gotchas, each dated
 wiki/daily/           one note per day: sessions, spend
-skills/               one note per promoted skill: source sessions, uses, cost
+skills/               one note per skill that is promoted or came out of a session: status, source session, project, uses, cost
 skills/candidates/    <name>/SKILL.md extracted from sessions or imported, awaiting review
 ```
 
@@ -28,7 +28,10 @@ the markers is the user's and is preserved on every rewrite. Notes use YAML fron
 A note can hold more than one generated block, so each is rewritten on its own: the session note's distilled part is
 `<!-- agent-router:begin distilled -->…<!-- agent-router:end distilled -->`, the project note's bullets are
 `…begin knowledge…`. Frontmatter keys the router owns are rewritten in place; keys the user adds are kept; `tags` is a union.
-`skills/<name>.md` exists only while the skill is promoted (deleted on demote).
+`skills/<name>.md` exists while the skill is promoted or has a source session: it links that session, its project and the `SKILL.md`,
+and the session's distilled block ends with `Skill candidate: [[skills/<name>|<name>]]` (kept in step with the ledger on every index pass, so a
+later extract that returns no skill does not drop it; a reject removes it). An imported skill's note is removed on demote; a skill note the user
+wrote in is never deleted.
 
 ## Pipeline
 
@@ -42,9 +45,11 @@ A note can hold more than one generated block, so each is rewritten on its own: 
    whose requests carry `source` (the brain's or advisor's own calls) is never captured; `POST /router/brain/capture`
    forces one session or all. The file is `YYYY-MM-DD <sanitised title>.md`; a retitle renames it, and the `session` key
    in the frontmatter finds a note again if it was moved inside `wiki/logs/`.
-2. **Gate (classification).** Deterministic pre-filter first: >= 8 tool calls, at least one file written or
+2. **Scan (the gate: classification).** Deterministic pre-filter first: >= 8 tool calls, at least one file written or
    command run, not already processed. Then typed questions over the session note:
-   - `reusable` (noul): the session worked out a multi-step procedure that would apply in other projects
+   - `reusable` (noul): "The session worked out a multi-step procedure (commands, tool sequence, or workflow) that the same person would
+     want to repeat in a different project — for example setting up a pipeline, producing a video, deploying a service. A one-off fix or a
+     discussion is not reusable."
    - `kind` (choice): `skill` | `project-knowledge` | `nothing`
    - `matches` (choice): an existing skill name, or `new`
    Backend `classifier: auto` = Jev when a TypeSafe key exists (`TYPESAFE_API_KEY` or
@@ -59,12 +64,18 @@ A note can hold more than one generated block, so each is rewritten on its own: 
    As built: the writer runs when `kind` is not `nothing` at the confidence; a skill is asked for only when `kind` is
    `skill`, `reusable` is true at the confidence and `matches` is `new`. `matches` is only asked once a skill exists.
    A model answer that is not the JSON asked for is no gate at all. "Distill anyway" skips the gate.
+   `POST scan {session}` runs this step alone and stores the answer; the writer is not called. A distill then uses a stored scan that no
+   writer has used yet and that is newer than the session's last turn; otherwise it scans first. A scan over the cap is refused (409), not queued.
 3. **Distill (one Sonnet call per gated session).** The writer is a separate, stronger model than the
    classifier: `brain_writer_model`, default the CLI alias `sonnet` (resolves to the newest Sonnet the account has). Structured input, capped near 8k tokens, never the raw
    transcript. Output JSON: `summary`, `decisions[]`, `learnings[]`, `open_threads[]`, `tags[]`, and
    `skill: {name, description, body} | null`. Writes the session note's distilled block, appends dated bullets
    to the project note (exact-duplicate lines dropped; distilling a session again replaces that session's bullets),
-   and writes a skill candidate when present and the gate asked for one.
+   and writes a skill candidate when present and the gate asked for one. When the scan said `kind = skill` (and asked for one) the prompt
+   asks for the skill outright: a name, a when-to-use description, and a body with `## Prerequisites`, `## Steps` (numbered, the exact
+   commands that worked) and `## Pitfalls` (seen in the session).
+   What each scan and extract cost is stored per session (`brain_sessions.scan_usd`, `extract_usd`): the brain-tagged spend logged while
+   the call ran.
    A "Consolidate" button runs one further writer call to merge and rewrite a project note.
 4. **Skills.** Candidates never reach Claude Code on their own. **Promote** copies
    `skills/candidates/<name>/` to `~/.claude/skills/<name>/` (user-level, so every project gets it) with a
@@ -96,15 +107,39 @@ A note can hold more than one generated block, so each is rewritten on its own: 
 
 ## Viewer (console Brain tab)
 
-Tree on the left (Sessions by date, Projects, Skills promoted / candidates, Daily, Index, Facts), rendered
-Markdown in the middle (small built-in renderer; `[[wikilinks]]` navigate in place), search across the vault
-with snippets. Actions: Distill, Consolidate, Promote / Reject / Demote, Import skill from URL, edit
-`CRITICAL_FACTS.md`, install the recall skill, open in Obsidian. Header: spend today against the cap, sessions
-captured, skills promoted, candidates waiting.
+Three views, chosen with a segmented control and kept in the hash (`#brain?view=pipeline|notes|graph`).
+
+- **Pipeline** (default). A funnel strip of five stages, each naming who does the work: Captured · no model → Scanned · Haiku (or Jev) →
+  Extracted · Sonnet → Skill candidate → Promoted. Counts are cumulative (a session counts in every stage it passed); clicking a stage
+  filters the table to the sessions that reached it. One row per captured session: title, project, step chips (Captured ✓ → Scan:
+  `skill 0.92` / `knowledge 0.90` / `nothing` / `too small` → Extract: `$0.03` / `skipped` / `queued` → Skill: name or —) and actions
+  (Scan, Extract, Open note). **Scan backlog (N)** scans every captured, unscanned session that passes the pre-filter; **Extract scanned
+  (M)** runs the writer for every session whose scan said to keep something and that has no extract yet. Both run sequentially in the
+  background, one run at a time (a second is 409), stop at the daily cap or when the brain is turned off, and show progress inline. The
+  confirm states the count, an estimate (count × the mean of the last 20 measured calls; none until there is history) and what is left
+  of the cap.
+- **Notes.** Tree on the left (Sessions by date, Projects, Skills promoted / candidates, Daily, Index, Facts), rendered
+  Markdown in the middle (small built-in renderer; `[[wikilinks]]` navigate in place), search across the vault
+  with snippets. Actions: Distill, Consolidate, Promote / Reject / Demote, Import skill from URL, edit
+  `CRITICAL_FACTS.md`, install the recall skill. Header: spend today against the cap, sessions captured, skills promoted, candidates waiting.
+- **Graph.** The vault as a force-directed graph, inline SVG, plain JS (repulsion between notes closer than 200 units, a spring per link,
+  a pull to the centre; run to rest in one go, no animation loop; O(n²) per iteration: 200 notes lay out in 20–45 ms). Nodes: sessions
+  (muted), projects (clay), days (dim), skills (teal; a candidate has a dashed ring), tags (amber, off by default); size by degree. Edges:
+  session→project, session→day, skill→the session it came from (`brain_skills.source_session`) and that session's project, skill→sessions
+  that invoked it (`tool_uses`), note→tag, and any other `[[wikilink]]` between notes; one edge per pair. A skill is one node whichever of
+  its two files a link names. `index.md`, the manual, the log and notes outside the folders the router writes are left out. Drag to pan,
+  wheel or pinch to zoom, drag a note to pin it, hover to light a note and its neighbours, click to open it in Notes; type chips filter,
+  the search box highlights matches. It is laid out again only when the set of notes or links changes; pan, zoom and pins survive polls.
+
+**Open in Obsidian** shows when Obsidian is installed (macOS: `/Applications/Obsidian.app` or `~/Applications/Obsidian.app`; elsewhere
+`obsidian` on PATH; `OBSIDIAN_APP` overrides the path probed) and runs `open -a Obsidian <vault>`. Otherwise the button is **Reveal
+folder** (`open <vault>` / `xdg-open`). The directory is always the configured vault; nothing from the request reaches the command.
 
 ## API (all under `/router/brain/`)
 
-`GET stats` · `GET tree` · `GET note?path=` · `GET search?q=` · `POST capture {session?}` · `POST distill {session, force?}` ·
+`GET stats` (incl. `obsidian`) · `GET tree` · `GET note?path=` · `GET search?q=` · `GET pipeline` (`stages`, `rows`, `cap`, `running`, `todo`) ·
+`GET graph` (`nodes`, `edges`) · `POST capture {session?}` · `POST scan {session}` · `POST distill {session, force?}` ·
+`POST scan-all {limit?}` · `POST extract-all` (202 `{total, estimate_usd, cap}`; 409 `brain_busy` while one runs) · `POST open {target: obsidian|folder}` ·
 `POST consolidate {project}` · `POST skills/import {url}` · `POST skills/<name>/promote|demote|reject` · `POST recall` ·
 `PUT facts {text}`. Reads always answer; every write is `409 brain_disabled` until `brain_enabled`. Enabling is
 `PUT /router/settings {brain_enabled: true, brain_dir}`.

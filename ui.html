@@ -66,6 +66,18 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .md { overflow-wrap: anywhere; } .md h1 { font-size: 26px; margin: 0 0 6px; } .md h2 { margin: 14px 0 4px; } .md h3, .md h4 { margin: 10px 0 2px; font-size: 14px; }
 .md p, .md ul, .md ol { margin: 4px 0; } .md ul, .md ol { padding-left: 20px; } .md a { color: var(--teal); } .md td { border: 1px solid var(--line); padding: 4px 8px; }
 .md code { font: 12px var(--mono); background: var(--bg); padding: 1px 4px; border-radius: 4px; } .md table { border-collapse: collapse; margin: 6px 0; }
+.funnel { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; } .funnel .arrow { align-self: center; color: var(--gray); font-size: 18px; }
+.stage { flex: 1 1 130px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 12px 14px; border-radius: 10px; text-align: left; font-weight: 400; }
+.stage[aria-pressed=true] { border-color: var(--clay); } .steps { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-family: var(--sans); }
+.chip.dash { background: none; border: 1px dashed var(--teal); color: var(--teal); }
+#graph { width: 100%; height: 68vh; min-height: 420px; display: block; border-radius: 8px; background: var(--bg); border: 1px solid var(--line); touch-action: none; user-select: none; cursor: grab; }
+#graph .e { stroke: var(--gray); stroke-width: 1; vector-effect: non-scaling-stroke; } #graph .e.source, #graph .e.used { stroke: var(--teal); stroke-opacity: .55; } #graph .e.hi { stroke: var(--muted); stroke-opacity: 1; }
+#graph .n { cursor: pointer; } #graph .n circle { fill: var(--muted); stroke: var(--bg); stroke-width: 1; } #graph .n.project circle { fill: var(--clay); } #graph .n.day circle { fill: var(--gray); }
+#graph .n.skill circle { fill: var(--teal); } #graph .n.candidate circle { fill: var(--teal); fill-opacity: .3; stroke: var(--teal); stroke-width: 1.5; stroke-dasharray: 3 2; } #graph .n.tag circle { fill: var(--amber); }
+#graph .n.pin circle { stroke: var(--fg); } #graph .n.match circle { stroke: var(--amber); stroke-width: 2.5; }
+#graph text { font: 11px var(--sans); font-size: calc(11px / var(--k, 1)); fill: var(--muted); pointer-events: none; display: none; } /* --k = zoom: labels keep their size on screen */
+#graph .n.project text, #graph .n.skill text, #graph .n.candidate text, #graph.zoom text, #graph .n.hi text, #graph .n.match text { display: block; } #graph .n.hi text, #graph .n.match text { fill: var(--fg); }
+#graph.dim .n:not(.hi), #graph.dim .e:not(.hi), #graph.find .n:not(.match):not(.hi) { opacity: .15; }
 [hidden] { display: none !important; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 @media (max-width: 1000px) { .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid2, .brain { grid-template-columns: 1fr; } }
@@ -121,7 +133,7 @@ const model = (m) => esc((m ?? '—').replace(/^claude-/, '').replace(/-\d{8}$/,
 const get = (p) => fetch(`/router/${p}`).then((r) => r.json());
 const send = (method, p, body) => fetch(`/router/${p}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) }).then((r) => r.json());
 let S = {};            // last settings
-const ui = { cacheSession: 'all', cacheDays: 7, whatif: 'all', open: {}, added: null, tl: null, busy: {}, b: {}, note: 'index.md', bq: '', bedit: false, files: [] }; // view state that survives re-renders
+const ui = { cacheSession: 'all', cacheDays: 7, whatif: 'all', open: {}, added: null, tl: null, busy: {}, b: {}, note: 'index.md', bq: '', bedit: false, files: [], bview: 'pipeline', pstage: null, sig: null }; // view state that survives re-renders
 const kt = (n) => n == null ? '—' : `${Math.round(n / 1000)}k`;
 const ctxColor = (s) => s.context_pct >= s.urgent_pct ? 'clay' : s.context_pct >= s.warn_pct ? 'amber' : 'muted';
 // Session timeline: x = turn, one lane per account (first appearance order), bar = context (teal read + clay write cap)
@@ -196,6 +208,161 @@ const md = (src) => {
   return out.join('\n') + (pre ? `<pre>${pre.join('\n')}</pre>` : '') + (fm ? `<pre>${fm.join('\n')}</pre>` : '');
 };
 // md:end
+
+// ---------- Brain: pipeline (captured -> scanned -> extracted -> candidate -> promoted) ----------
+const PC = 'grid-template-columns:minmax(0,1.2fr) minmax(0,.6fr) minmax(0,2.3fr) 250px'; // Pipeline table
+const SKIP = { nothing: 'The scan found nothing worth keeping', low_confidence: 'The scan was not sure enough to spend a writer call', prefilter: 'Fewer than 8 tool calls, or no file written and no command run: not worth a model call' };
+const chip = (cls, text, title = '') => `<span class="chip ${cls}"${title ? ` title="${esc(title)}"` : ''}>${text}</span>`;
+const brainPipeline = (p) => {
+  const at = (id) => p.stages.findIndex((s) => s.id === id), rows = ui.pstage ? p.rows.filter((r) => at(r.stage) >= at(ui.pstage)) : p.rows;
+  const left = Math.max(0, p.cap.cap_usd - p.cap.spent_usd), run = p.running, off = ui.busy.brain || run ? 'disabled' : '', by = (i) => p.stages[i].label.split(' · ')[1];
+  const all = (kind, label, i) => `<button class="sm" data-bact="${kind}-all" data-n="${p.todo[kind].count}" data-est="${p.todo[kind].estimate_usd ?? ''}" data-left="${left}" data-by="${esc(by(i))}" ${off || (p.todo[kind].count ? '' : 'disabled')}>${label} (${p.todo[kind].count})</button>`;
+  const arrow = '<span class="muted" aria-hidden="true">→</span>';
+  const tr = (r) => { const sc = r.scan, ex = r.extract, sk = esc(r.session_key), busy = ui.busy.brain === r.session_key, anyway = !ex?.ts && (sc ? !sc.wanted : !r.pre); // the gate would say no: skip it
+    return `<div class="tr" style="${PC}">
+      <div class="col" style="gap:0;min-width:0"><span class="nm" title="${sk}">${esc(r.title)}</span><span class="small muted" style="font-family:var(--sans)">${new Date(r.last_ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} · ${r.turns} turns · ${r.tool_calls ?? '—'} tool calls</span></div>
+      <span class="nm muted">${esc(r.project ?? '—')}</span>
+      <div class="steps">${chip('ok', 'Captured ✓')}${arrow}
+        ${sc ? chip(sc.kind === 'skill' ? 'ok' : sc.kind === 'nothing' ? '' : 'warn', `Scan: ${sc.kind === 'nothing' ? 'nothing' : `${sc.kind === 'skill' ? 'skill' : 'knowledge'} ${sc.confidence.toFixed(2)}`}`, `${sc.backend} · repeatable procedure: ${sc.reusable ? 'yes' : 'no'}${sc.matches && sc.matches !== 'new' ? ` · an existing skill may cover it: ${sc.matches}` : ''}${sc.usd == null ? '' : ` · cost $${sc.usd.toFixed(3)}`}`)
+          : r.pre ? chip('', 'Scan: —', 'Not scanned yet') : chip('', 'Scan: too small', SKIP.prefilter)}${arrow}
+        ${ex?.ts ? chip('ok', `Extract: ${ex.usd == null ? 'done' : `$${ex.usd.toFixed(2)}`}`, `extracted ${ago(ex.ts)}`) : r.queued ? chip('warn', 'Extract: queued', 'The daily cap was spent: it runs when the cap frees up')
+          : sc?.wanted ? chip('warn', 'Extract: queued', 'Scanned and worth extracting: Extract, or “Extract scanned”') : ex?.skipped_reason && sc ? chip('', 'Extract: skipped', SKIP[ex.skipped_reason]) : chip('', 'Extract: —')}${arrow}
+        ${r.skill ? `<button class="plain" data-note="skills/${esc(r.skill.name)}.md" title="${esc(r.skill.status)}">${chip(r.skill.status === 'promoted' ? 'ok' : 'dash', `Skill: ${esc(r.skill.name)}`)}</button>` : chip('', 'Skill: —')}</div>
+      <div class="row" style="flex-wrap:wrap;gap:4px">${r.pre ? `<button class="sm" data-bact="scan" data-sk="${sk}" ${off}>${busy ? '…' : sc ? 'Rescan' : 'Scan'}</button>` : ''}
+        <button class="sm" data-bact="${anyway ? 'force' : 'distill'}" data-sk="${sk}" ${off}>${busy ? '…' : ex?.ts ? 'Extract again' : anyway ? 'Extract anyway' : 'Extract'}</button>
+        <button class="sm" data-note="${esc(r.note_path)}">Open note</button></div></div>`; };
+  return `<section class="panel">
+      <div class="funnel" role="group" aria-label="Pipeline stages; click one to filter the table">${p.stages.map((s, i) => { const [l, m] = s.label.split(' · ');
+        return `${i ? '<span class="arrow" aria-hidden="true">→</span>' : ''}<button class="stage" data-stage="${s.id}" aria-pressed="${ui.pstage === s.id}"><span class="big">${s.count}</span><b>${esc(l)}</b><span class="small muted">${esc(m ?? '')}</span></button>`; }).join('')}</div>
+      <div class="between" style="flex-wrap:wrap"><div class="row" style="flex-wrap:wrap">${all('scan', 'Scan backlog', 1)}${all('extract', 'Extract scanned', 2)}
+        ${run ? `<span class="row small" aria-live="polite" style="min-width:220px"><span class="dot"></span>${run.kind === 'scan' ? 'Scanning' : 'Extracting'} ${Math.min(run.done + 1, run.total)} of ${run.total}…${bar([[run.total ? run.done / run.total : 0, 'var(--teal)']])}</span>` : ''}</div>
+        <span class="small muted">Brain spend today <span class="mono ${left ? '' : 'clay'}">${usd(p.cap.spent_usd)}</span> of ${usd(p.cap.cap_usd)} at list price · scanning and extracting stop at the cap</span></div>
+      <div class="table">
+        <div class="tr th" style="${PC}"><span>session${ui.pstage ? ` · reached “${esc(p.stages[at(ui.pstage)].label.split(' · ')[0])}”` : ''}</span><span>project</span><span>steps</span><span>actions</span></div>
+        ${rows.map(tr).join('') || `<div class="note">${p.rows.length ? 'No session has reached this stage yet.' : 'No sessions captured yet. A session gets its note once it has been idle for 15 minutes; “Capture now” in Notes writes them all.'}</div>`}
+      </div>
+      <div class="note">Capturing is free. A scan is one small call that looks for a repeatable skill; extracting is one larger call that writes the summary, the project's bullets and, when the scan found one, the skill candidate. A candidate reaches Claude only when you promote it.</div>
+    </section>`;
+};
+
+// ---------- Brain: graph (force-directed, plain JS, inline SVG) ----------
+// Laid out only when the set of visible notes or links changes; positions, pins, pan and zoom live in G and survive every re-render.
+const GT = [['session', 'Sessions', 'muted'], ['project', 'Projects', 'clay'], ['day', 'Days', 'gray'], ['skill', 'Skills', 'teal'], ['tag', 'Tags', 'amber']];
+const G = { key: '', N: [], E: [], adj: [], pos: {}, k: 1, tx: 0, ty: 0, moved: false, hover: null, drag: null, ptrs: new Map(), pinch: 0, ms: 0, on: { session: true, project: true, day: true, skill: true, tag: false } };
+// graph:begin (test_router.ts loads this block)
+// Repulsion between every pair closer than 200, a spring along every link, a pull to the centre (stronger in y: the panel is wide);
+// each step is capped and the cap cools to zero, so it runs to rest and stops (no animation loop). Pinned notes do not move.
+// ponytail: O(n²) repulsion, every pair on every iteration: 200 notes × 300 iterations = 6M pair steps, measured 20–45 ms (500 notes:
+// 130 ms). Past ~1000 notes, bin the notes in a 200-unit grid (or a Barnes–Hut quadtree) so only nearby pairs are visited.
+function glayout(N, E, iters = 300, step = 30) {
+  const n = N.length, dx = new Float64Array(n), dy = new Float64Array(n);
+  for (let it = 0; it < iters; it++) {
+    dx.fill(0); dy.fill(0);
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      const x = N[i].x - N[j].x || .01, y = N[i].y - N[j].y || .01, d2 = x * x + y * y, f = 300 / d2;
+      if (d2 < 4e4) { dx[i] += x * f; dy[i] += y * f; dx[j] -= x * f; dy[j] -= y * f; }
+    }
+    for (const e of E) {
+      const a = N[e.a], b = N[e.b], x = b.x - a.x, y = b.y - a.y, d = Math.hypot(x, y) || 1, f = (d - 35) / d * .2;
+      dx[e.a] += x * f; dy[e.a] += y * f; dx[e.b] -= x * f; dy[e.b] -= y * f;
+    }
+    for (let i = 0; i < n; i++) {
+      if (N[i].pin) continue;
+      const vx = dx[i] - N[i].x * .06, vy = dy[i] - N[i].y * .1, m = Math.hypot(vx, vy) || 1, s = Math.min(m, step * (1 - it / iters)) / m;
+      N[i].x += vx * s; N[i].y += vy * s;
+    }
+  }
+}
+// graph:end
+// the visible notes and links for the current filter; a new set is laid out (old positions are the starting point) and, until the user
+// has panned or zoomed, fitted to the 1000 × 600 viewBox
+function gsync(g) {
+  const vis = g.nodes.filter((n) => G.on[n.type === 'candidate' ? 'skill' : n.type]), at = new Map(vis.map((n, i) => [n.id, i]));
+  const E = g.edges.filter((e) => at.has(e.a) && at.has(e.b)).map((e) => ({ a: at.get(e.a), b: at.get(e.b), kind: e.kind }));
+  const N = vis.map((n, i) => (G.pos[n.id] = Object.assign(G.pos[n.id] ?? { x: 14 * Math.sqrt(i + 1) * Math.cos(i * 2.4), y: 14 * Math.sqrt(i + 1) * Math.sin(i * 2.4), pin: false }, n, { deg: 0 })));
+  for (const e of E) { N[e.a].deg++; N[e.b].deg++; }
+  const key = vis.map((n) => n.id).join('|') + '#' + E.map((e) => `${e.a}-${e.b}`).join('|');
+  Object.assign(G, { N, E, adj: N.map(() => new Set()), hover: null });
+  for (const e of E) { G.adj[e.a].add(e.b); G.adj[e.b].add(e.a); }
+  if (key === G.key) return;
+  const t = performance.now();
+  glayout(N, E);
+  Object.assign(G, { key, ms: performance.now() - t });
+  if (!G.moved && N.length) {
+    const xs = N.map((n) => n.x), ys = N.map((n) => n.y), x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    G.k = Math.min(2, 900 / (x1 - x0 || 1), 520 / (y1 - y0 || 1)); G.tx = 500 - (x0 + x1) / 2 * G.k; G.ty = 300 - (y0 + y1) / 2 * G.k;
+  }
+}
+const gxf = () => `translate(${G.tx.toFixed(1)} ${G.ty.toFixed(1)}) scale(${G.k.toFixed(3)})`;
+const gbody = (found = G.found ?? new Set()) => { const f = (v) => v.toFixed(1), q = ui.bq.toLowerCase();
+  return G.E.map((e) => `<line class="e ${e.kind}" x1="${f(G.N[e.a].x)}" y1="${f(G.N[e.a].y)}" x2="${f(G.N[e.b].x)}" y2="${f(G.N[e.b].y)}"/>`).join('')
+    + G.N.map((n, i) => { const r = Math.min(16, 3.5 + 1.7 * Math.sqrt(n.deg));
+      return `<g class="n ${esc(n.type)}${n.pin ? ' pin' : ''}${q && (n.title.toLowerCase().includes(q) || found.has(n.path)) ? ' match' : ''}" data-n="${i}" transform="translate(${f(n.x)} ${f(n.y)})"><title>${esc(n.title)} · ${esc(n.type)} · ${n.deg} link${n.deg === 1 ? '' : 's'}</title><circle r="${f(r)}"/><text x="${f(r + 3)}" dy=".32em">${esc(n.title.length > 30 ? `${n.title.slice(0, 29)}…` : n.title)}</text></g>`; }).join(''); };
+const brainGraph = (g, hits) => {
+  const count = (t) => g.nodes.filter((n) => (n.type === 'candidate' ? 'skill' : n.type) === t).length;
+  const tools = `<div class="between" style="flex-wrap:wrap"><div class="row" style="flex-wrap:wrap" role="group" aria-label="Note types shown">${GT.map(([t, l, c]) => `<button class="sm" data-gtype="${t}" aria-pressed="${G.on[t]}" style="${G.on[t] ? '' : 'opacity:.5'}"><span class="dot" style="background:var(--${c})"></span> ${l} <span class="muted">${count(t)}</span></button>`).join('')}</div>
+    <form id="brain-search" class="row"><label class="sr" for="bq">Highlight notes that match</label><input id="bq" name="q" value="${esc(ui.bq)}" placeholder="Highlight notes…"><button class="sm">Search</button>${ui.bq ? '<button type="button" class="sm" data-bact="clear">Clear</button>' : ''}</form></div>`;
+  if (g.nodes.filter((n) => n.type !== 'tag').length < 2) return `<section class="panel">${tools}<div class="note">Not enough notes to draw yet: the graph needs at least two. Sessions get a note once they have been idle for 15 minutes, or now with “Capture now” in Notes.</div></section>`;
+  gsync(g);
+  G.found = new Set(Array.isArray(hits) ? hits.map((h) => h.path) : []);
+  return `<section class="panel">${tools}
+    <svg id="graph" class="${G.k >= 1.6 ? 'zoom' : ''}${ui.bq ? ' find' : ''}" viewBox="0 0 1000 600" style="--k:${G.k.toFixed(3)}" role="img" aria-label="Graph of ${G.N.length} notes and ${G.E.length} links between them"><g id="gv" transform="${gxf()}">${gbody()}</g></svg>
+    <div class="between small muted" style="flex-wrap:wrap"><span>${G.N.length} notes · ${G.E.length} links · laid out in ${G.ms.toFixed(0)} ms · teal lines: a skill and the session it came from or was used in</span>
+      <span class="row">drag to pan · scroll or pinch to zoom · drag a note to pin it · click to open <button class="sm" data-bact="greset">Reset layout</button></span></div></section>`;
+};
+// gestures, on the document like every other handler here (the SVG is replaced on re-render)
+const gpt = (svg, e) => { const m = svg.getScreenCTM(); return [(e.clientX - m.e) / m.a, (e.clientY - m.f) / m.d]; }; // client px -> viewBox units
+const gview = () => { const svg = $('#graph'); svg.firstElementChild.setAttribute('transform', gxf()); svg.style.setProperty('--k', G.k.toFixed(3)); svg.classList.toggle('zoom', G.k >= 1.6); };
+const gzoom = (x, y, f) => { const k = Math.max(.15, Math.min(8, G.k * f)); G.tx = x - (x - G.tx) * k / G.k; G.ty = y - (y - G.ty) * k / G.k; G.k = k; G.moved = true; gview(); };
+function ghover(h) {
+  const svg = $('#graph');
+  if (h === G.hover || !svg) return;
+  G.hover = h;
+  svg.classList.toggle('dim', h != null);
+  svg.querySelectorAll('.n').forEach((el, i) => el.classList.toggle('hi', h != null && (i === h || G.adj[h].has(i))));
+  svg.querySelectorAll('.e').forEach((el, j) => el.classList.toggle('hi', h != null && (G.E[j].a === h || G.E[j].b === h)));
+}
+document.addEventListener('pointerdown', (e) => {
+  const svg = e.target.closest?.('#graph');
+  if (!svg) return;
+  const n = e.target.closest('.n'), [x, y] = gpt(svg, e);
+  G.ptrs.set(e.pointerId, [x, y]);
+  G.drag = { n: n ? +n.dataset.n : null, x, y, tx: G.tx, ty: G.ty, far: false };
+});
+document.addEventListener('pointermove', (e) => {
+  const svg = $('#graph'), d = G.drag;
+  if (!d || !svg) return;
+  const [x, y] = gpt(svg, e);
+  if (G.ptrs.has(e.pointerId)) G.ptrs.set(e.pointerId, [x, y]);
+  if (G.ptrs.size === 2) { // two fingers on a touch screen (a trackpad pinch arrives as ctrl + wheel)
+    const [a, b] = [...G.ptrs.values()], gap = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    if (G.pinch) gzoom((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, gap / G.pinch);
+    G.pinch = gap; d.far = true;
+    return;
+  }
+  d.far ||= Math.hypot(x - d.x, y - d.y) > 4;
+  if (d.n == null) { G.tx = d.tx + x - d.x; G.ty = d.ty + y - d.y; G.moved = true; gview(); }
+  else if (d.far) { Object.assign(G.N[d.n], { x: (x - G.tx) / G.k, y: (y - G.ty) / G.k, pin: true }); svg.firstElementChild.innerHTML = gbody(); }
+});
+const gup = (e) => {
+  const d = G.drag;
+  G.ptrs.delete(e.pointerId); G.pinch = 0;
+  if (!d || G.ptrs.size) return;
+  G.drag = null;
+  if (d.n == null || !$('#graph')) return;
+  const p = G.N[d.n].path;
+  if (!d.far) { if (p) { ui.note = p; ui.bedit = false; location.hash = '#brain?view=notes'; } }                  // click: open the note in the reader
+  else { glayout(G.N, G.E, 60, 6); $('#graph').firstElementChild.innerHTML = gbody(); }                              // dropped: the rest settles around the pin
+};
+document.addEventListener('pointerup', gup);
+document.addEventListener('pointercancel', gup);
+document.addEventListener('wheel', (e) => {
+  const svg = e.target.closest?.('#graph');
+  if (!svg) return;
+  e.preventDefault();
+  gzoom(...gpt(svg, e), Math.exp(-e.deltaY * (e.ctrlKey ? .01 : .002)));
+}, { passive: false });
+document.addEventListener('pointerover', (e) => { const n = e.target.closest?.('#graph .n'); if (!G.drag) ghover(n ? +n.dataset.n : null); });
 
 // ---------- views: each returns [paths to fetch, render(data)] ----------
 const views = {
@@ -479,7 +646,8 @@ const views = {
       </div></section>`;
   }],
 
-  brain: [['brain/stats', 'brain/tree', () => `brain/note?path=${encodeURIComponent(ui.note)}`, () => ui.bq ? `brain/search?q=${encodeURIComponent(ui.bq)}` : 'settings', 'settings'], (b, t, note, hits) => {
+  // second fetch = what the chosen view shows: the pipeline, the vault tree (Notes) or the graph
+  brain: [['brain/stats', () => `brain/${ui.bview === 'notes' ? 'tree' : ui.bview}`, () => ui.bview === 'notes' ? `brain/note?path=${encodeURIComponent(ui.note)}` : 'settings', () => ui.bq && ui.bview !== 'pipeline' ? `brain/search?q=${encodeURIComponent(ui.bq)}` : 'settings', 'settings'], (b, t, note, hits) => {
     const sub = 'Notes about past sessions, as plain files, so the next session does not work the same thing out again.';
     if (!b.enabled) return head('Brain', sub) + `<form class="panel" id="brain-enable" style="max-width:760px">
       <h2>The brain is off</h2>
@@ -490,6 +658,17 @@ const views = {
       <div class="note">The ledger still stores no request bodies. This folder is the one place that holds excerpts of your own prompts and commands, and you can open it in Obsidian.</div>
       <label class="col small muted">Folder<input name="dir" value="${esc(b.dir)}" class="mono"></label>
       <div class="row"><button class="primary">Enable</button></div></form>`;
+    const top = head('Brain', sub, `<details data-k="bset" ${ui.open.bset ? 'open' : ''} style="max-width:420px"><summary>Settings</summary>
+        <form id="brain-settings" class="col" style="gap:8px;margin-top:8px">
+          <label class="between small"><span>Distill</span><select name="brain_distill" class="sm">${[['manual', 'only when I click'], ['on_idle', 'when a session goes idle']].map(([v, l]) => `<option value="${v}" ${S.brain_distill === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+          <label class="between small"><span>Daily cap ($ at list price)</span><input name="brain_daily_usd" type="number" min="0" step="0.05" value="${b.cap_usd}" style="width:90px"></label>
+          <label class="between small"><span>Classifier <span class="muted">(in use: ${esc(b.classifier_backend)})</span></span><select name="classifier" class="sm">${['auto', 'jev', 'model'].map((v) => `<option ${S.classifier === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <div class="row"><button class="sm">Save</button><button type="button" class="sm" data-bact="disable">Turn the brain off</button></div>
+        </form></details>`)
+      + `<div class="between" style="flex-wrap:wrap"><div class="seg" role="group" aria-label="Brain view">${[['pipeline', 'Pipeline'], ['notes', 'Notes'], ['graph', 'Graph']].map(([v, l]) => `<button data-bview="${v}" aria-pressed="${ui.bview === v}">${l}</button>`).join('')}</div>
+        <div class="row" style="flex-wrap:wrap">${b.obsidian ? '<button class="sm" data-bact="open" data-target="obsidian">Open in Obsidian</button>'
+          : '<span class="small muted">Obsidian isn\'t installed — the Graph view here shows the same links.</span><button class="sm" data-bact="open" data-target="folder">Reveal folder</button>'}</div></div>`;
+    if (ui.bview !== 'notes') return top + (t.error ? `<div class="note err">${esc(t.error.type)}</div>` : ui.bview === 'graph' ? brainGraph(t, hits) : brainPipeline(t));
     ui.files = t.files;
     const f = t.files, base = (p) => p.split('/').pop().replace(/\.md$/, ''), path = note.path ?? '';
     const item = (p, label = base(p)) => `<button class="plain nm small${p === ui.note ? ' clay' : ''}" data-note="${esc(p)}" title="${esc(p)}">${esc(label)}</button>`;
@@ -512,7 +691,7 @@ const views = {
     const acts = kind === 'session' && s ? btn('distill', ui.busy.brain ? 'Distilling…' : s.distilled_ts ? 'Distill again' : 'Distill', `data-sk="${esc(s.session_key)}"`) + (g && !g.gated ? btn('force', 'Distill anyway', `data-sk="${esc(s.session_key)}"`) : '')
       : kind === 'project' ? btn('consolidate', ui.busy.brain ? 'Consolidating…' : 'Consolidate', `data-name="${esc(base(path))}"`)
       : sk?.status === 'promoted' ? btn('demote', 'Demote', `data-name="${esc(name)}"`)
-      : kind === 'candidate' && sk ? btn('promote', 'Promote', `data-name="${esc(name)}"`) + btn('reject', 'Reject', `data-name="${esc(name)}"`)
+      : (kind === 'candidate' || kind === 'skill') && sk ? btn('promote', 'Promote', `data-name="${esc(name)}"`) + btn('reject', 'Reject', `data-name="${esc(name)}"`)
       : kind === 'facts' && !ui.bedit ? btn('edit', 'Edit') : '';
     const gate = !s ? '' : `<div class="small muted">${s.queued ? '<span class="chip warn">queued: the daily cap is spent</span> ' : ''}${!g ? 'Not gated yet.' : g.forced ? 'Distilled without the gate.'
       : g.answers ? `Gate (${esc(g.backend)}): ${Object.entries(g.answers).map(([k, a]) => `${esc(k)} = ${esc(a.value)} <span class="mono">${a.confidence.toFixed(2)}</span>`).join(' · ')} → ${g.gated ? (g.want_skill ? 'distill, skill wanted' : 'distill, no skill') : 'not worth distilling'}`
@@ -522,14 +701,7 @@ const views = {
       : kind === 'candidate' ? `${sk && sk.source !== 'session' && sk.source !== 'builtin' ? `<div class="inset warnbox"><span class="small">Imported from <span class="mono">${esc(sk.source)}</span>. These are someone else's instructions: read all of it before promoting. Shown as raw text, nothing hidden.</span></div>` : ''}<pre>${esc(note.text)}</pre>`
       : `<div class="md">${md(note.text)}</div>`;
     const BC = 'grid-template-columns:minmax(0,1.2fr) 150px 50px 70px 70px 100px minmax(0,1.2fr) 90px';
-    return head('Brain', sub, `<details data-k="bset" ${ui.open.bset ? 'open' : ''} style="max-width:420px"><summary>Settings</summary>
-        <form id="brain-settings" class="col" style="gap:8px;margin-top:8px">
-          <label class="between small"><span>Distill</span><select name="brain_distill" class="sm">${[['manual', 'only when I click'], ['on_idle', 'when a session goes idle']].map(([v, l]) => `<option value="${v}" ${S.brain_distill === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-          <label class="between small"><span>Daily cap ($ at list price)</span><input name="brain_daily_usd" type="number" min="0" step="0.05" value="${b.cap_usd}" style="width:90px"></label>
-          <label class="between small"><span>Classifier <span class="muted">(in use: ${esc(b.classifier_backend)})</span></span><select name="classifier" class="sm">${['auto', 'jev', 'model'].map((v) => `<option ${S.classifier === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-          <div class="row"><button class="sm">Save</button><button type="button" class="sm" data-bact="disable">Turn the brain off</button></div>
-        </form></details>`)
-    + `<section class="grid4">
+    return top + `<section class="grid4">
       ${kpi('Brain spend today', usd(b.spend_today_usd), `of ${usd(b.cap_usd)} at list price${b.queued ? ` · ${b.queued} queued for tomorrow` : ''}`, b.spend_today_usd >= b.cap_usd ? 'clay' : '')}
       ${kpi('Sessions captured', b.sessions_captured, `${b.distilled} distilled`)}
       ${kpi('Skills promoted', b.promoted, 'loaded by every new session', 'teal')}
@@ -545,7 +717,7 @@ const views = {
       <div class="panel">
         <div class="between" style="flex-wrap:wrap"><h2 class="nm">${esc(path ? base(path) : 'No note')}</h2><div class="row">${acts}</div></div>
         ${gate}
-        ${note.abs ? `<div class="row small" style="flex-wrap:wrap"><a class="teal" href="obsidian://open?path=${encodeURIComponent(note.abs)}">Open in Obsidian</a><span class="mono muted" style="overflow-wrap:anywhere">${esc(note.abs)}</span></div>` : ''}
+        ${note.abs ? `<div class="small mono muted" style="overflow-wrap:anywhere">${esc(note.abs)}</div>` : ''}
         ${body}
       </div>
     </section>
@@ -566,7 +738,8 @@ const views = {
 // ---------- routing, polling, rendering ----------
 const route = () => { const r = location.hash.slice(1).split('?')[0]; return views[r] ? r : 'overview'; };
 // deep link to a session's timeline: #accounts?tl=<session key>
-const deep = () => { const q = new URLSearchParams(location.hash.split('?')[1] ?? ''); if (q.get('tl')) ui.tl = q.get('tl'); };
+// …and to a Brain view: #brain?view=pipeline|notes|graph
+const deep = () => { const q = new URLSearchParams(location.hash.split('?')[1] ?? ''); if (q.get('tl')) ui.tl = q.get('tl'); ui.bview = ['notes', 'graph'].includes(q.get('view')) ? q.get('view') : 'pipeline'; };
 let seq = 0;
 async function refresh(force) {
   const r = route(), [paths, render] = views[r], my = ++seq;
@@ -583,7 +756,11 @@ async function refresh(force) {
     // never yank a control out from under the user: focus anywhere in a form (buttons included) or a half-typed
     // field means the poll waits; clicking Create used to move focus to the button and get the form re-rendered away
     const dirty = [...main.querySelectorAll('input, textarea')].some((i) => i.type !== 'radio' && i.type !== 'checkbox' && i.value !== i.defaultValue);
-    if (!force && ((f && main.contains(f) && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(f.tagName)) || dirty)) return;
+    if (!force && ((f && main.contains(f) && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(f.tagName)) || dirty || G.drag)) return;
+    // Brain pipeline and graph: a poll that brought nothing new is not rendered, so scroll, hover, pan, zoom and pins stay put
+    const sig = r === 'brain' && ui.bview !== 'notes' ? ui.bview + JSON.stringify(data) : null;
+    if (!force && sig && sig === ui.sig) return;
+    ui.sig = sig;
     const keep = [...main.querySelectorAll('[data-scroll]')].map((x) => [x.dataset.scroll, x.scrollTop]); // inner scrollers survive the re-render
     $('#main').innerHTML = render(...data);
     for (const [k, y] of keep) { const x = main.querySelector(`[data-scroll="${k}"]`); if (x) x.scrollTop = y; }
@@ -604,13 +781,19 @@ async function brainAct(d) {
   if (a === 'clear') { ui.bq = ''; ui.bedit = false; refresh(true); }
   if (a === 'edit') { ui.bedit = true; refresh(true); }
   if (a === 'capture' || a === 'recall') act(`brain/${a}`);
+  if (a === 'open') act('brain/open', { target: d.target });
+  if (a === 'greset') { Object.assign(G, { pos: {}, key: '', moved: false }); refresh(true); }
+  if (a === 'scan-all' || a === 'extract-all') { // background run on the server: confirm with the count, the estimate and what is left of the cap
+    const scan = a === 'scan-all', n = Number(d.n);
+    if (confirm(`${scan ? 'Scan' : 'Extract'} ${n} session${n === 1 ? '' : 's'} with ${d.by}, one after the other?\n\n${d.est === '' ? 'No cost history yet, so no estimate: the first calls set it.' : `About $${Number(d.est).toFixed(2)} at list price (${n} × the recent average per call).`}\n$${Number(d.left).toFixed(2)} of today's cap is left; it stops there.`)) act(`brain/${a}`);
+  }
   if (a === 'disable' && confirm('Turn the brain off? Notes stay where they are; nothing new is written.')) putSettings({ brain_enabled: false });
   if (a === 'promote' && confirm(`Promote ${d.name}? It is copied to your Claude skills folder and every new session loads its description.`)) act(skill);
   if (a === 'demote') act(skill);
   if (a === 'reject' && confirm(`Reject ${d.name}? The candidate is deleted.`)) act(skill).then(() => { ui.note = 'index.md'; refresh(true); });
-  if (a === 'distill' || a === 'force' || a === 'consolidate') { // model calls: seconds to minutes
-    ui.busy.brain = true; refresh(true);
-    const r = await send('POST', a === 'consolidate' ? 'brain/consolidate' : 'brain/distill', a === 'consolidate' ? { project: d.name } : { session: d.sk, force: a === 'force' }).catch((e) => ({ error: { type: e.message } }));
+  if (a === 'scan' || a === 'distill' || a === 'force' || a === 'consolidate') { // model calls: seconds to minutes
+    ui.busy.brain = d.sk ?? true; refresh(true);
+    const r = await send('POST', a === 'consolidate' ? 'brain/consolidate' : a === 'scan' ? 'brain/scan' : 'brain/distill', a === 'consolidate' ? { project: d.name } : { session: d.sk, force: a === 'force' }).catch((e) => ({ error: { type: e.message } }));
     delete ui.busy.brain;
     if (r?.error) alert(`Failed: ${r.error.type}`); else if (r?.queued) alert('The daily brain cap is spent. Queued: it runs when the cap frees up.');
     refresh(true);
@@ -621,7 +804,10 @@ document.addEventListener('click', (e) => {
   const t = e.target.closest('button, a[data-session], a[data-wl]');
   if (!t) return;
   const d = t.dataset;
-  if (d.note) { ui.note = d.note; ui.bedit = false; refresh(true); }
+  if (d.note) { ui.note = d.note; ui.bedit = false; if (ui.bview === 'notes') refresh(true); else location.hash = '#brain?view=notes'; }
+  if (d.bview) location.hash = `#brain?view=${d.bview}`;
+  if (d.stage) { ui.pstage = ui.pstage === d.stage ? null : d.stage; refresh(true); }
+  if (d.gtype) { G.on[d.gtype] = !G.on[d.gtype]; G.moved = false; refresh(true); } // another set of notes: laid out and fitted again
   if (d.wl) { // [[wikilink]]: a vault path, else the note with that name
     e.preventDefault();
     const w = d.wl.replace(/\.md$/, ''), hit = ui.files.find((p) => p === `${w}.md`) ?? ui.files.find((p) => p.endsWith(`/${w.split('/').pop()}.md`));

@@ -141,7 +141,7 @@ _CLAUDE.md  index.md  CRITICAL_FACTS.md  log.md
 wiki/logs/       one note per session: what you asked, files written, commands that worked, tools, subagents, account switches
 wiki/projects/   one note per project: dated decisions, learnings and open threads, plus its sessions
 wiki/daily/      one note per day: sessions and spend
-skills/          one note per promoted skill;  skills/candidates/<name>/SKILL.md  awaiting your review
+skills/          one note per skill (status, the session and project it came from, uses);  skills/candidates/<name>/SKILL.md  awaiting your review
 ```
 
 - **Capture is free.** A session that has been idle for 15 minutes gets its note straight from its transcript; no model is
@@ -160,6 +160,13 @@ skills/          one note per promoted skill;  skills/candidates/<name>/SKILL.md
   unused for 30 days. No savings are claimed.
 - **Recall.** *Install recall skill* adds a small `brain` skill that tells Claude to read the vault's index and at most three
   notes when you refer to past work.
+- **Pipeline.** The Brain tab opens on a funnel — captured (no model) → scanned (Haiku looks for a repeatable skill) → extracted
+  (Sonnet) → skill candidate → promoted — with one row per session showing how far it got and what each step cost. *Scan* runs
+  only the classifier; *Scan backlog* and *Extract scanned* work through the rest in the background after a confirm that states
+  the count, an estimate and what is left of the daily cap.
+- **Graph.** An Obsidian-style graph of the vault drawn in the console (no Obsidian needed): sessions, projects, days, skills and
+  tags, with a skill tied to the session it came from and the sessions that used it. The same links are written into the notes,
+  so Obsidian shows the same picture; *Open in Obsidian* appears when the app is installed, *Reveal folder* otherwise.
 
 Settings: `brain_enabled`, `brain_dir`, `brain_distill` (`manual` | `on_idle`), `brain_daily_usd`, `classifier`
 (`auto` | `jev` | `model`), `brain_classifier_model` (`haiku`), `brain_writer_model` (`sonnet`), `brain_confidence` (0.7).
