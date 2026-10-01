@@ -1777,7 +1777,7 @@ const at = (ms: number, row: string) => row.replace(/"timestamp":"[^"]*"/, `"tim
 const res = (sk: string, id: string, ms: number, chars: number, err = false) => at(ms, jrow(sk, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: `OUT${'y'.repeat(chars)}`, ...(err && { is_error: true }) }] } }));
 const TRACE_SECRET = 'sk-ant-api03-SECRETSECRETSECRET';
 const CURL = `curl -H "Authorization: Bearer ${TRACE_SECRET}" https://tts.example.com/speak?token=abc ${'-v '.repeat(60)}`;
-const CURL_TARGET = 'curl -H "Authorization: [redacted]" https://tts.example.com/speak?token=[redacted] '.concat('-v '.repeat(60)).replace(/\s+/g, ' ').trim().slice(0, 120);
+const CURL_TARGET = 'curl -H "Authorization: [redacted]" https://tts.example.com/speak?token=[redacted] '.concat('-v '.repeat(60)).replace(/\s+/g, ' ').trim().slice(0, 160);
 // One session: a prompt, ten routed requests (model calls) and the tool calls between them: a failing Bash and one that never returned (both of families that
 // later succeed), a command with a secret, four read-only calls in a row, two writes to one file, an Agent call whose subagent transcript runs one command twice.
 // Model calls end at fixed times in the ledger; tools and the subagent have the transcript's times.
@@ -1901,9 +1901,9 @@ test('agent trace: each rule of minimal() on its own; md() keeps prompts, subage
   // 3: of the writes to one path the last, with its count; another path is its own
   m = run([span('tool', 'Write', 'a.js'), span('tool', 'Edit', 'a.js'), span('tool', 'Write', 'b.js'), span('tool', 'Edit', 'a.js')]);
   assert.deepEqual([m.pruned, m.spans.slice(1).map((s: any) => [s.name, s.target, s.edits])], [{ overwritten_writes: 2 }, [['Write', 'b.js', undefined], ['Edit', 'a.js', 3]]]);
-  // 4: of the successful commands of one family the last, with its count; the family is the executable and the first argument, after `cd … &&` and VAR=…
+  // 4: of the successful commands of one family the last, with its count; the family is the tuple of commandKeys (below): `cd …` and VAR=… do not count, `npm run build` is not `npm run deploy`
   m = run([span('tool', 'Bash', 'cd /x && npm run build'), span('tool', 'Bash', 'npm run deploy'), span('tool', 'Bash', 'git status'), span('tool', 'Bash', 'FOO=1 npm run build --prod')]);
-  assert.deepEqual([m.pruned, m.spans.slice(1).map((s: any) => [s.target, s.runs])], [{ repeated_commands: 2 }, [['git status', undefined], ['FOO=1 npm run build --prod', 3]]]);
+  assert.deepEqual([m.pruned, m.spans.slice(1).map((s: any) => [s.target, s.runs])], [{ repeated_commands: 1 }, [['npm run deploy', undefined], ['git status', undefined], ['FOO=1 npm run build --prod', 2]]]);
   // 5: a subagent keeps its place and is pruned on its own; each scope keeps its last model call and drops the others
   m = run([span('model', 'a'), span('tool', 'Bash', 'x one'), span('tool', 'Agent', 'run', { kind: 'subagent', name: 'sub', id: 'sa' }), span('model', 'b'),
     span('model', 'c', '', { parent: 'sa' }), span('tool', 'Bash', 'y one', { parent: 'sa' }), span('tool', 'Bash', 'y one', { parent: 'sa' }), span('model', 'd', '', { parent: 'sa' })]);
@@ -1918,6 +1918,35 @@ test('agent trace: each rule of minimal() on its own; md() keeps prompts, subage
   assert.ok(/explored 0 files/.test(whole) && !/explored 0 files/.test(cut) && /explored 299 files/.test(cut), 'the oldest explored spans go first');
   assert.match(cut.split('\n')[0], /; \d+ more left out to fit$/);
   assert.deepEqual([lines(tight, /explored/), lines(tight, /Write/), lines(tight, /Subagent/), lines(tight, /Prompt/), lines(tight, /Bash/) < 40], [0, 20, 1, 1, true], 'then the other steps, never writes, subagents or prompts');
+});
+
+test('agent trace: commandKeys reads a command line as its real commands; minimal() keeps distinct `cd dir && tool` steps and supersedes only a true re-run', async () => {
+  await arith();
+  const { commandKeys, minimal } = await import('./trace.ts');
+  const k = (c: string) => commandKeys(c).keys;
+  // one key per real command: executable, subcommand or script, and the file it writes; cd, VAR=…, sleep and echo are set-up
+  assert.deepEqual(k('cd /a/b && ffmpeg -y -i in.mp4 -vf scale=1280:-2 out_720.mp4'), ['ffmpeg >out_720.mp4']);
+  assert.notDeepEqual(k('cd /a/b && ffmpeg -y -i in.mp4 -vf scale=1920:-2 out_1080.mp4'), k('cd /a/b && ffmpeg -y -i in.mp4 -vf scale=1280:-2 out_720.mp4'));
+  assert.deepEqual(k('cd /c && ffmpeg -i other.mp4 -vf scale=1280:-2 /x/out_720.mp4'), ['ffmpeg >out_720.mp4'], 'a re-run: same family whatever else changed');
+  assert.deepEqual([k('cd x && node render.js --fps 30 > render.log 2>&1'), k('S=/tmp/v3; cd "$S" && python3 voiceover.py --line 4'), k('until curl -sf localhost:3000; do sleep 1; done')],
+    [['node render.js >render.log'], ['python3 voiceover.py'], ['curl']]);
+  assert.deepEqual([k('npm run build && npm run deploy'), k('npm run build'), k("bash -c 'cd /x && npx playwright test tests/a.spec.ts'"), k('FOO=1 sudo timeout 9 ~/.venv/bin/python -m pytest -q'),
+    k('for f in a b; do cwebp $f -o out/$f.webp; done'), k('git status && git commit -m x'), k('$V voiceover.py plan | grep Duration; exit 1')], [['npm run build', 'npm run deploy'], ['npm run build'], ['npx playwright'], ['python pytest'], ['cwebp >$f.webp'], ['git status', 'git commit'], ['$V voiceover.py', 'grep']]);
+  // quoted separators do not split; a redirect is a write
+  assert.deepEqual([commandKeys('echo "a && b" > notes.txt'), commandKeys('echo "a && b"; cd /x')].map((c) => [c.keys, c.ro]), [[['echo >notes.txt'], false], [[], true]]);
+  // exploration: every command left is read-only and nothing is written; a read mixed with a real command is a step
+  assert.deepEqual(['cd x && ls -la && cat README.md', 'cat a.txt | grep foo', 'git status 2>/dev/null', 'git log --oneline | head', `sqlite3 db "select 1"`, 'ffprobe -v error a.mp4', 'sleep 2'].map((c) => commandKeys(c).ro), [true, true, true, true, true, true, true]);
+  assert.deepEqual(['cat a.txt | grep foo > found.txt', 'ls && npm test', 'find . -name x -delete', 'git commit -m x', `sqlite3 db "delete from t"`, 'jq . a.json > b.json'].map((c) => commandKeys(c).ro), [false, false, false, false, false, false]);
+  assert.equal(commandKeys('cd /private/tmp/x && ls -la && node render.js > out.log').text, 'ls -la && node render.js > out.log', 'the shown line has the set-up removed');
+  // minimal(): four distinct `cd dir && tool` steps all stay (the old rule kept one); the same render run twice is one step, the later run kept
+  let n = 0;
+  const span = (name: string, target: string, o: any = {}) => ({ id: `s${++n}`, parent: 'p', kind: 'tool', name, target, t0: n * 10, t1: n * 10 + 5, ms: 5, ok: true, n_children: 0, ...o });
+  const cmds = ['cd /w/a && ffmpeg -i in.mp4 out_a.mp4', 'cd /w/a && node render.js --fps 30', 'cd /w/a && python3 voiceover.py --line 4', 'cd /w/a && ffmpeg -i in.mp4 out_b.mp4', 'cd /w/a && ffmpeg -i in2.mp4 out_a.mp4', 'cd /w/a && ls'];
+  const t = { unit_id: 'u', title: 'T', kind: 'subagent', mode: 'full', started: 0, ended: 1e4, usd: 1, lim: '', last_ts: 1, tokens: { in: 0, out: 0, cache_read: 0, cache_create: 0 },
+    counts: { steps: 0, tool_calls: 0, failed: 0, subagents: 0, models: 0 }, spans: [{ ...span('', '', { id: 'p', parent: null }), kind: 'prompt', name: 'do it' }, ...cmds.map((c) => span('Bash', c))] } as any;
+  const m = minimal(t);
+  assert.deepEqual([m.pruned, m.spans.slice(1).map((s: any) => [s.target, s.runs])], [{ repeated_commands: 1 }, [['cd /w/a && node render.js --fps 30', undefined],
+    ['cd /w/a && python3 voiceover.py --line 4', undefined], ['cd /w/a && ffmpeg -i in.mp4 out_b.mp4', undefined], ['cd /w/a && ffmpeg -i in2.mp4 out_a.mp4', 2], ['cd /w/a && ls', undefined]]]);
 });
 
 test('brain distill from the trace: the gate reads the head of a unit\'s minimal trace, the writer all of it; the failed command is in neither, the commands that worked are', async (t) => {

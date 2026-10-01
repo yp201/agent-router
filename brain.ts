@@ -10,7 +10,7 @@ import { db, settings, now } from './ledger.ts';
 import { claude, claudeHome } from './advisor.ts';
 import { ROOT, desc } from './tailer.ts';
 import { MSG, spendOf, fmtUsd } from './console.ts';
-import { trace, minimal, md, lastTs } from './trace.ts'; // trace.ts imports this file back; each calls the other's functions only at run time
+import { trace, minimal, md, lastTs, commandKeys } from './trace.ts'; // trace.ts imports this file back; each calls the other's functions only at run time
 
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
@@ -231,8 +231,8 @@ export function segments(ev: Ev[]) {
 }
 // Commands that worked, capped near 3,000 tokens: under the cap all of them; over it, the first of each command family, then the final
 // third of the run from its end backwards, in their original order.
-// ponytail: a family is the first two words after leading `cd … &&` and VAR=… prefixes; parse the shell if that groups badly
-export const family = (c: string) => c.replace(/^(cd [^&;]+(&&|;)\s*)+/, '').replace(/^(\w+=\S+\s+)+/, '').split(' ').slice(0, 2).join(' ');
+// A command family is its commandKeys() tuple (trace.ts: the one definition, also minimal()'s).
+const family = (c: string) => commandKeys(c).keys.join(' | ');
 function keep(cmds: string[], max = 12_000) {
   if (cmds.reduce((n, c) => n + c.length + 4, 0) <= max) return cmds;
   const fam = new Set<string>(), pick = new Set<number>();

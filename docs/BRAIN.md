@@ -60,7 +60,7 @@ its own overview (the last 80 commands); `index.md`, the day note and the projec
 
 As built: units are rows of `brain_sessions` (`kind` `session` | `subagent` | `segment`, `parent` = the session, `agent_id`,
 `seg_index`, `name`, `started`; the key is `<session>/<agent id>` or `<session>/seg-<n>`), so rows from before units are sessions
-and keep their scan and extract state. A command family is the first two words after leading `cd … &&` and `VAR=…`.
+and keep their scan and extract state. A command family is its `commandKeys()` tuple (see Trace).
 
 ## Pipeline
 
@@ -215,13 +215,27 @@ its prompts. Containers carry the dollars and tokens of everything beneath them;
 (tool calls and subagent runs), `tool_calls`, `failed`, `subagents`, `models`.
 
 **Minimal trace**, `minimal(trace)`, applies in this order: (1) drop tool spans with `ok = false`, and an unanswered call that a later success of the same family supersedes;
-(2) collapse runs of consecutive read-only exploration (`Read`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `ToolSearch`, and Bash that is `ls`, `cat`, `head`, `tail`, `grep`, `rg`,
-`find`, `tree`, `pwd`, `wc`, `stat`, `file` without a redirect) into one `explored N files` span that keeps the 3 largest targets; (3) of the writes to one path keep the last
+(2) collapse runs of consecutive read-only exploration (`Read`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `ToolSearch`, and Bash whose every command is read-only: `ls`, `cat`, `head`,
+`tail`, `grep`, `rg`, `find`, `tree`, `pwd`, `wc`, `stat`, `file`, `du`, `df`, `which`, `jq`, `ffprobe`, `sed` (not `-i`), `awk`, `cut`, `tr`, `sort`, `ps`, `date`, …, `git status|log|diff|show|branch`,
+`sqlite3` with a `select`, and no redirect into a file) into one `explored N files` span that keeps the 3 largest targets; (3) of the writes to one path keep the last
 (`edits: n`); (4) of the successful Bash commands of one family keep the last (`runs: n`); (5) keep every prompt and segment, every subagent span (pruned on its own, recursively) and
-each unit's last model call, which is its report. Every other model call is dropped (it carries no content). A *family* is the same tool; for Bash the executable plus the first
-argument (the unit notes' command family: after leading `cd … &&` and `VAR=…`); for the file tools the same path. The definition of read-only and of a family is in one place at the top
-of `trace.ts`. The result has `pruned` (`failed_or_superseded`, `collapsed`, `collapsed_into`, `overwritten_writes`, `repeated_commands`, `model_calls`), `counts` of what is kept
-and `full` (the counts before). The same coarse family rule groups `npm run build` with `npm run deploy` and every `ffmpeg -i …`: only the last of each is kept, with `runs`.
+each unit's last model call, which is its report. Every other model call is dropped (it carries no content). A *family* is the same tool; for the file tools the same path; for Bash the
+**`commandKeys(line)` tuple** (`trace.ts`, also the unit notes' command families; the one definition of family and of read-only):
+- the line is split into simple commands on unquoted `&&`, `||`, `;`, `|`, `&`, `( )` and newlines (quotes, `$(…)`, backticks and heredocs stay whole); `for`/`while`/`until`/`if` keywords are
+  peeled off (a loop's header goes, its condition and body stay);
+- set-up noise is dropped: `cd`, `pushd`/`popd`, `export`, `set`, `source`, `sleep`, `true`/`false`, `:`, `wait`, `exit`, `trap`, pure `VAR=value`, comments, and `echo`/`printf` not redirected into a file;
+  `VAR=value` prefixes are stripped and `sudo`, `env`, `time`, `nohup`, `timeout N`, `xargs`, `bash -c '…'` unwrapped to the command inside;
+- each command left is a key: the executable's basename, plus a subcommand (`git`, `npm`, `npx`, `pnpm`, `yarn`, `bun`, `docker`, `brew`, `gh`, `wrangler`, `cargo`, `go`, `kubectl`, `pip`, `uv`,
+  `launchctl`, `deno`: the first non-flag argument, and the script name after `run`) or script (`python`, `node`, `bash`, `sh`, `ruby`, `perl`, `$VAR`: the script's basename, `-m X` for modules, a hash of
+  `-c`/`-e` code), plus the file it writes (`-o`/`--output` value, a redirect target, the last argument of `ffmpeg`/`magick`/`sox`/`yt-dlp` when it has an extension), reduced to its basename, plus a
+  hash of a heredoc's text. So `cd d && ffmpeg … out_a.mp4` and `… out_b.mp4` are different families, `npm run build && npm run deploy` is not `npm run build`, and a true re-run of the same
+  command to the same output is one family: the later success supersedes the earlier;
+- a line is exploration when every command left is read-only and nothing is redirected into a file (a read mixed with a real command is a step; a line of nothing but set-up counts as exploration);
+- the span's `target` is the line with the set-up removed (first 160 characters, scrubbed), so a row reads `ffmpeg -i … out.mp4`, not `cd /private/tmp/…`; the keys travel with a Bash span as `cmd: {keys, ro}`.
+
+It is a line scanner, not a shell parser: it flattens `( … )`, ignores what is inside `$(…)`, and misreads functions defined earlier in the shell, `case`, `git -C dir …`, aliases and a target held in a
+variable; every misreading keeps a step that could have been merged, none merges two commands. The result has `pruned` (`failed_or_superseded`, `collapsed`, `collapsed_into`, `overwritten_writes`,
+`repeated_commands`, `model_calls`), `counts` of what is kept and `full` (the counts before).
 
 `md(trace)` renders a minimal trace as a numbered outline (step, tool, target, outcome, duration; a subagent's steps as a nested list), at most ~6,000 tokens (24,000 characters):
 over that it drops `explored` spans first, then the other steps, oldest first, and never a prompt, subagent or write. **The writer reads this outline**, with the unit's Brief

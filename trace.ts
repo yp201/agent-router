@@ -9,32 +9,112 @@ import { db, settings } from './ledger.ts';
 import { cost, limText } from './console.ts';
 import { resultChars } from './advisor.ts';
 import { desc } from './tailer.ts';
-import { clip, strip, code, family, segments, LONG, mainPaths } from './brain.ts';
+import { createHash } from 'node:crypto';
+import { clip, strip, code, segments, LONG, mainPaths } from './brain.ts';
 
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
 type Tok = { in: number; out: number; cache_read: number; cache_create: number };
 export type Span = { id: string; parent: string | null; kind: 'prompt' | 'model' | 'tool' | 'subagent' | 'segment'; name: string; target: string; t0: number; t1: number; ms: number | null;
-  ok: boolean | null; out_tokens_est?: number; usd?: number | null; tokens?: Tok; lim?: string; n_children: number; edits?: number; runs?: number };
+  ok: boolean | null; out_tokens_est?: number; usd?: number | null; tokens?: Tok; lim?: string; n_children: number; edits?: number; runs?: number; cmd?: { keys: string[]; ro: boolean } };
 export type Counts = { steps: number; tool_calls: number; failed: number; subagents: number; models: number };
 export type Trace = { unit_id: string; title: string; kind: 'session' | 'subagent' | 'segment'; mode: 'full' | 'minimal'; started: number; ended: number; usd: number; tokens: Tok; lim: string;
   last_ts: number; counts: Counts; spans: Span[]; full?: Counts; pruned?: Record<string, number> };
 
 // ---- the one place that says what is exploration and what is "the same command" (minimal() rules 1-4) ----
-// Read-only exploration: these tools, and Bash that is just looking (ls, cat, head, grep, find, …). A family is: the same tool; for Bash the same
-// executable + first argument (brain.ts family()); for the file tools (Read, Edit, Write, …) the same path.
-// ponytail: a Bash command is read-only when its executable is on the list and it has no redirect, -delete or -exec; parse the shell if that misfiles
-const RO = new Set(['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch', 'ToolSearch']), RO_CMD = /^(ls|cat|head|tail|grep|rg|find|tree|pwd|wc|stat|file)$/, WRITE = /^(Edit|Write|MultiEdit|NotebookEdit)$/;
-const readOnly = (s: Span) => RO.has(s.name) || (s.name === 'Bash' && RO_CMD.test(family(s.target).split(' ')[0]) && !/>|-delete|-exec/.test(s.target));
+// Read-only exploration: these tools, and Bash that is just looking. A family is: the same tool; for Bash the same commandKeys() tuple; for the file tools (Read,
+// Edit, Write, …) the same path.
+const RO = new Set(['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch', 'ToolSearch']), WRITE = /^(Edit|Write|MultiEdit|NotebookEdit)$/;
+const cmdOf = (s: Span) => s.cmd ?? commandKeys(s.target);
+const readOnly = (s: Span) => RO.has(s.name) || (s.name === 'Bash' && cmdOf(s).ro);
 const FILE = /^(Read|Edit|Write|MultiEdit|NotebookEdit)$/;
-const famKey = (s: Span) => (s.name === 'Bash' ? `Bash ${family(s.target)}` : FILE.test(s.name) ? `${s.name} ${s.target}` : s.name);
+const famKey = (s: Span) => (s.name === 'Bash' ? `Bash ${cmdOf(s).keys.join(' | ')}` : FILE.test(s.name) ? `${s.name} ${s.target}` : s.name);
+
+// A command line, read just enough to tell what it did. Split on unquoted && || ; | & ( ) and newlines ($(…), `…` and quotes stay whole); loop and `if` keywords peeled
+// off; set-up noise (cd, export, VAR=x, sleep, echo, …) dropped; sudo, env, time, timeout, xargs and bash -c unwrapped. Each command left is a key: the executable, its
+// subcommand or script, and the file it writes (-o, a redirect, ffmpeg's last argument when it has an extension). A line's family is the tuple of its keys; it is exploration when every command in it is read-only.
+// ponytail: a line scanner, not a shell parser. A heredoc is one command, told apart by a hash of its text; it flattens ( … ) subshells, ignores what is inside $(…), and misreads functions, `case`, `git -C dir`, aliases and a target held in a
+// variable ($OUT); misreads over-keep, they never merge two commands. Upgrade to a real parser if that groups badly.
+const NOISE = /^(cd|pushd|popd|export|set|source|sleep|true|false|:|wait|read|test|exit|continue|break|return|trap|unset|local|declare|shift|\[\[?|[{}])$/, WRAP = /^(sudo|env|time|nohup|timeout|xargs)$/, SUB = /^(git|npm|npx|pnpm|yarn|bun|docker|brew|gh|wrangler|cargo|go|kubectl|pip|uv|launchctl|deno)$/;
+const SCRIPT = /^(python[\d.]*|node|bash|sh|zsh|ruby|perl|\$\{?\w+\}?)$/, MEDIA = /^(ffmpeg|ffprobe|magick|convert|sox|yt-dlp)$/, RO_EXE = /^(ls|cat|head|tail|wc|grep|rg|find|stat|file|du|df|which|pwd|tree|jq|ffprobe|sed|awk|cut|tr|sort|uniq|nl|column|xxd|od|strings|diff|cmp|md5|shasum|ps|pgrep|lsof|basename|dirname|realpath|readlink|date|uname|whoami|afinfo|mdls)$/;
+const base = (p: string) => p.replace(/^.*\//, '');
+const KW = /^(?:(?:do|then|else|elif|if|while|until|!)(?:\s+|$))+/;
+function split(s: string) {
+  const out: [string, string][] = []; // [the separator before it, the command]
+  let cur = '', sep = '', q = '', d = 0, hd = '';
+  const push = (next: string) => { if (cur.trim()) out.push([sep, cur.trim()]); cur = ''; sep = next; };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i], n = s[i + 1];
+    cur += c;
+    if (c === '\\') cur += s[++i] ?? '';
+    else if (q) { if (c === q) q = ''; }
+    else if (c === "'" || c === '"' || c === '`') q = c;
+    else if (c === '(' && (d || s[i - 1] === '$')) d++;
+    else if (c === ')' && d) d--;
+    else if (!d) {
+      if (c === '<' && n === '<' && s[i - 1] !== '<' && s[i + 2] !== '<') hd = /^<<-?\s*['"]?(\w+)/.exec(s.slice(i))?.[1] ?? hd; // a heredoc: its body stays in this command
+      if (c === '\n' && hd) { const e = s.indexOf(`\n${hd}`, i), end = e < 0 ? s.length : e + 1 + hd.length; cur += s.slice(i + 1, end); i = end - 1; hd = ''; }
+      else if (c + n === '&&' || c + n === '||') { cur = cur.slice(0, -1); i++; push(c + n); }
+      else if (/[;|\n()]/.test(c) || (c === '&' && !/[<>]/.test(s[i - 1] ?? '') && n !== '>')) { cur = cur.slice(0, -1); push(c === '\n' ? ';' : c); }
+    }
+  }
+  push('');
+  return out;
+}
+// one simple command: its words, and the files it redirects into
+function words(s: string) {
+  const w: string[] = [], out: string[] = [];
+  let cur = '', has = false, q = '', d = 0, red = '';
+  const end = () => { if (has) { (red === 'o' ? out : red ? [] : w).push(cur); red = ''; } cur = ''; has = false; };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\' && q !== "'") { cur += s[++i] ?? ''; has = true; }
+    else if (q) { if (c === q) q = ''; else cur += c; }
+    else if (c === "'" || c === '"' || c === '`') { q = c; has = true; }
+    else if (c === '(' && (d || cur.endsWith('$'))) { d++; cur += c; }
+    else if (c === ')' && d) { d--; cur += c; }
+    else if (d) cur += c;
+    else if (c === '\n') break; // only a heredoc body can follow
+    else if (/\s/.test(c)) end();
+    else if (c === '>' || c === '<') {
+      if (/^(\d*|&)$/.test(cur)) { cur = ''; has = false; } else end(); // `2>` and `&>`: the number is not a word
+      red = c === '>' ? 'o' : 'i';
+      if (s[i + 1] === c) i++; else if (c === '>' && s[i + 1] === '&') i++;
+    } else { cur += c; has = true; }
+  }
+  end();
+  return { w, out: out.filter((f) => !/^(\d+|-|\/dev\/null)$/.test(f)) };
+}
+export function commandKeys(line: string) {
+  const keys: string[] = [], shown: [string, string][] = [];
+  let ro = true;
+  const read = (s: string, top: boolean) => {
+    for (const [sep, raw] of split(s)) {
+      const text = raw.replace(KW, ''), { w, out } = words(text), skip = () => { while (w[0] && /^(-.*|\d+[smhd]?|[A-Za-z_]\w*=.*)$/.test(w[0])) w.shift(); };
+      skip();
+      while (w[0] && WRAP.test(w[0])) { w.shift(); skip(); }
+      const exe = base(w[0] ?? ''), a = w.slice(1), n = keys.length;
+      if (/^(ba|z)?sh$/.test(exe) && /^-\w*c$/.test(a[0]) && a[1] != null) { read(a[1], false); if (keys.length > n && top) shown.push([sep, text]); continue; }
+      if (!exe || text.startsWith('#') || NOISE.test(exe) || /^(for|select|case|done|fi|esac)$/.test(exe) || (/^(echo|printf)$/.test(exe) && !out.length)) continue;
+      const pos = a.filter((x) => !x.startsWith('-')), m = a.indexOf('-m'), c = a.findIndex((x) => /^-[ce]$/.test(x)), o = a.findIndex((x) => /^(-o|--out(put)?)$/.test(x)), eq = a.find((x) => /^--out(put)?=/.test(x));
+      let sub = SUB.test(exe) ? pos[0] ?? '' : SCRIPT.test(exe) ? (m >= 0 ? a[m + 1] : c >= 0 ? `-c ${createHash('sha1').update(a[c + 1] ?? '').digest('hex').slice(0, 6)}` : base(pos[0] ?? '')) : '';
+      if (sub === 'run' && /^(npm|pnpm|yarn|bun|deno)$/.test(exe)) sub += ` ${base(pos[1] ?? '')}`;
+      const to = [o >= 0 && a[o + 1], eq?.split('=')[1], MEDIA.test(exe) && /^[^-].*\.\w+$/.test(a.at(-1) ?? '') && a.at(-1), ...out].filter(Boolean).map((t) => base(t as string)).filter(Boolean);
+      keys.push([exe, sub, ...to.map((t) => `>${t}`), /<<-?\s*['"]?\w/.test(text) && `#${createHash('sha1').update(text).digest('hex').slice(0, 6)}`].filter(Boolean).join(' '));
+      ro &&= RO_EXE.test(exe) ? !out.length && !a.some((x) => (exe === 'find' && /^-(delete|exec(dir)?)$/.test(x)) || (exe === 'sed' && /^-i/.test(x))) : (exe === 'git' && /^(status|log|diff|show|branch)$/.test(sub) && !out.length) || (exe === 'sqlite3' && a.some((x) => /^\s*select\b/i.test(x)));
+      if (top) shown.push([sep, text]);
+    }
+  };
+  read(line, true);
+  return { keys, ro, text: shown.length ? shown.map(([s, t], i) => (i ? ` ${s} ` : '') + t).join('') : line };
+}
 
 // a tool call's one short target: file, command, pattern, url (host and path only), query, skill or description. Scrubbed; paths relative to the cwd.
 const targetOf = (i: any, cwd: string) => {
   let v = i?.command ?? i?.file_path ?? i?.notebook_path ?? i?.pattern ?? i?.url ?? i?.query ?? i?.skill ?? i?.path ?? i?.description;
   if (typeof v !== 'string') return '';
   if (/^https?:\/\//.test(v)) try { const u = new URL(v); v = u.host + u.pathname; } catch {}
-  return clip(cwd && v.startsWith(`${cwd}/`) ? v.slice(cwd.length + 1) : v, 120);
+  return clip(cwd && v.startsWith(`${cwd}/`) ? v.slice(cwd.length + 1) : v, i?.command ? 160 : 120);
 };
 
 // ---- parse one transcript set into nested nodes ----
@@ -80,8 +160,9 @@ async function parse(sk: string, files: string[], side: boolean, pre: string): P
         if (typeof r.toolUseResult?.agentId === 'string') s.agent = r.toolUseResult.agentId; // an Agent call: the id of the subagent transcript it started
       }
       if (r.type === 'assistant' && b?.type === 'tool_use' && b.id && !uses.has(b.id)) {
-        const s: Node = { id: b.id, kind: 'tool', name: String(b.name), target: targetOf(b.input, cwd), t0: ts, t1: ts, ms: null, ok: null, kids: [],
-          ...(/^(Agent|Task)$/.test(b.name) && { title: clip(String(b.input?.description ?? ''), 80) }) };
+        const c = b.name === 'Bash' && typeof b.input?.command === 'string' ? commandKeys(b.input.command) : null;
+        const s: Node = { id: b.id, kind: 'tool', name: String(b.name), target: targetOf(c ? { command: c.text } : b.input, cwd), t0: ts, t1: ts, ms: null, ok: null, kids: [],
+          ...(c && { cmd: { keys: c.keys, ro: c.ro } }), ...(/^(Agent|Task)$/.test(b.name) && { title: clip(String(b.input?.description ?? ''), 80) }) };
         uses.set(b.id, s); (cur ?? prompt('(continued)', ts)).kids.push(s); ev.push({ t: 'u', s: '', node: s });
       }
     }
@@ -155,7 +236,7 @@ const children = (spans: Span[]) => { const k = new Map<string | null, Span[]>()
 //  1. drop failed tool spans, and an unanswered attempt that a later successful call of the same family supersedes
 //  2. collapse runs of consecutive read-only exploration into one `explored N files` span (the 3 largest targets are kept)
 //  3. of the writes to one path keep the last (`edits: n`)
-//  4. of the successful Bash commands of one family keep the last (`runs: n`)
+//  4. of the successful Bash commands of one family (commandKeys) keep the last (`runs: n`)
 //  5. keep every prompt and segment, every subagent span (pruned the same way, on its own), and the unit's final model call (its report)
 // Model calls carry no content, so every other one is dropped (counted). Rules 3 and 4 look across the whole transcript they run on.
 export function minimal(t: Trace): Trace {
@@ -192,7 +273,7 @@ export function minimal(t: Trace): Trace {
       for (const xs of g.values()) { xs.slice(0, -1).forEach((x) => gone.add(x)); add(reason, xs.length - 1); if (xs.length > 1) note.set(xs.at(-1)!, { [k]: xs.length }); }
     };
     group((s) => (WRITE.test(s.name) && s.ok && s.target ? s.target : null), 'edits', 'overwritten_writes');
-    group((s) => (s.name === 'Bash' && s.ok ? family(s.target) : null), 'runs', 'repeated_commands');
+    group((s) => (s.name === 'Bash' && s.ok ? famKey(s) : null), 'runs', 'repeated_commands');
     // 5, and the output in the original order
     const emit = (xs: Span[]) => {
       for (const s of xs) {

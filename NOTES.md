@@ -556,3 +556,16 @@ Spec: `docs/BRAIN.md` "Trace". Code: `trace.ts` (new: `trace()`, `minimal()`, `m
   "New version — reload" chip while a form is dirty or an input has focus (checked in the browser: typing in the filter box held the reload, clearing it let it happen).
 - **Not built:** trace search is over the loaded spans after one full fetch (no server-side search); a very long idle gap (the subagent above spans 5 h 42 min for 342 minutes of wall time, mostly waiting) makes
   the bars thin: no axis break; spans are not windowed past ~20,000 open rows.
+
+## Minimal trace: parse the command before deciding its family (2026-10-01)
+Spec: `docs/BRAIN.md` "Trace". Code: `trace.ts` `commandKeys()` (one definition; `minimal()` and the unit notes' command families in `brain.ts` use it; `family()` and the read-only regex are gone).
+- **The old family rule (first two words after `cd … &&`) threw real steps away.** `cd <dir> && ffmpeg …`, `cd <dir> && node render.js`, `cd <dir> && python3 voiceover.py` were one family per directory and only the last
+  survived; the survivors were `cd`, `until`, `for`, `S=…`. Now a line is split into its commands, set-up (`cd`, `export`, `VAR=x`, `sleep`, `echo`, …) is dropped, and each command is keyed by executable +
+  subcommand/script + output file; the family is the tuple. A Bash span carries `cmd: {keys, ro}` (computed from the full command, since `target` is cut at 160 characters) and its `target` is the line without set-up.
+- **Dry run on a copy of the live ledger and vault, no model call.** Subagent "Build trailer v3" (272 steps, 189 Bash): kept 78 -> 192; repeated_commands 130 -> 6; collapsed reads 85 -> 99 (more of the
+  `sed`/`cut`/`tr`/`awk`/`ps` filters count as looking now); outline 12.1k -> 24.0k characters (at the 24k cap, so `md()` trims). Two more units of that session: 126 steps, 74 -> 100 (44 -> 5 repeated) and 129 steps,
+  51 -> 86 (43 -> 3). Every distinct successful non-read-only command family of the full trace is in the minimal one (128 of 128, 55 of 55, 57 of 57); ffmpeg 22 distinct runs, 22 kept (old: 2).
+- **What it costs.** Heredoc scripts (`python3 - <<EOF …` file patches, 47 in the first unit) are distinct by a hash of their text, so every patch is a step; collapsing them was the old failure in another form.
+  A rule that merges patches by the file they touch would need the heredoc parsed. Shell functions defined in an earlier call (`hc`, `snap`), `$VAR` executables with no script and `case` are keyed by their name only.
+- **Read-only grew** beyond the spec's list (`sed` without `-i`, `awk`, `cut`, `tr`, `sort`, `uniq`, `ps`, `pgrep`, `date`, `basename`, `diff`, `strings`, …) after the first run kept dozens of `sed -n`/`cut`/`pgrep` steps.
+
