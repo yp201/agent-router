@@ -21,6 +21,8 @@ wiki/projects/        one note per project (what is true): decisions, learnings,
 wiki/daily/           one note per day: sessions, spend
 skills/               one note per skill that is promoted or came out of a session: status, source units, project, uses, cost
 skills/candidates/    <name>/SKILL.md extracted from sessions or imported, awaiting review; for a promoted skill, a proposed update
+skills/merged/        <name>/SKILL.md of a fragment a consolidation replaced (merged or covered); kept as it was, restorable
+skills/<installed>.notes.md   facts from fragments an installed skill may lack (a consolidation's covered clusters); the installed skill itself is never edited
 ```
 
 Generated content sits between `<!-- agent-router:begin -->` and `<!-- agent-router:end -->`. Anything outside
@@ -130,7 +132,25 @@ and keep their scan and extract state. A command family is its `commandKeys()` t
    since, so later runs refine the earlier one's skill instead of repeating it.
    What each scan and extract cost is stored per unit (`brain_sessions.scan_usd`, `extract_usd`): the brain-tagged spend logged while
    the call ran.
-   A "Consolidate" button runs one further writer call to merge and rewrite a project note.
+   **How a writer call ends** is stored on the unit (`brain_sessions.extract_result`, a short `extract_detail`, never model output beyond a 120-character parse error) and shown
+   on its pipeline row, so no call is silent:
+   | `extract_result` | meaning |
+   | --- | --- |
+   | `skill_created` | a new candidate was written |
+   | `skill_refined` | an existing candidate (or a proposed update to a promoted skill) was improved |
+   | `no_skill` | the writer answered, and no skill came of it: `writer returned skill: null`, `skill dropped: skill_exists (name)` (the name belongs to another unit's candidate), an incomplete skill, or none was asked for |
+   | `parse_failed` | the reply was not the JSON object asked for, twice: it is asked once more with "return only the JSON object"; the failed text is only in one log line |
+   | `writer_error` | `claude` exited non-zero or printed nothing |
+   | `timeout` | no answer within 180 s |
+   Only `skill_*` and `no_skill` set `distilled_ts`; the other three leave the unit to extract again (**Retry**). When the scan said `skill` (or named a skill to refine) at the
+   confidence and the result is `no_skill`, the row shows an amber **no skill written** chip with the detail and **Retry**. Retry (and "Distill anyway" on a unit with a stored scan that
+   asked for a skill) keeps that scan: the writer is asked for the skill outright, or to refine the skill named, as the scan said. (A forced distill used to replace the scan with
+   "want a skill, maybe"; handed a 192-step run and no prompt to write one, the writer answered `skill: null`: measured, 2 of 3 runs on the richest unit of a real session.)
+   A unit extracted again that already wrote a candidate improves that candidate in place (refine mode on its own skill) instead of inventing a second name.
+   The outline the writer reads is cut in the middle when it is over the cap (see Trace); `brain_sessions.trace_trimmed` is 1 then, and the row shows a "trace trimmed" chip.
+   In refine mode a writer that decides the run is a different procedure answers with the new skill and `"related_to": "<the matched name>"`; the unit is then linked to both
+   (`skill_sources` mode `related` on the matched skill, `create` on the new one), so a consolidation sees the relation.
+   A "Consolidate notes" button runs one further writer call to merge and rewrite a project note.
 4. **Skills.** Candidates never reach Claude Code on their own. **Promote** copies
    `skills/candidates/<name>/` to `~/.claude/skills/<name>/` (user-level, so every project gets it) with a
    `.agent-router` marker; an existing skill directory without that marker is never overwritten. **Demote**
@@ -143,6 +163,38 @@ and keep their scan and extract state. A command family is its `commandKeys()` t
    at most three notes when the user refers to past work. It is installed through the same promote path (marker,
    never over an unmarked `brain` directory) and shows up in the skills table. The bounded per-prompt recall hook from
    obsidian-second-brain is a later, opt-in addition.
+
+## Consolidation
+
+Extraction is per unit, so a long procedure comes out as fragments (a real session's video and voice work gave nine). Consolidation turns the fragments of one project, or one
+session, into the smallest set of end-to-end skills. It is a **proposal**: nothing changes until the user applies clusters of it.
+
+- **Input.** Every candidate with a source unit in the scope (a project is the session's cwd name): name, description, the whole `SKILL.md`, the titles of its source units and their
+  count (units of mode `create`, `refine` or `merge`, not `related`). And the skills in the skills dir as name, description and whether they carry the `.agent-router` marker (the
+  recall skill and a skill with no description are left out). Sent to the writer model (`brain_writer_model`) through the same runner (source `brain`, inside the daily cap).
+- **One call**, strict JSON: `{clusters: [{skill: {name, description, body} | null, covered_by: "<installed skill>" | null, replaces: [fragment…], rationale, additions_for_installed: […]}], untouched: […]}`.
+  The prompt: merge fragments that are steps or variants of one procedure into one end-to-end skill (setup, main steps, variants, verification, pitfalls; the fragments' exact commands; no
+  invented step); a lone fragment stays untouched; if an installed skill covers the same job with the same main tools, set `covered_by`, write no competing skill, and list only
+  concrete facts its description does not mention ("may already be covered: …": the model sees descriptions only). The plan is cleaned before it is stored: unknown fragment or skill names,
+  a fragment claimed twice, a bad or taken name and a cluster that does nothing are dropped.
+- **Too many candidates for one call** (over 80,000 characters of `SKILL.md`, about 20k tokens): fragments are grouped by what they share (words of name and description that most
+  fragments do not share, the executables of their commands, a little for the same session), small groups ride together, a group over the budget is cut in arrival order, and each group is one call.
+- **Stored** in `brain_consolidations(id, scope 'project'|'session', scope_key, ts, plan_json, usd, status 'proposed'|'applied'|'dismissed')`; a newer proposal for the same scope dismisses an
+  unanswered older one. `plan_json.applied` lists the clusters already applied (the status is `applied` once all are).
+- **Apply** (`POST consolidations/<id>/apply {clusters: [index…]}`), per cluster:
+  - *merge* (`skill` set): the merged skill is written as a new candidate (`skills/candidates/<name>/SKILL.md`; source `session`; `skill_sources` mode `merge` for the union of the
+    fragments' source units); each fragment it replaces gets `status = 'merged'`, `merged_into`, and moves to `skills/merged/<name>/`; it leaves the candidate list, the match targets and the graph.
+  - *covered* (`covered_by` set): each fragment gets `status = 'covered'`, `covered_by`, and moves the same way; the additions go into the generated block of `skills/<installed>.notes.md`.
+    **An installed skill is never edited**, with the marker or without.
+  - Nothing is promoted. **Restore** (`POST skills/<name>/restore`) moves a fragment back and makes it a candidate again. Dismiss changes nothing.
+- **Automatic** (`brain_consolidate = after_extract`, the default): after an extract-all (a session's own or all) in which a session's units wrote or refined 3 or more skills, one proposal for that
+  session's project is queued. `manual` never does. It only proposes.
+- **Console.** The Notes view's Skills area has a Consolidate panel: a button per project ("Propose consolidation for <project>", confirm with the number of calls, the estimate and what is
+  left of the cap), and each open proposal: per cluster the merged skill's name and description, the fragments it replaces with their source counts, the rationale, or "covered by <skill>" with the
+  proposed additions, a checkbox, a preview of the merged `SKILL.md` as raw text; **Apply selected**, **Dismiss**. The skills table hides merged and covered fragments; a chip ("9 fragments merged
+  into 2") opens them, each with Restore. The graph leaves merged fragments out; the merged skill is tied to the units its fragments came from, and a covered fragment to an outlined
+  `installed` node for the skill that covers it.
+- Measured on a real project (21 candidates, the user's own end-to-end video skill installed without a marker): see NOTES.md "Consolidation".
 
 ## Cost accounting
 
@@ -174,7 +226,7 @@ Four views, chosen with a segmented control and kept in the hash (`#brain?view=p
   background, one run at a time (a second is 409), stop at the daily cap or when the brain is turned off, and show progress inline. The
   confirm states the count, an estimate (count × the mean of the last 20 measured calls; none until there is history) and what is left
   of the cap. A batch that stops at the daily cap leaves a banner ("Scan stopped at the daily cap with 12 units left") with **Resume (12 left)**:
-  the same call limited to what is left (`pipeline.stopped = {kind, session?, left}`), disabled while the cap is still spent. Every row has a **Trace** button.
+  the same call limited to what is left (`pipeline.stopped = {kind, session?, left}`), disabled while the cap is still spent. Every row has a **Trace** button. A row's Extract chip says how the writer call ended (`extract_result`): an amber **no skill written** (with the detail) and **Retry**, or "unreadable answer" / "writer failed" / "timed out" and **Retry**; **trace trimmed** when the outline was cut.
 - **Notes.** Tree on the left (Sessions by date with their unit notes nested beneath, Projects, Skills promoted / candidates, Daily, Index, Facts), rendered
   Markdown in the middle (small built-in renderer; `[[wikilinks]]` navigate in place), search across the vault
   with snippets. A candidate that is an update to a promoted skill is shown as a line diff against the installed copy, with Apply update
@@ -184,7 +236,7 @@ Four views, chosen with a segmented control and kept in the hash (`#brain?view=p
   a pull to the centre; run to rest in one go, no animation loop; O(n²) per iteration: 200 notes lay out in 20–45 ms). Nodes: sessions
   (muted), units (small, muted; chip "Subagents", on by default), projects (clay), days (dim), skills (teal; a candidate has a dashed
   ring), tags (amber, off by default); size by degree. Edges: session→project, session→day, unit→its session (`subagent` / `segment`),
-  skill→every unit that wrote or refined it (`source`, from `skill_sources`) and its first source's project, skill→sessions
+  skill→every unit that wrote, refined, was merged into it or was related to it (`source`, from `skill_sources`), a covered fragment→the skill that covers it (`covered`; an outlined `installed` node unless the brain promoted that skill itself; merged fragments are left out) and its first source's project, skill→sessions
   that invoked it (`tool_uses`), note→tag, and any other `[[wikilink]]` between notes; one edge per pair. A skill is one node whichever of
   its two files a link names. `index.md`, the manual, the log and notes outside the folders the router writes are left out. Drag to pan,
   wheel or pinch to zoom, drag a note to pin it, hover to light a note and its neighbours, click to open it in Notes; type chips filter,
@@ -238,7 +290,8 @@ variable; every misreading keeps a step that could have been merged, none merges
 `repeated_commands`, `model_calls`), `counts` of what is kept and `full` (the counts before).
 
 `md(trace)` renders a minimal trace as a numbered outline (step, tool, target, outcome, duration; a subagent's steps as a nested list), at most ~6,000 tokens (24,000 characters):
-over that it drops `explored` spans first, then the other steps, oldest first, and never a prompt, subagent or write. **The writer reads this outline**, with the unit's Brief
+over that it drops `explored` spans first, then the **middle** of the other steps (the first 25% and the last 55% stay; the cut grows outward from the middle of the gap between them until it
+fits) and puts a line `… N steps omitted …` where it cut, and never a prompt, subagent or write: a run's setup and its ending say more than its long middle. (It used to drop the oldest steps, which is the setup.) The unit is marked `trace_trimmed`. **The writer reads this outline**, with the unit's Brief
 and Final report; the scan reads its first 40 lines. A unit note carries a line `Trace: [open in the console](…) · 214 steps → 38 after pruning`.
 
 The console's **Trace** view: a collapsible tree (kind chip, name, target, a red mark for a failed step) with a duration bar on the unit's own time axis beside each row, and for model
@@ -254,7 +307,9 @@ update) · `GET search?q=` · `GET pipeline` (`stages`, `rows` each with `units`
 `depth=1` the top-level spans, `parent` one span's children, both with `n_children`; 404 `no_transcript`; `meta=1` is just `{unit_id, last_ts}`) · `GET trace.md?unit=` (the minimal trace as an outline) · `POST capture {session?}` · `POST scan {session}` · `POST distill {session, force?}` (`session` = a unit key) ·
 `POST scan-all {limit?, session?}` · `POST extract-all {limit?, session?}` (`session`: only that session's subagent and segment units, oldest
 first; 202 `{total, estimate_usd, cap}`; 409 `brain_busy` while one runs; `pipeline.stopped` says what a batch left at the cap, and Resume is this call with `limit` = what is left) · `POST open {target: obsidian|folder}` ·
-`POST consolidate {project}` · `POST skills/import {url}` · `POST skills/<name>/promote|demote|reject` · `POST recall` ·
+`POST consolidate-notes {project}` (merge a project note's bullets) · `GET consolidations` (`projects` with an estimate, `proposals` with each cluster's `SKILL.md`, `running`, `last_error`) ·
+`POST consolidate {project | session}` (202 `{scope, scope_key, fragments, calls, estimate_usd, cap}`, background, 409 `brain_busy` / `brain_over_cap`, 404 `nothing_to_consolidate` under two candidates) ·
+`POST consolidations/<id>/apply {clusters}` · `POST consolidations/<id>/dismiss` · `POST skills/import {url}` · `POST skills/<name>/promote|demote|reject|restore` · `POST recall` ·
 `PUT facts {text}` · `POST facts-load {on}` (adds or removes the one line `@<vault>/CRITICAL_FACTS.md` in `<CLAUDE_HOME or ~/.claude>/CLAUDE.md`;
 `stats.facts_loaded` reads it back). Reads always answer; every write is `409 brain_disabled` until `brain_enabled`. Enabling is
 `PUT /router/settings {brain_enabled: true, brain_dir}`.
@@ -263,7 +318,7 @@ first; 202 `{total, estimate_usd, cap}`; 409 `brain_busy` while one runs; `pipel
 
 `brain_enabled` false · `brain_dir` · `brain_distill` `manual` | `on_idle` · `brain_daily_usd` 1.00 ·
 `classifier` `auto` | `jev` | `model` · `brain_classifier_model` `haiku` · `brain_writer_model` `sonnet` ·
-`brain_confidence` 0.7
+`brain_confidence` 0.7 · `brain_consolidate` `after_extract` | `manual`
 
 ## Safety
 

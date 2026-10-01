@@ -490,7 +490,7 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
   if (m === 'GET' && what === 'stats') return json(res, 200, all('select * from requests order by id desc limit 100'));
   if (m === 'GET' && what === 'settings') return json(res, 200, settings());
   if (m === 'PUT' && what === 'settings') {
-    const enums: Record<string, string[]> = { policy: ['sticky_least_utilized', 'prefer_home_until_80', 'manual'], brain_distill: ['manual', 'on_idle'], classifier: ['auto', 'jev', 'model'] };
+    const enums: Record<string, string[]> = { policy: ['sticky_least_utilized', 'prefer_home_until_80', 'manual'], brain_distill: ['manual', 'on_idle'], brain_consolidate: ['manual', 'after_extract'], classifier: ['auto', 'jev', 'model'] };
     for (const [k, v] of Object.entries(input ?? {})) {
       const d = DEFAULTS[k], ok = !(k in DEFAULTS) ? false : k.endsWith('_pct') || k === 'brain_confidence' ? typeof v === 'number' && v >= 0 && v <= 1
         : k === 'warm_rules' ? Array.isArray(v) && v.every(okRule) && new Set(v.map((r) => r.id)).size === v.length

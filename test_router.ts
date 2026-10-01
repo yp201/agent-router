@@ -1107,11 +1107,11 @@ test('brain skills: import by URL (https only, 200 KB, text, must be a skill), p
 test('brain safety: writes are 409 until enabled, API paths cannot leave the vault, the renderer escapes HTML and only links http(s)', async (t) => {
   const b = await brainSetup(t, {}, false);
   assert.deepEqual((await b.api('settings')).brain_enabled, false, 'off by default');
-  for (const [m, p] of [['POST', 'capture'], ['POST', 'distill'], ['POST', 'consolidate'], ['POST', 'skills/import'], ['POST', 'skills/x/promote'], ['POST', 'recall'], ['PUT', 'facts']])
+  for (const [m, p] of [['POST', 'capture'], ['POST', 'distill'], ['POST', 'consolidate-notes'], ['POST', 'consolidate'], ['POST', 'consolidations/1/apply'], ['POST', 'consolidations/1/dismiss'], ['POST', 'skills/import'], ['POST', 'skills/x/promote'], ['POST', 'recall'], ['PUT', 'facts']])
     assert.deepEqual(await b.call(m, p, { session: 's', url: 'https://example.com/SKILL.md', text: 'x' }), [409, { error: { type: 'brain_disabled' } }], p);
   assert.ok(!existsSync(b.vault) && !existsSync(b.skills), 'nothing is written while disabled');
   assert.deepEqual([(await b.call('GET', 'stats'))[1].enabled, (await b.call('GET', 'tree'))[1].files], [false, []]);
-  for (const bad of [{ brain_distill: 'always' }, { classifier: 'gpt' }, { brain_confidence: 2 }, { brain_daily_usd: '1' }, { brain_daily_units: 200000 }, { brain_enabled: 'yes' }, { brain_dir: 'relative/dir' }]) assert.equal((await b.put(bad)).status, 400, JSON.stringify(bad));
+  for (const bad of [{ brain_distill: 'always' }, { brain_consolidate: 'always' }, { classifier: 'gpt' }, { brain_confidence: 2 }, { brain_daily_usd: '1' }, { brain_daily_units: 200000 }, { brain_enabled: 'yes' }, { brain_dir: 'relative/dir' }]) assert.equal((await b.put(bad)).status, 400, JSON.stringify(bad));
   assert.equal((await b.put({ brain_enabled: true, brain_distill: 'on_idle', brain_dir: null })).status, 200);
 
   assert.deepEqual(await b.call('PUT', 'facts', { text: '# Facts\n\nDeploys go through wrangler.\n' }), [200, { ok: true }]);
@@ -1665,7 +1665,7 @@ test('brain units: scan and extract run per unit on its own note; a run that mat
   writeFileSync(`${b.tmp}/writer.json`, JSON.stringify({ ...WRITER, skill: { name: 'render-video', description: 'Use when rendering.', body: '1. Run `ffmpeg -vf drawtext=text=aCOLONb`' } }).replace('COLON', '\\:'));
   assert.equal((await b.call('POST', 'distill', { session: 'u2/c' }))[1].skill, 'render-video');
   assert.ok(b.read('skills/candidates/render-video/SKILL.md').endsWith('1. Run `ffmpeg -vf drawtext=text=a\\:b`\n'));
-  assert.ok(!readFileSync(`${b.tmp}/prompt.writer`, 'utf8').includes('"existing_skill":'), 'create mode');
+  assert.ok(readFileSync(`${b.tmp}/prompt.writer`, 'utf8').includes('"existing_skill":"---\\nname: render-video'), 'a unit extracted again improves the candidate it wrote (refine mode on its own skill), it does not invent a second one');
   assert.deepEqual([skill(), (await sources()).slice(2)], [md('minify'), [['render-video', 'u2/c', 'create', null]]]);
   // …and so is a match the writer does not agree with: in refine mode it answers under a new name, and the matched skill is left alone
   writeFileSync(`${b.tmp}/classifier.json`, matchJson('deploy-worker', 0.9));
@@ -1754,7 +1754,7 @@ test('brain units: a ledger from before units keeps each session\'s scan and ext
   execFileSync(process.execPath, [`${import.meta.dirname}/ledger.ts`], { env: { ...process.env, LEDGER_PATH: f } }); // opening the ledger is the upgrade
   const db = new DatabaseSync(f);
   assert.deepEqual({ ...db.prepare('select * from brain_sessions').get() }, { session_key: 'old', last_captured_ts: 1, note_path: 'wiki/logs/2026-09-30 old.md', gate_json: '{"gated":true}', gate_backend: 'model', gated_ts: 2, distilled_ts: 3,
-    skill_candidate: 'old-skill', queued: 0, trivial: 0, scan_usd: 0.004, extract_usd: 0.03, kind: 'session', parent: null, agent_id: null, seg_index: null, name: null, started: null });
+    skill_candidate: 'old-skill', queued: 0, trivial: 0, scan_usd: 0.004, extract_usd: 0.03, extract_result: null, extract_detail: null, trace_trimmed: null, kind: 'session', parent: null, agent_id: null, seg_index: null, name: null, started: null });
   assert.deepEqual(db.prepare('select * from skill_sources').all().map((x: any) => ({ ...x })), [{ skill: 'old-skill', unit_id: 'old', ts: 4, mode: 'create', note: null }]);
   assert.deepEqual(db.prepare('select name, update_ts from brain_skills order by 1').all().map((x: any) => [x.name, x.update_ts]), [['imported', null], ['old-skill', null]]);
   db.close();
@@ -1762,7 +1762,7 @@ test('brain units: a ledger from before units keeps each session\'s scan and ext
 
 test('ui.html: the Pipeline nests a session\'s units, the Graph has a Subagents chip, a proposed skill update is shown as a line diff', () => {
   const page = readFileSync(new URL('./ui.html', import.meta.url), 'utf8');
-  for (const x of ["['unit', 'Subagents', 'muted']", 'unit: true', 'data-session="${esc(r.session_key)}"', "Scan this session's ${segs ? 'units' : 'subagents'} (${n(toScan)})", 'Extract (${n(toExtract)})', 'data-k="pu-${sk}"', "'Apply update'", "'Discard update'", 'ldiff(note.installed, note.text)', 't.units ?? {}'])
+  for (const x of ['no skill written', 'data-bact="force" data-sk="${sk}"', "RES = { parse_failed", 'Propose consolidation for', 'data-bact="cons-apply"', 'data-bact="cons-dismiss"', 'data-pick="${key}"', 'Preview the merged SKILL.md', "fragment${gone.length === 1 ? '' : 's'} merged into", "['installed', 'Installed', 'teal']", 'brain/consolidate-notes', "k.status === 'candidate' || k.status === 'promoted'", "['unit', 'Subagents', 'muted']", 'unit: true', 'data-session="${esc(r.session_key)}"', "Scan this session's ${segs ? 'units' : 'subagents'} (${n(toScan)})", 'Extract (${n(toExtract)})', 'data-k="pu-${sk}"', "'Apply update'", "'Discard update'", 'ldiff(note.installed, note.text)', 't.units ?? {}'])
     assert.ok(page.includes(x), `ui.html lacks ${x}`);
   const ldiff = new Function(`${page.slice(page.indexOf('// diff:begin'), page.indexOf('// diff:end'))}; return ldiff;`)() as (a: string, b: string) => [string, string][];
   assert.deepEqual(ldiff('a\nb\nc\nd', 'a\nc\nx\nd').map(([m, l]) => m + l), ['  a', '- b', '  c', '+ x', '  d']);
@@ -2410,3 +2410,278 @@ test('brain facts: "Load in every session" adds and removes exactly one import l
   assert.match(ui, /Load in every session/); assert.match(ui, /Applies from the next session; Cowork sessions skip it\./);
 });
 
+
+// ---- brain: extract results, trace trimming, related_to, consolidation ----
+// A fake `claude` whose writer answers come from a queue (one file per call; `FAIL` = exit 3) before it falls back to writer.json. Returns the enqueue function.
+function queued(b: { tmp: string }) {
+  writeFileSync(`${b.tmp}/claude`, `#!/bin/sh\np=$(cat)\ncase "$p" in "You are a classifier"*) k=classifier;; *) k=writer;; esac\nprintf '%s' "$p" > ${b.tmp}/prompt.$k\necho "$k $3 $ANTHROPIC_CUSTOM_HEADERS" >> ${b.tmp}/calls\nf=${b.tmp}/$k.json\n`
+    + `if [ $k = writer ] && [ -s ${b.tmp}/queue ]; then f=$(head -n1 ${b.tmp}/queue); tail -n +2 ${b.tmp}/queue > ${b.tmp}/queue.n; mv ${b.tmp}/queue.n ${b.tmp}/queue; fi\n[ "$f" = FAIL ] && exit 3\ncat $f\n`, { mode: 0o755 });
+  return (...xs: (string | object)[]) => appendFileSync(`${b.tmp}/queue`, xs.map((x, i) => { if (x === 'FAIL') return x; const f = `${b.tmp}/q-${Math.random().toString(36).slice(2)}-${i}`; writeFileSync(f, typeof x === 'string' ? x : JSON.stringify(x)); return f; }).join('\n') + '\n');
+}
+// a writer answer with a skill of that name
+const WSK = (name: string, extra: Record<string, any> = {}) => ({ ...WRITER, skill: { name, description: `Use when you ${name}.`, body: `## Steps\n\n1. Run \`${name} go\`` }, ...extra });
+const unitRow = async (b: any, id: string) => (await b.call('GET', 'pipeline'))[1].rows.flatMap((r: any) => [r, ...r.units]).find((u: any) => u.session_key === id);
+
+test('brain extract result: every writer call ends in a stored state: skill null, an unreadable answer (asked once more), a failing claude and a dropped name show on the unit, and Retry asks for the skill', async (t) => {
+  const b = await brainSetup(t), q = queued(b), writerCalls = () => b.calls().filter((c) => c.startsWith('writer')).length;
+  await b.session('x1', (rid) => worked('x1', rid, 2));
+  for (const id of ['a', 'b', 'c', 'd']) await subrun(b, 'x1', id, `Render ${id}`, okcmds('x1', 'req_none', id, 10, (i) => `ffmpeg -i in.mp4 ${id}-${i}.mp4`));
+  // a run whose outline is over the cap: 300 distinct commands of ~190 characters
+  await subrun(b, 'x1', 'e', 'Render e', okcmds('x1', 'req_none', 'e', 300, (i) => `ffmpeg -i in${i}.mp4 -vf "${'x'.repeat(90)}" out${i}.mp4`));
+  await b.call('POST', 'capture', {});
+  const fresh = async (id: string) => (await b.rows('select extract_result r, extract_detail d, distilled_ts t, trace_trimmed tt from brain_sessions where session_key = ?', `x1/${id}`))[0];
+  const none = () => readdirSync(`${b.vault}/skills/candidates`).length === 0;
+
+  // the gate said skill at confidence and the writer returned `skill: null`: no candidate, and it says so
+  writeFileSync(`${b.tmp}/writer.json`, JSON.stringify({ ...WRITER, skill: null }));
+  let r = (await b.call('POST', 'distill', { session: 'x1/a' }))[1];
+  assert.deepEqual([r.distilled, r.skill, none()], [true, null, true]);
+  assert.deepEqual({ ...await fresh('a') }, { r: 'no_skill', d: 'writer returned skill: null', t: (await fresh('a')).t, tt: 0 });
+  let u = (await unitRow(b, 'x1/a')).extract;
+  assert.deepEqual([u.result, u.detail, u.missed, u.trimmed, u.ts > 0], ['no_skill', 'writer returned skill: null', true, false, true], 'the pipeline row carries the amber chip data');
+  // Retry (a forced distill) keeps the stored scan: the writer is asked for the skill outright, and writes it
+  writeFileSync(`${b.tmp}/writer.json`, JSON.stringify(WSK('render-clips')));
+  r = (await b.call('POST', 'distill', { session: 'x1/a', force: true }))[1];
+  assert.deepEqual([r.skill, r.forced, (await fresh('a')).r, (await unitRow(b, 'x1/a')).extract.missed], ['render-clips', undefined, 'skill_created', false]);
+  assert.ok(readFileSync(`${b.tmp}/prompt.writer`, 'utf8').includes('The classifier found a repeatable skill'), 'asked outright, as the scan said');
+  // a forced distill with no scan behind it is still the writer's call
+  assert.equal((await b.call('POST', 'distill', { session: 'x1/a', force: true }))[1].skill, 'render-clips', 'the refine of its own candidate');
+
+  // an unreadable answer is asked for once more ("only the JSON object"); the second one is read
+  const n0 = writerCalls();
+  q('Sure! Here is the skill you asked for.', WSK('voice-over-clips'));
+  r = (await b.call('POST', 'distill', { session: 'x1/b' }))[1];
+  assert.deepEqual([r.skill, writerCalls() - n0, (await fresh('b')).r], ['voice-over-clips', 2, 'skill_created']);
+  assert.ok(readFileSync(`${b.tmp}/prompt.writer`, 'utf8').endsWith('Return only the JSON object: no prose, no code fences.'));
+  assert.match(b.stdout(), /brain: writer reply did not parse \(no JSON object in the reply\); asking once more/);
+  // two unreadable answers: parse_failed, nothing written, the unit stays to extract again; the text itself is nowhere on disk
+  q('not json at all {', '{"summary": "cut off');
+  r = (await b.call('POST', 'distill', { session: 'x1/c' }))[1];
+  assert.deepEqual([r.distilled, r.why, r.result, (await fresh('c')).t, (await fresh('c')).r], [false, 'writer_failed', 'parse_failed', null, 'parse_failed']);
+  const c = await fresh('c');
+  assert.ok(c.d.length > 0 && c.d.length <= 120 && !c.d.includes('cut off'.repeat(2)), c.d);
+  u = (await unitRow(b, 'x1/c')).extract;
+  assert.deepEqual([u.result, u.ts, u.missed], ['parse_failed', null, false]);
+  assert.ok((await b.call('GET', 'pipeline'))[1].todo.extract.count >= 1);
+  assert.ok(!readFileSync(b.ledger).includes('not json at all'), 'the failed answer is not stored');
+  // claude itself failing is its own state
+  q('FAIL');
+  r = (await b.call('POST', 'distill', { session: 'x1/c' }))[1];
+  assert.deepEqual([r.result, r.detail, (await fresh('c')).r], ['writer_error', 'claude failed: exit 3', 'writer_error']);
+  // a skill the writer names after another unit's candidate is dropped, and that is shown, not silent
+  q(WSK('render-clips'));
+  r = (await b.call('POST', 'distill', { session: 'x1/c' }))[1];
+  assert.deepEqual([r.distilled, r.skill, (await fresh('c')).r, (await fresh('c')).d], [true, null, 'no_skill', 'skill dropped: skill_exists (render-clips)']);
+  assert.equal((await unitRow(b, 'x1/c')).extract.missed, true);
+
+  // the outline over the cap loses its middle, not its oldest steps; the unit says so
+  q(WSK('long-run-clips'));
+  await b.call('POST', 'distill', { session: 'x1/e' });
+  const sent = readFileSync(`${b.tmp}/prompt.writer`, 'utf8');
+  assert.match(sent, /\\n {3}\d+\. Bash `ffmpeg -i in0\.mp4/, 'the first step stays');
+  assert.match(sent, /in299\.mp4/, 'so does the last');
+  assert.match(sent, /… \d+ steps omitted …/);
+  assert.deepEqual([(await fresh('e')).tt, (await unitRow(b, 'x1/e')).extract.trimmed, (await fresh('a')).tt], [1, true, 0]);
+  b.noLeak();
+});
+
+test('agent trace: md() over the cap trims the middle steps (the first quarter and the last half stay) with an omitted line, never a write or a prompt', async () => {
+  await arith();
+  const { md } = await import('./trace.ts');
+  let n = 0;
+  const span = (kind: string, name: string, target = '', o: any = {}) => ({ id: `s${++n}`, parent: 'p', kind, name, target, t0: n * 10, t1: n * 10 + 5, ms: 5, ok: true, n_children: 0, ...o });
+  const steps = Array.from({ length: 80 }, (_, i) => (i === 40 ? span('tool', 'Write', 'keep-me.txt') : span('tool', 'Bash', `tool-${String(i).padStart(2, '0')} run ${'x'.repeat(60)}`)));
+  const t = { unit_id: 'u', title: 'T', kind: 'subagent', mode: 'full', started: 0, ended: 1e4, usd: 1, lim: '', last_ts: 1, tokens: { in: 0, out: 0, cache_read: 0, cache_create: 0 },
+    counts: { steps: 80, tool_calls: 80, failed: 0, subagents: 0, models: 0 }, spans: [span('prompt', 'do it', '', { id: 'p', parent: null }), ...steps] } as any;
+  const whole = md(t, 1e9), cut = md(t, Math.round(whole.length * 0.8)), lines = cut.split('\n');
+  assert.ok(!/omitted/.test(whole));
+  const kept = lines.map((l) => l.match(/tool-(\d\d) /)?.[1]).filter(Boolean).map(Number), gap = lines.findIndex((l) => /^\s+… \d+ steps omitted …$/.test(l)), omitted = 79 - kept.length;
+  assert.ok(gap > 0 && lines[gap].includes(`… ${omitted} steps omitted …`), lines[gap]);
+  assert.deepEqual([kept[0], kept.at(-1), omitted >= 10 && omitted <= 22], [0, 79, true]);
+  const first = Math.min(...[...Array(80).keys()].filter((i) => i !== 40 && !kept.includes(i))), last = Math.max(...[...Array(80).keys()].filter((i) => i !== 40 && !kept.includes(i)));
+  assert.ok(first >= 15 && last <= 44 && last - first + 1 === omitted + (first < 40 && last > 40 ? 1 : 0), `the gap ${first}..${last} is one run in the middle`);
+  assert.ok(lines.slice(0, gap).some((l) => l.includes(`tool-${String(first - 1).padStart(2, '0')} `)) && lines.slice(gap).some((l) => l.includes(`tool-${String(last + 1).padStart(2, '0')} `)), 'the marker sits in the gap');
+  assert.ok(cut.includes('keep-me.txt') && /Prompt: do it/.test(cut), 'a write and the prompt stay');
+  assert.match(lines[0], /; \d+ more left out to fit$/);
+});
+
+test('brain refine mode: a writer that finds a different procedure returns related_to, and the unit is linked to both skills', async (t) => {
+  const b = await brainSetup(t), q = queued(b), day = new Date().toLocaleDateString('sv');
+  await b.session('r1', (rid) => worked('r1', rid, 2));
+  for (const id of ['a', 'b', 'c']) await subrun(b, 'r1', id, `Render ${id}`, okcmds('r1', 'req_none', id, 10));
+  await b.call('POST', 'capture', {});
+  const src = async () => (await b.rows('select skill, unit_id u, mode from skill_sources order by ts, mode')).map((x) => [x.skill, x.u, x.mode]);
+  q(WSK('deploy-clips'));
+  await b.call('POST', 'distill', { session: 'r1/a' });
+  writeFileSync(`${b.tmp}/classifier.json`, matchJson('deploy-clips', 0.9));
+  q(WSK('encode-audio', { changelog: null, related_to: 'deploy-clips' }));
+  const r = (await b.call('POST', 'distill', { session: 'r1/b' }))[1];
+  assert.deepEqual([r.refine, r.skill, r.refined], ['deploy-clips', 'encode-audio', undefined]);
+  assert.match(readFileSync(`${b.tmp}/prompt.writer`, 'utf8'), /"related_to": the existing skill's name/);
+  assert.deepEqual(await src(), [['deploy-clips', 'r1/a', 'create'], ['encode-audio', 'r1/b', 'create'], ['deploy-clips', 'r1/b', 'related']]);
+  assert.equal((await unitRow(b, 'r1/b')).skill.name, 'encode-audio', 'the pipeline row shows the skill the unit wrote, not the related one');
+  const U = `wiki/logs/${day} deploy the worker r1 — Render b.md`, g = (await b.call('GET', 'graph'))[1];
+  assert.deepEqual(g.edges.filter((e: any) => [e.a, e.b].includes(U) && e.kind === 'source').map((e: any) => [e.a, e.b].find((x: string) => x !== U)).sort(), ['skills/deploy-clips.md', 'skills/encode-audio.md']);
+  const note = b.read(`wiki/logs/${day} deploy the worker r1 — Render b.md`);
+  assert.ok(note.includes('Skill candidate: [[skills/deploy-clips|deploy-clips]]') && note.includes('Skill candidate: [[skills/encode-audio|encode-audio]]'), 'the unit note links both');
+  // a related_to that is not the matched skill is ignored
+  q(WSK('mux-subtitles', { related_to: 'something-else' }));
+  await b.call('POST', 'distill', { session: 'r1/c' });
+  assert.deepEqual((await src()).slice(3), [['mux-subtitles', 'r1/c', 'create']]);
+  b.noLeak();
+});
+
+// five candidates of one project, one session: three video fragments, a payment one, an unrelated one; and the user's own installed video skill (no marker)
+async function fragmentsFixture(b: any, q: (...x: (string | object)[]) => void) {
+  const names = ['video-render', 'video-voice', 'video-verify', 'payment-link', 'git-hygiene'];
+  await b.session('c1', (rid: string) => worked('c1', rid, 2));
+  for (const [i, n] of names.entries()) await subrun(b, 'c1', String.fromCharCode(97 + i), `Fragment ${n}`, okcmds('c1', 'req_none', String.fromCharCode(97 + i), 10));
+  await b.call('POST', 'capture', {});
+  for (const [i, n] of names.entries()) { q(WSK(n)); await b.call('POST', 'distill', { session: `c1/${String.fromCharCode(97 + i)}` }); }
+  mkdirSync(`${b.skills}/x-video`, { recursive: true });
+  writeFileSync(`${b.skills}/x-video/SKILL.md`, '---\nname: x-video\ndescription: Use when making a video end to end: render with ffmpeg, add the voice-over, verify the take.\n---\n\nSECRET-INSTALLED-BODY\n');
+  writeFileSync(`${b.skills}/x-video/scaffold.sh`, '#!/bin/sh\necho scaffold\n');
+  return names;
+}
+const dirBytes = (d: string) => JSON.stringify((readdirSync(d, { recursive: true }) as string[]).sort().map((f) => [f, statSync(`${d}/${f}`).isFile() ? readFileSync(`${d}/${f}`, 'utf8') : null]));
+const PLAN = { clusters: [
+  { skill: null, covered_by: 'x-video', replaces: ['video-render', 'video-voice', 'video-verify'], rationale: 'x-video already covers the whole video procedure.', additions_for_installed: ['may already be covered: render with `-crf 18`', 'may already be covered: loudness target -16 LUFS'] },
+  { skill: { name: 'ship-checkout-change', description: 'Use when shipping a checkout change end to end.', body: '## Setup\n\n1. Run `payment-link go`\n\n## Verify\n\n1. Run `git-hygiene go`' }, covered_by: null, replaces: ['payment-link', 'git-hygiene', 'not-a-fragment'],
+    rationale: 'Both are steps of shipping one change.', additions_for_installed: ['ignored: no installed skill covers this'] },
+  { skill: null, covered_by: 'no-such-skill', replaces: ['video-render'], rationale: 'an installed skill that does not exist, and a fragment already in a cluster: dropped' },
+  { skill: { name: 'ghost', description: 'd', body: 'b' }, covered_by: null, replaces: ['nothing-here'], rationale: 'replaces no fragment: dropped' }], untouched: [] };
+
+test('brain consolidation: one writer call proposes; nothing changes until a cluster is applied; merge, covered_by (never an installed skill), restore, dismiss, cap', async (t) => {
+  const b = await brainSetup(t), q = queued(b), pipe = async () => (await b.call('GET', 'pipeline'))[1], cons = async () => (await b.call('GET', 'consolidations'))[1];
+  const names = await fragmentsFixture(b, q), calls0 = b.calls().length;
+  assert.equal((await b.call('GET', 'stats'))[1].candidates, 5);
+  const state = async () => JSON.stringify([(await b.rows('select name, status, merged_into, covered_by from brain_skills order by name')).map((x) => [x.name, x.status, x.merged_into, x.covered_by]), readdirSync(`${b.vault}/skills/candidates`).sort(), existsSync(`${b.vault}/skills/merged`), (await b.rows('select count(*) n from skill_sources'))[0].n]);
+  const before = await state(), installed = dirBytes(`${b.skills}/x-video`), done = () => until(async () => { const x = await pipe(); return !x.running && x; }, 'consolidation finished');
+
+  // propose: 202 with the estimate; one call, the fragments in full and the installed skills by description only
+  writeFileSync(`${b.tmp}/writer.json`, JSON.stringify(PLAN));
+  const [s, r] = await b.call('POST', 'consolidate', { project: 'proj-x' });
+  assert.deepEqual([s, r.kind, r.scope, r.scope_key, r.fragments, r.calls, r.cap.cap_usd], [202, 'consolidate', 'project', 'proj-x', 5, 1, 1]);
+  await done();
+  assert.equal(b.calls().length, calls0 + 1);
+  const sent = JSON.parse(readFileSync(`${b.tmp}/prompt.writer`, 'utf8').split('\n\n').slice(-1)[0]);
+  assert.deepEqual([sent.fragments.map((f: any) => f.name), sent.fragments[0].source_count, sent.fragments[0].sources, sent.installed.map((x: any) => [x.name, x.marked])], [names, 1, ['Fragment video-render'], [['x-video', false]]]);
+  assert.ok(sent.fragments[0].body.includes('video-render go') && sent.fragments[0].body.startsWith('---\nname: video-render'), 'the full SKILL.md');
+  assert.ok(!readFileSync(`${b.tmp}/prompt.writer`, 'utf8').includes('SECRET-INSTALLED-BODY'), 'an installed skill is sent as name and description only');
+  assert.match(readFileSync(`${b.tmp}/prompt.writer`, 'utf8'), /a second skill for the same job is a competitor[\s\S]*write no skill[\s\S]*may already be covered/);
+  let c = await cons(), p = c.proposals[0];
+  assert.deepEqual([c.proposals.length, p.status, p.scope, p.scope_key, p.clusters.length, p.untouched, c.projects.map((x: any) => [x.project, x.candidates, x.calls])], [1, 'proposed', 'project', 'proj-x', 2, [], [['proj-x', 5, 1]]]);
+  assert.deepEqual(p.clusters.map((x: any) => [x.skill?.name ?? null, x.covered_by, x.replaces, x.additions_for_installed.length]), [[null, 'x-video', ['video-render', 'video-voice', 'video-verify'], 2], ['ship-checkout-change', null, ['payment-link', 'git-hygiene'], 0]], 'unknown names and a double claim are dropped');
+  assert.ok(p.clusters[1].text.startsWith('---\nname: ship-checkout-change\n') && p.clusters[1].text.includes('## Setup'));
+  assert.deepEqual(p.fragments['payment-link'], { description: 'Use when you payment-link.', sources: ['Fragment payment-link'], n: 1 });
+  assert.equal(await state(), before, 'a proposal changes nothing on disk or in the ledger');
+  assert.equal(dirBytes(`${b.skills}/x-video`), installed);
+
+  // dismiss: still nothing; a new proposal is asked for, and the first is not offered again
+  assert.deepEqual(await b.call('POST', `consolidations/${p.id}/dismiss`), [200, { ok: true, status: 'dismissed' }]);
+  assert.deepEqual([await state() === before, (await b.call('POST', `consolidations/${p.id}/dismiss`))[0], (await b.call('POST', `consolidations/${p.id}/apply`, { clusters: [0] }))[0]], [true, 409, 409]);
+  await b.call('POST', 'consolidate', { project: 'proj-x' });
+  await done();
+  p = (await cons()).proposals[0];
+  assert.deepEqual([(await cons()).proposals.map((x: any) => x.status), (await b.call('POST', `consolidations/${p.id}/apply`, {}))[0], (await b.call('POST', `consolidations/${p.id}/apply`, { clusters: [7] }))[0]], [['proposed', 'dismissed'], 400, 400]);
+
+  // apply the merged cluster: a new candidate whose provenance is the union of its fragments' units; the fragments move, hidden and restorable
+  const [as, ar] = await b.call('POST', `consolidations/${p.id}/apply`, { clusters: [1] });
+  assert.deepEqual([as, ar.applied, ar.skipped, ar.status], [200, [1], {}, 'proposed']);
+  assert.equal(b.read('skills/candidates/ship-checkout-change/SKILL.md'), p.clusters[1].text);
+  assert.deepEqual((await b.rows(`select unit_id u, mode from skill_sources where skill = 'ship-checkout-change' order by unit_id`)).map((x) => [x.u, x.mode]), [['c1/d', 'merge'], ['c1/e', 'merge']]);
+  assert.deepEqual((await b.rows(`select name, status, merged_into from brain_skills where name in ('payment-link', 'git-hygiene', 'ship-checkout-change', 'video-render') order by name`)).map((x) => [x.name, x.status, x.merged_into]),
+    [['git-hygiene', 'merged', 'ship-checkout-change'], ['payment-link', 'merged', 'ship-checkout-change'], ['ship-checkout-change', 'candidate', null], ['video-render', 'candidate', null]]);
+  assert.deepEqual([existsSync(`${b.vault}/skills/merged/payment-link/SKILL.md`), existsSync(`${b.vault}/skills/candidates/payment-link`), existsSync(`${b.vault}/skills/candidates/git-hygiene`)], [true, false, false], 'kept on disk, out of the candidates');
+  let st = (await b.call('GET', 'stats'))[1];
+  assert.deepEqual([st.candidates, st.skills.filter((k: any) => k.merged_into).map((k: any) => [k.name, k.merged_into]).sort()], [4, [['git-hygiene', 'ship-checkout-change'], ['payment-link', 'ship-checkout-change']]]);
+  assert.deepEqual((await pipe()).rows[0].units.filter((u: any) => ['c1/d', 'c1/e'].includes(u.session_key)).map((u: any) => u.skill.name), ['ship-checkout-change', 'ship-checkout-change'], 'the units show the merged skill');
+  assert.ok(b.read('index.md').includes('ship-checkout-change') && !/Skill candidates[\s\S]*payment-link/.test(b.read('index.md')));
+  assert.match(b.read('skills/payment-link.md'), /Merged into \[\[skills\/ship-checkout-change\|ship-checkout-change\]\]/);
+  assert.equal((await b.call('POST', 'skills/payment-link/promote'))[0], 409, 'a merged fragment is restored, not promoted');
+  assert.equal((await cons()).proposals[0].applied.join(), '1');
+  assert.equal(dirBytes(`${b.skills}/x-video`), installed);
+
+  // restorable
+  assert.deepEqual(await b.call('POST', 'skills/payment-link/restore'), [200, { ok: true, name: 'payment-link', status: 'candidate' }]);
+  assert.deepEqual([existsSync(`${b.vault}/skills/candidates/payment-link/SKILL.md`), existsSync(`${b.vault}/skills/merged/payment-link`), (await b.call('POST', 'skills/payment-link/restore'))[0], (await b.call('GET', 'stats'))[1].candidates], [true, false, 409, 5]);
+  assert.deepEqual(await b.call('POST', `consolidations/${p.id}/apply`, { clusters: [1] }), [400, { error: { type: 'no_clusters', message: 'clusters: the indexes of clusters not yet applied' } }], 'a cluster applies once');
+
+  // apply the covered cluster: the fragments are covered by the installed skill, its additions are a vault note, the installed directory is byte for byte what it was
+  const [cs, cr] = await b.call('POST', `consolidations/${p.id}/apply`, { clusters: [0] });
+  assert.deepEqual([cs, cr.applied, cr.status], [200, [0], 'applied']);
+  assert.deepEqual((await b.rows(`select name, status, covered_by from brain_skills where name like 'video-%' order by name`)).map((x) => [x.name, x.status, x.covered_by]), names.slice(0, 3).sort().map((n) => [n, 'covered', 'x-video']));
+  const notes = b.read('skills/x-video.notes.md');
+  assert.match(notes, /^---\ninstalled_skill: x-video\ntags: \[skill-notes\]\n---\n# Notes for the installed skill x-video\n[\s\S]*<!-- agent-router:begin additions -->\n- may already be covered: render with `-crf 18` \(from \[\[skills\/video-render\|video-render\]\], /);
+  assert.ok(notes.includes('loudness target -16 LUFS'));
+  assert.equal(dirBytes(`${b.skills}/x-video`), installed, 'an installed skill is never edited');
+  assert.ok(!existsSync(`${b.skills}/x-video/.agent-router`));
+  assert.deepEqual([(await cons()).proposals[0].status, (await b.call('GET', 'stats'))[1].candidates], ['applied', 2]);
+  // graph: the merged skill is tied to the units it came from, a covered fragment to an outline node for the installed skill; the merged fragments are gone from it
+  const g = (await b.call('GET', 'graph'))[1], by = (n: string) => g.nodes.find((x: any) => x.title === n);
+  assert.deepEqual([by('git-hygiene'), by('ship-checkout-change').type, by('x-video').type, by('x-video').id, by('video-voice').type], [undefined, 'candidate', 'installed', 'installed:x-video', 'candidate']);
+  assert.deepEqual(g.edges.filter((e: any) => e.kind === 'covered').map((e: any) => [e.a, e.b].sort().join(' ~ ')).sort(), names.slice(0, 3).map((n) => `installed:x-video ~ skills/${n}.md`).sort());
+  assert.equal(g.edges.filter((e: any) => e.kind === 'source' && [e.a, e.b].includes('skills/ship-checkout-change.md')).length, 2);
+  // (payment-link was restored above, so it is a node again)
+  // a covered fragment can be restored too
+  assert.equal((await b.call('POST', 'skills/video-voice/restore'))[0], 200);
+  assert.equal(await b.rows(`select covered_by c from brain_skills where name = 'video-voice'`).then((x) => x[0].c), null);
+
+  // over the daily cap nothing is asked
+  await b.put({ brain_daily_usd: 0.5 });
+  b.s.usage = B_USAGE;
+  await b.msg('own', { model: 'claude-haiku-4-5' }, { 'x-agent-router-source': 'brain' });
+  await until(async () => (await pipe()).cap.spent_usd > 0.5, 'brain spend logged');
+  const n = b.calls().length;
+  assert.deepEqual(await b.call('POST', 'consolidate', { project: 'proj-x' }), [409, { error: { type: 'brain_over_cap' } }]);
+  assert.deepEqual([b.calls().length, (await b.call('POST', 'consolidate', { project: 'nowhere' }))[0]], [n, 404]);
+  b.noLeak();
+});
+
+test('brain consolidation: a candidate set over the call budget is grouped by what its fragments share, one call per group; the automatic proposal follows an extract-all of 3+ skills and only proposes', async (t) => {
+  const b = await brainSetup(t), q = queued(b), pipe = async () => (await b.call('GET', 'pipeline'))[1], writes = () => b.calls().filter((c) => c.startsWith('writer')).length;
+  const done = () => until(async () => { const x = await pipe(); return !x.running && x; }, 'batch finished');
+  // six fragments of ~25 KB each (150 KB, over the 80 KB budget): three about video, three about invoices: two groups, two calls
+  const big = (n: string) => WSK(n, { skill: { name: n, description: `Use when you ${n.split('-')[0]} ${n.split('-')[0]} clips.`, body: `## Steps\n\n1. Run \`${n.split('-')[0]} go\`\n\n${'filler line\n'.repeat(2000)}` } });
+  const mk = async (sk: string, ids: string[]) => { await b.session(sk, (rid) => worked(sk, rid, 2)); for (const id of ids) await subrun(b, sk, id, `Run ${id}`, okcmds(sk, 'req_none', id, 10)); };
+  await mk('g1', ['a', 'b', 'c', 'd', 'e', 'f']);
+  await b.call('POST', 'capture', {});
+  await b.call('POST', 'scan-all', { session: 'g1' }); await done();
+  const names = ['video-grade', 'video-trim', 'video-mux', 'invoice-draft', 'invoice-send', 'invoice-void'];
+  q(...names.map(big));
+  await b.put({ brain_consolidate: 'manual' });
+  await b.call('POST', 'extract-all', { session: 'g1' }); await done();
+  assert.deepEqual([writes(), (await b.call('GET', 'consolidations'))[1].proposals.length], [6, 0], 'manual: no proposal after the extract');
+  writeFileSync(`${b.tmp}/writer.json`, JSON.stringify({ clusters: [], untouched: [] }));
+  const [s, r] = await b.call('POST', 'consolidate', { session: 'g1' });
+  assert.deepEqual([s, r.scope, r.fragments, r.calls], [202, 'session', 6, 2]);
+  await done();
+  assert.equal(writes(), 8);
+  const sent = (JSON.parse(readFileSync(`${b.tmp}/prompt.writer`, 'utf8').split('\n\n').slice(-1)[0]).fragments as any[]).map((f) => f.name).sort();
+  assert.ok([names.slice(0, 3), names.slice(3)].some((g) => JSON.stringify([...g].sort()) === JSON.stringify(sent)), `the last call held one group: ${sent}`);
+  const p = (await b.call('GET', 'consolidations'))[1].proposals[0];
+  assert.deepEqual([p.scope, p.scope_key, p.clusters, p.untouched.sort()], ['session', 'g1', [], [...names].sort()]);
+  assert.deepEqual((await b.call('POST', 'consolidate', {})), [400, { error: { type: 'project_or_session_required' } }]);
+
+  // automatic: three skills from one session's extract-all -> one proposal for its project (the default setting); two do not
+  for (const n of names) assert.equal((await b.call('POST', `skills/${n}/reject`))[0], 200); // the big ones out of the project's candidates
+  await b.put({ brain_consolidate: 'after_extract' });
+  await mk('g2', ['a', 'b', 'c']);
+  await b.call('POST', 'capture', { session: 'g2' });
+  await b.call('POST', 'scan-all', { session: 'g2' }); await done();
+  const w0 = writes();
+  q(WSK('auto-one'), WSK('auto-two'), WSK('auto-three'));
+  writeFileSync(`${b.tmp}/writer.json`, JSON.stringify({ clusters: [{ skill: { name: 'auto-all', description: 'Use when all three.', body: '## Steps\n\n1. Run `auto go`' }, covered_by: null, replaces: ['auto-one', 'auto-two', 'auto-three'], rationale: 'one procedure' }], untouched: [] }));
+  await b.call('POST', 'extract-all', { session: 'g2' }); await done();
+  assert.equal(writes() - w0, 4, 'three extracts and one plan');
+  const all = (await b.call('GET', 'consolidations'))[1].proposals;
+  assert.deepEqual([all[0].scope, all[0].scope_key, all[0].status, all[0].clusters.map((c: any) => c.skill.name), (await b.call('GET', 'stats'))[1].candidates], ['project', 'proj-x', 'proposed', ['auto-all'], 3], 'only a proposal: the three candidates are still there');
+  await mk('g3', ['a', 'b']);
+  await b.call('POST', 'capture', { session: 'g3' });
+  await b.call('POST', 'scan-all', { session: 'g3' }); await done();
+  const w1 = writes();
+  q(WSK('few-one'), WSK('few-two'));
+  await b.call('POST', 'extract-all', { session: 'g3' }); await done();
+  assert.deepEqual([writes() - w1, (await b.call('GET', 'consolidations'))[1].proposals.length], [2, all.length], 'two skills are not enough');
+  b.noLeak();
+});

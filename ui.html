@@ -71,12 +71,12 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .stage[aria-pressed=true] { border-color: var(--clay); } .steps { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-family: var(--sans); }
 .chip.dash { background: none; border: 1px dashed var(--teal); color: var(--teal); }
 #graph { width: 100%; height: 68vh; min-height: 420px; display: block; border-radius: 8px; background: var(--bg); border: 1px solid var(--line); touch-action: none; user-select: none; cursor: grab; }
-#graph .e { stroke: var(--gray); stroke-width: 1; vector-effect: non-scaling-stroke; } #graph .e.source, #graph .e.used { stroke: var(--teal); stroke-opacity: .55; } #graph .e.hi { stroke: var(--muted); stroke-opacity: 1; }
+#graph .e { stroke: var(--gray); stroke-width: 1; vector-effect: non-scaling-stroke; } #graph .e.source, #graph .e.used { stroke: var(--teal); stroke-opacity: .55; } #graph .e.covered { stroke: var(--teal); stroke-opacity: .55; stroke-dasharray: 3 2; } #graph .e.hi { stroke: var(--muted); stroke-opacity: 1; }
 #graph .n { cursor: pointer; } #graph .n circle { fill: var(--muted); stroke: var(--bg); stroke-width: 1; } #graph .n.unit circle { fill-opacity: .6; } #graph .n.project circle { fill: var(--clay); } #graph .n.day circle { fill: var(--gray); }
-#graph .n.skill circle { fill: var(--teal); } #graph .n.candidate circle { fill: var(--teal); fill-opacity: .3; stroke: var(--teal); stroke-width: 1.5; stroke-dasharray: 3 2; } #graph .n.tag circle { fill: var(--amber); }
+#graph .n.skill circle { fill: var(--teal); } #graph .n.candidate circle { fill: var(--teal); fill-opacity: .3; stroke: var(--teal); stroke-width: 1.5; stroke-dasharray: 3 2; } #graph .n.installed circle { fill: none; stroke: var(--teal); stroke-width: 1.5; } #graph .n.tag circle { fill: var(--amber); }
 #graph .n.pin circle { stroke: var(--fg); } #graph .n.match circle { stroke: var(--amber); stroke-width: 2.5; }
 #graph text { font: 11px var(--sans); font-size: calc(11px / var(--k, 1)); fill: var(--muted); pointer-events: none; display: none; } /* --k = zoom: labels keep their size on screen */
-#graph .n.project text, #graph .n.skill text, #graph .n.candidate text, #graph.zoom text, #graph .n.hi text, #graph .n.match text { display: block; } #graph .n.hi text, #graph .n.match text { fill: var(--fg); }
+#graph .n.project text, #graph .n.skill text, #graph .n.candidate text, #graph .n.installed text, #graph.zoom text, #graph .n.hi text, #graph .n.match text { display: block; } #graph .n.hi text, #graph .n.match text { fill: var(--fg); }
 #graph.dim .n:not(.hi), #graph.dim .e:not(.hi), #graph.find .n:not(.match):not(.hi) { opacity: .15; }
 [hidden] { display: none !important; }
 .tree { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); max-height: 72vh; overflow: auto; outline: none; } .tree:focus-visible { border-color: var(--clay); outline: none; }
@@ -153,7 +153,7 @@ const model = (m) => esc((m ?? '—').replace(/^claude-/, '').replace(/-\d{8}$/,
 const get = (p) => fetch(`/router/${p}`).then((r) => r.json());
 const send = (method, p, body) => fetch(`/router/${p}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) }).then((r) => r.json());
 let S = {};            // last settings
-const ui = { cacheSession: 'all', cacheDays: 7, whatif: 'all', tproj: 'all', open: {}, added: null, tl: null, busy: {}, b: {}, note: 'index.md', bq: '', bedit: false, files: [], bview: 'pipeline', pstage: null, sig: null, tu: null, tmode: 'minimal', tq: '' }; // view state that survives re-renders
+const ui = { cacheSession: 'all', cacheDays: 7, whatif: 'all', tproj: 'all', open: {}, added: null, tl: null, busy: {}, b: {}, note: 'index.md', bq: '', bedit: false, files: [], bview: 'pipeline', pstage: null, sig: null, tu: null, tmode: 'minimal', tq: '', pick: {} }; // view state that survives re-renders
 const kt = (n) => n == null ? '—' : `${Math.round(n / 1000)}k`;
 const ctxColor = (s) => s.context_pct >= s.urgent_pct ? 'clay' : s.context_pct >= s.warn_pct ? 'amber' : 'muted';
 // Session timeline: x = turn, one lane per account (first appearance order), bar = context (teal read + clay write cap)
@@ -232,6 +232,7 @@ const md = (src) => {
 // ---------- Brain: pipeline (captured -> scanned -> extracted -> candidate -> promoted) ----------
 const PC = 'grid-template-columns:minmax(0,1.2fr) minmax(0,.6fr) minmax(0,2.3fr) 250px'; // Pipeline table
 const SKIP = { nothing: 'The scan found nothing worth keeping', low_confidence: 'The scan was not sure enough to spend a writer call', prefilter: 'Fewer than 8 tool calls, or no file written and no command run: not worth a model call' };
+const RES = { parse_failed: 'unreadable answer', writer_error: 'writer failed', timeout: 'timed out' }; // extract_result values that left no extract
 const chip = (cls, text, title = '') => `<span class="chip ${cls}"${title ? ` title="${esc(title)}"` : ''}>${text}</span>`;
 // diff:begin (test_router.ts loads this block)
 // Line diff (longest common subsequence) of two texts: [['  ' | '- ' | '+ ', line]]. For a proposed skill update against the installed copy.
@@ -258,14 +259,15 @@ const brainPipeline = (p) => {
   // a session's own batch: its subagent runs and segments, oldest first
   const own = (r, kind, n, label) => `<button class="sm" data-bact="${kind}-all" data-session="${esc(r.session_key)}" data-n="${n}" data-est="${p.avg[kind] == null ? '' : n * p.avg[kind]}" data-left="${left}" data-by="${esc(by(kind === 'scan' ? 1 : 2))}" ${off || (n ? '' : 'disabled')}>${label}${kind === 'scan' && n && p.avg.scan != null ? ` — about $${(n * p.avg.scan).toFixed(2)}` : ''}</button>`;
   const tr = (r, kid) => { const sc = r.scan, ex = r.extract, sk = esc(r.session_key), busy = ui.busy.brain === r.session_key, anyway = !ex?.ts && (sc ? !sc.wanted : !r.pre); // the gate would say no: skip it
-    const u = r.units ?? [], n = (f) => u.filter(f).length, segs = n((x) => x.kind === 'segment');
+    const u = r.units ?? [], n = (f) => u.filter(f).length, segs = n((x) => x.kind === 'segment'), retry = `<button class="sm" data-bact="force" data-sk="${sk}" ${off}>Retry</button>`;
     return `<div class="tr" style="${PC}">
       <div class="col" style="gap:0;min-width:0${kid ? ';padding-left:22px' : ''}"><span class="nm" title="${sk}">${kid ? `${chip('', esc(r.kind))} ` : ''}${esc(r.title)}</span><span class="small muted" style="font-family:var(--sans)">${new Date(r.last_ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} · ${r.turns} turns · ${r.tool_calls ?? '—'} tool calls</span></div>
       <span class="nm muted">${esc(r.project ?? '—')}</span>
       <div class="steps">${chip('ok', 'Captured ✓')}${arrow}
         ${sc ? chip(sc.kind === 'skill' ? 'ok' : sc.kind === 'nothing' ? '' : 'warn', `Scan: ${sc.kind === 'nothing' ? 'nothing' : `${sc.kind === 'skill' ? 'skill' : 'knowledge'} ${sc.confidence.toFixed(2)}`}`, `${sc.backend} · repeatable procedure: ${sc.reusable ? 'yes' : 'no'}${sc.matches && sc.matches !== 'new' ? ` · an existing skill may cover it: ${sc.matches}` : ''}${sc.usd == null ? '' : ` · cost $${sc.usd.toFixed(3)}`}`)
           : r.pre ? chip('', 'Scan: —', 'Not scanned yet') : chip('', 'Scan: too small', SKIP.prefilter)}${arrow}
-        ${ex?.ts ? chip('ok', `Extract: ${ex.usd == null ? 'done' : `$${ex.usd.toFixed(2)}`}`, `extracted ${ago(ex.ts)}`) : r.queued ? chip('warn', 'Extract: queued', 'The daily cap was spent: it runs when the cap frees up')
+        ${ex?.ts ? chip('ok', `Extract: ${ex.usd == null ? 'done' : `$${ex.usd.toFixed(2)}`}`, `extracted ${ago(ex.ts)}`) + (ex.missed ? ` ${chip('warn', 'no skill written', ex.detail ?? '')} ${retry}` : '') + (ex.trimmed ? ` ${chip('', 'trace trimmed', 'The writer read the run with its middle steps left out (about 6,000 tokens of outline)')}` : '')
+          : ex?.result ? chip('warn', `Extract: ${RES[ex.result] ?? ex.result}`, ex.detail ?? '') + ` ${retry}` : r.queued ? chip('warn', 'Extract: queued', 'The daily cap was spent: it runs when the cap frees up')
           : sc?.wanted ? chip('warn', 'Extract: queued', 'Scanned and worth extracting: Extract, or “Extract scanned”') : ex?.skipped_reason && sc ? chip('', 'Extract: skipped', SKIP[ex.skipped_reason]) : chip('', 'Extract: —')}${arrow}
         ${r.skill ? `<button class="plain" data-note="skills/${esc(r.skill.name)}.md" title="${esc(r.skill.status)}">${chip(r.skill.status === 'promoted' ? 'ok' : 'dash', `Skill: ${esc(r.skill.name)}`)}</button>` : chip('', 'Skill: —')}</div>
       <div class="row" style="flex-wrap:wrap;gap:4px">${r.pre ? `<button class="sm" data-bact="scan" data-sk="${sk}" ${off}>${busy ? '…' : sc ? 'Rescan' : 'Scan'}</button>` : ''}
@@ -278,7 +280,7 @@ const brainPipeline = (p) => {
       <div class="funnel" role="group" aria-label="Pipeline stages; click one to filter the table">${p.stages.map((s, i) => { const [l, m] = s.label.split(' · ');
         return `${i ? '<span class="arrow" aria-hidden="true">→</span>' : ''}<button class="stage" data-stage="${s.id}" aria-pressed="${ui.pstage === s.id}"><span class="big">${s.count}</span><b>${esc(l)}</b><span class="small muted">${esc(m ?? '')}</span></button>`; }).join('')}</div>
       <div class="between" style="flex-wrap:wrap"><div class="row" style="flex-wrap:wrap">${all('scan', 'Scan backlog', 1)}${all('extract', 'Extract scanned', 2)}
-        ${run ? `<span class="row small" aria-live="polite" style="min-width:220px"><span class="dot"></span>${run.kind === 'scan' ? 'Scanning' : 'Extracting'} ${Math.min(run.done + 1, run.total)} of ${run.total}…${bar([[run.total ? run.done / run.total : 0, 'var(--teal)']])}</span>` : ''}</div>
+        ${run ? `<span class="row small" aria-live="polite" style="min-width:220px"><span class="dot"></span>${run.kind === 'scan' ? 'Scanning' : run.kind === 'extract' ? 'Extracting' : 'Proposing a consolidation'} ${Math.min(run.done + 1, run.total)} of ${run.total}…${bar([[run.total ? run.done / run.total : 0, 'var(--teal)']])}</span>` : ''}</div>
         <span class="small muted">Brain spend today <span class="mono ${left ? '' : 'clay'}">${usd(p.cap.spent_usd)}</span> of ${usd(p.cap.cap_usd)} at list price · scanning and extracting stop at the cap</span></div>
       ${resume}
       <div class="table">
@@ -289,10 +291,36 @@ const brainPipeline = (p) => {
     </section>`;
 };
 
+// ---------- Brain: consolidation proposals (GET /router/brain/consolidations) ----------
+const consolidatePanel = (c, b) => {
+  const left = Math.max(0, b.cap_usd - b.spend_today_usd), off = ui.busy.brain || c.running ? 'disabled' : '', n = (k) => `${k} source${k === 1 ? '' : 's'}`;
+  const cluster = (p, x, i) => { const key = `${p.id}:${i}`, done = p.applied.includes(i);
+    return `<div class="inset"><label class="row" style="align-items:flex-start"><input type="checkbox" data-pick="${key}" ${ui.pick[key] ? 'checked' : ''} ${done ? 'disabled' : ''}>
+      <span class="col" style="gap:3px;min-width:0"><span><b class="mono">${x.skill ? esc(x.skill.name) : `covered by ${esc(x.covered_by)}`}</b>${done ? ` ${chip('ok', 'applied')}` : ''}</span>
+        <span class="small">${esc(x.skill ? x.skill.description : 'An installed skill already covers this procedure: no new skill is written.')}</span>
+        <span class="small muted">replaces ${x.replaces.map((f) => `<span class="mono">${esc(f)}</span> (${n(p.fragments[f]?.n ?? 0)})`).join(', ')}</span>
+        <span class="small muted">${esc(x.rationale)}</span></span></label>
+      ${x.covered_by ? `<div class="small"><b>Proposed additions for ${esc(x.covered_by)}</b> — the model saw its description only, so each may already be covered:<ul style="margin:4px 0 4px 18px">${x.additions_for_installed.map((a) => `<li>${esc(a)}</li>`).join('') || '<li class="muted">none</li>'}</ul>
+        <span class="muted">They go to the vault note <span class="mono">skills/${esc(x.covered_by)}.notes.md</span>; an installed skill is never edited.</span></div>` : ''}
+      ${x.text ? `<details data-k="cp-${key}" ${ui.open[`cp-${key}`] ? 'open' : ''}><summary class="small">Preview the merged SKILL.md</summary><pre>${esc(x.text)}</pre></details>` : ''}</div>`; };
+  const open = c.proposals.filter((p) => p.status === 'proposed');
+  return `<section class="panel">
+    <div class="between" style="flex-wrap:wrap"><h2>Consolidate</h2><span class="small muted">a unit's skill is a fragment of a procedure: one writer call turns a project's fragments into end-to-end skills, as a proposal you apply</span></div>
+    <div class="row" style="flex-wrap:wrap">${c.projects.map((q) => `<button class="sm" data-bact="cons-propose" data-project="${esc(q.project)}" data-n="${q.candidates}" data-calls="${q.calls}" data-est="${q.estimate_usd ?? ''}" data-left="${left}" ${off}>Propose consolidation for ${esc(q.project)} (${q.candidates})</button>`).join('')
+      || '<span class="small muted">A project with two or more skill candidates can be consolidated.</span>'}${c.running ? `<span class="row small" aria-live="polite"><span class="dot"></span>Proposing a consolidation…</span>` : ''}</div>
+    ${c.last_error ? `<div class="note err">The last proposal for ${esc(c.last_error.scope_key)} failed: ${esc(c.last_error.detail)}</div>` : ''}
+    ${open.map((p) => `<div class="col" style="gap:8px"><div class="between" style="flex-wrap:wrap"><b>Proposal for ${esc(p.scope)} ${esc(p.scope_key)}</b><span class="small muted">${ago(p.ts)} · ${p.usd == null ? '' : `$${p.usd.toFixed(2)} · `}${p.clusters.length} cluster${p.clusters.length === 1 ? '' : 's'}, ${p.untouched.length} fragment${p.untouched.length === 1 ? '' : 's'} left as they are</span></div>
+      ${p.clusters.map((x, i) => cluster(p, x, i)).join('') || '<div class="note">No merges proposed: the fragments are different procedures.</div>'}
+      ${p.untouched.length ? `<div class="small muted">Left as they are: ${p.untouched.map((f) => `<span class="mono">${esc(f)}</span>`).join(', ')}</div>` : ''}
+      <div class="row"><button class="sm primary" data-bact="cons-apply" data-id="${p.id}" ${off} ${p.clusters.length ? '' : 'disabled'}>Apply selected</button><button class="sm" data-bact="cons-dismiss" data-id="${p.id}" ${off}>Dismiss</button></div></div>`).join('')}
+    <div class="note">Nothing changes until you apply a cluster. A merged skill is a new candidate (nothing is promoted); the fragments it replaces move out of the candidate list and can be restored. If an installed skill already covers a cluster, only a note in the vault is written.</div>
+  </section>`;
+};
+
 // ---------- Brain: graph (force-directed, plain JS, inline SVG) ----------
 // Laid out only when the set of visible notes or links changes; positions, pins, pan and zoom live in G and survive every re-render.
-const GT = [['session', 'Sessions', 'muted'], ['unit', 'Subagents', 'muted'], ['project', 'Projects', 'clay'], ['day', 'Days', 'gray'], ['skill', 'Skills', 'teal'], ['tag', 'Tags', 'amber']];
-const G = { key: '', N: [], E: [], adj: [], pos: {}, k: 1, tx: 0, ty: 0, moved: false, hover: null, drag: null, ptrs: new Map(), pinch: 0, ms: 0, on: { session: true, unit: true, project: true, day: true, skill: true, tag: false } }; // unit: subagent runs and task segments
+const GT = [['session', 'Sessions', 'muted'], ['unit', 'Subagents', 'muted'], ['project', 'Projects', 'clay'], ['day', 'Days', 'gray'], ['skill', 'Skills', 'teal'], ['installed', 'Installed', 'teal'], ['tag', 'Tags', 'amber']];
+const G = { key: '', N: [], E: [], adj: [], pos: {}, k: 1, tx: 0, ty: 0, moved: false, hover: null, drag: null, ptrs: new Map(), pinch: 0, ms: 0, on: { session: true, unit: true, project: true, day: true, skill: true, installed: true, tag: false } }; // unit: subagent runs and task segments
 // graph:begin (test_router.ts loads this block)
 // Repulsion between every pair closer than 200, a spring along every link, a pull to the centre (stronger in y: the panel is wide);
 // each step is capped and the cap cools to zero, so it runs to rest and stops (no animation loop). Pinned notes do not move.
@@ -871,7 +899,7 @@ const views = {
   }],
 
   // second fetch = what the chosen view shows: the pipeline, the vault tree (Notes) or the graph
-  brain: [['brain/stats', () => ui.bview === 'trace' ? (ui.tu ? `brain/trace?unit=${encodeURIComponent(ui.tu)}&meta=1` : 'settings') : `brain/${ui.bview === 'notes' ? 'tree' : ui.bview}`, () => ui.bview === 'notes' ? `brain/note?path=${encodeURIComponent(ui.note)}` : 'settings', () => ui.bq && ui.bview !== 'pipeline' ? `brain/search?q=${encodeURIComponent(ui.bq)}` : 'settings', 'settings'], (b, t, note, hits) => {
+  brain: [['brain/stats', () => ui.bview === 'trace' ? (ui.tu ? `brain/trace?unit=${encodeURIComponent(ui.tu)}&meta=1` : 'settings') : `brain/${ui.bview === 'notes' ? 'tree' : ui.bview}`, () => ui.bview === 'notes' ? `brain/note?path=${encodeURIComponent(ui.note)}` : 'settings', () => ui.bq && ui.bview !== 'pipeline' ? `brain/search?q=${encodeURIComponent(ui.bq)}` : 'settings', () => ui.bview === 'notes' ? 'brain/consolidations' : 'settings', 'settings'], (b, t, note, hits, cons) => {
     const sub = 'Notes about past sessions, as plain files, so the next session does not work the same thing out again.';
     if (!b.enabled) return head('Brain', sub) + `<form class="panel" id="brain-enable" style="max-width:760px">
       <h2>The brain is off</h2>
@@ -885,6 +913,7 @@ const views = {
     const top = head('Brain', sub, `<details data-k="bset" ${ui.open.bset ? 'open' : ''} style="max-width:420px"><summary>Settings</summary>
         <form id="brain-settings" class="col" style="gap:8px;margin-top:8px">
           <label class="between small"><span>Distill</span><select name="brain_distill" class="sm">${[['manual', 'only when I click'], ['on_idle', 'when a session goes idle']].map(([v, l]) => `<option value="${v}" ${S.brain_distill === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+          <label class="between small"><span>Consolidate</span><select name="brain_consolidate" class="sm">${[['after_extract', 'propose after an extract of 3+ skills'], ['manual', 'only when I click']].map(([v, l]) => `<option value="${v}" ${S.brain_consolidate === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
           <label class="between small"><span>Daily cap ($ at list price)</span><input name="brain_daily_usd" type="number" min="0" step="0.05" value="${b.cap_usd}" style="width:90px"></label>
           <label class="between small"><span>Classifier <span class="muted">(in use: ${esc(b.classifier_backend)})</span></span><select name="classifier" class="sm">${['auto', 'jev', 'model'].map((v) => `<option ${S.classifier === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <div class="row"><button class="sm">Save</button><button type="button" class="sm" data-bact="disable">Turn the brain off</button></div>
@@ -912,11 +941,12 @@ const views = {
         ${grp('Skills — candidates', 'cand', cand.filter((p) => st(p) !== 'promoted').map((p) => item(p, p.split('/')[2])))}
         ${grp('Daily', 'daily', f.filter((p) => p.startsWith('wiki/daily/')).reverse().map((p) => item(p)))}
         ${f.length ? '' : '<div class="note">No notes yet. Sessions are written once they have been idle for 15 minutes, or now with “Capture now”.</div>'}`;
-    const kind = path.startsWith('wiki/logs/') ? 'session' : path.startsWith('wiki/projects/') ? 'project' : cand.includes(path) ? 'candidate' : /^skills\/[^/]+\.md$/.test(path) ? 'skill' : path === 'CRITICAL_FACTS.md' ? 'facts' : '';
-    const name = kind === 'candidate' ? path.split('/')[2] : kind === 'skill' ? base(path) : '', sk = b.skills.find((k) => k.name === name), s = note.session, g = s?.gate_json ? JSON.parse(s.gate_json) : null;
+    const kind = path.startsWith('wiki/logs/') ? 'session' : path.startsWith('wiki/projects/') ? 'project' : cand.includes(path) ? 'candidate' : /^skills\/merged\/[^/]+\/SKILL\.md$/.test(path) ? 'merged' : /^skills\/[^/]+\.md$/.test(path) ? 'skill' : path === 'CRITICAL_FACTS.md' ? 'facts' : '';
+    const name = kind === 'candidate' || kind === 'merged' ? path.split('/')[2] : kind === 'skill' ? base(path) : '', sk = b.skills.find((k) => k.name === name), s = note.session, g = s?.gate_json ? JSON.parse(s.gate_json) : null;
     const btn = (act, label, extra = '') => `<button class="sm" data-bact="${act}" ${extra} ${ui.busy.brain ? 'disabled' : ''}>${label}</button>`;
     const acts = (s ? `<button class="sm" data-tropen="${esc(s.session_key)}">Trace</button>` : '') + (kind === 'session' && s ? btn('distill', ui.busy.brain ? 'Distilling…' : s.distilled_ts ? 'Distill again' : 'Distill', `data-sk="${esc(s.session_key)}"`) + (g && !g.gated ? btn('force', 'Distill anyway', `data-sk="${esc(s.session_key)}"`) : '')
-      : kind === 'project' ? btn('consolidate', ui.busy.brain ? 'Consolidating…' : 'Consolidate', `data-name="${esc(base(path))}"`)
+      : kind === 'project' ? btn('consolidate', ui.busy.brain ? 'Consolidating…' : 'Consolidate notes', `data-name="${esc(base(path))}"`)
+      : kind === 'merged' ? btn('restore', 'Restore', `data-name="${esc(name)}"`)
       : sk?.status === 'promoted' ? (sk.update ? btn('promote', 'Apply update', `data-name="${esc(name)}" data-upd="1"`) + btn('reject', 'Discard update', `data-name="${esc(name)}" data-upd="1"`) : '') + btn('demote', 'Demote', `data-name="${esc(name)}"`)
       : (kind === 'candidate' || kind === 'skill') && sk ? btn('promote', 'Promote', `data-name="${esc(name)}"`) + btn('reject', 'Reject', `data-name="${esc(name)}"`)
       : kind === 'facts' && !ui.bedit ? btn('edit', 'Edit') : '');
@@ -927,9 +957,10 @@ const views = {
       : kind === 'facts' && ui.bedit ? `<form id="brain-facts" class="col" style="gap:8px"><textarea name="text" rows="12" class="mono" style="width:100%">${esc(note.text)}</textarea><div class="row"><button class="sm primary">Save</button><button type="button" class="sm" data-bact="clear">Cancel</button></div></form>`
       : kind === 'candidate' && note.installed != null ? `<div class="inset warnbox"><span class="small">A later run of the same procedure proposes this update to the installed skill. Lines marked <span class="clay">-</span> go, lines marked <span class="teal">+</span> are new. Your Claude skills folder is not touched until you apply it.</span></div>
           <pre>${ldiff(note.installed, note.text).map(([m, l]) => `<span class="${m === '+ ' ? 'teal' : m === '- ' ? 'clay' : 'muted'}">${esc(m + l)}</span>`).join('\n')}</pre>`
+      : kind === 'merged' ? `<div class="inset warnbox"><span class="small">A fragment ${sk?.merged_into ? `merged into <span class="mono">${esc(sk.merged_into)}</span>` : `covered by the installed skill <span class="mono">${esc(sk?.covered_by)}</span>`}. It is kept as it was; Restore makes it a candidate again.</span></div><pre>${esc(note.text)}</pre>`
       : kind === 'candidate' ? `${sk && sk.source !== 'session' && sk.source !== 'builtin' ? `<div class="inset warnbox"><span class="small">Imported from <span class="mono">${esc(sk.source)}</span>. These are someone else's instructions: read all of it before promoting. Shown as raw text, nothing hidden.</span></div>` : ''}<pre>${esc(note.text)}</pre>`
       : `<div class="md">${md(note.text)}</div>`;
-    const BC = 'grid-template-columns:minmax(0,1.2fr) 150px 50px 70px 70px 100px minmax(0,1.2fr) 90px';
+    const BC = 'grid-template-columns:minmax(0,1.2fr) 150px 50px 70px 70px 100px minmax(0,1.2fr) 90px', gone = b.skills.filter((k) => k.status === 'merged' || k.status === 'covered');
     return top + `<section class="grid4">
       ${kpi('Brain spend today', usd(b.spend_today_usd), `of ${usd(b.cap_usd)} at list price${b.queued ? ` · ${b.queued} queued for tomorrow` : ''}`, b.spend_today_usd >= b.cap_usd ? 'clay' : '')}
       ${kpi('Sessions captured', b.sessions_captured, `${b.distilled} distilled`)}
@@ -955,13 +986,16 @@ const views = {
       <div class="between"><h2>Skills</h2><span class="small muted">uses are counted from Skill tool calls in your transcripts · no savings are claimed</span></div>
       <div class="table">
         <div class="tr th" style="${BC}"><span>skill</span><span>status</span><span>uses</span><span>sessions</span><span>projects</span><span>last used</span><span>source</span><span>cost to find</span></div>
-        ${b.skills.map((k) => `<div class="tr" style="${BC}"><span class="nm">${item(`skills/candidates/${k.name}/SKILL.md`, k.name)}</span>
+        ${b.skills.filter((k) => k.status === 'candidate' || k.status === 'promoted').map((k) => `<div class="tr" style="${BC}"><span class="nm">${item(`skills/candidates/${k.name}/SKILL.md`, k.name)}</span>
           <span><span class="chip ${k.status === 'promoted' ? 'ok' : ''}">${esc(k.status)}</span>${k.update ? ' <span class="chip warn" title="A later run improved it: open it to see the diff and apply or discard">update waiting</span>' : ''}${k.status === 'promoted' && (k.last_used ?? k.promoted_ts) < Date.now() - 30 * 864e5 ? ' <span class="chip warn" title="Its description costs prefix tokens in every session">unused 30d</span>' : ''}</span>
           <span>${k.uses}</span><span>${k.sessions}</span><span>${k.projects}</span><span>${k.last_used ? ago(k.last_used) : NA}</span><span class="nm" title="${esc(k.source)}">${esc(k.source)}</span><span>${k.source_usd ? usd(k.source_usd) : NA}</span></div>`).join('')
           || '<div class="note">No skills yet. Distilling a session that worked out a reusable procedure proposes one; you can also import a SKILL.md by URL.</div>'}
       </div>
+      ${gone.length ? `<details data-k="bmerged" ${ui.open.bmerged ? 'open' : ''}><summary>${chip('', `${gone.length} fragment${gone.length === 1 ? '' : 's'} merged into ${new Set(gone.map((k) => k.merged_into ?? k.covered_by)).size}`)}</summary>
+        <div class="col" style="gap:4px;margin:6px 0">${gone.map((k) => `<div class="between small"><span>${item(`skills/merged/${k.name}/SKILL.md`, k.name)} <span class="muted">→ ${k.merged_into ? esc(k.merged_into) : `installed skill ${esc(k.covered_by)}`}</span></span><button class="sm" data-bact="restore" data-name="${esc(k.name)}" ${ui.busy.brain ? 'disabled' : ''}>Restore</button></div>`).join('')}</div></details>` : ''}
       <div class="note">A promoted skill adds its description line to every session's prefix, and applies from the next session. Skills unused for 30 days are flagged so you can demote them.</div>
-    </section>`;
+    </section>
+    ${consolidatePanel(cons, b)}`;
   }],
 };
 
@@ -1024,11 +1058,18 @@ async function brainAct(d) {
   }
   if (a === 'disable' && confirm('Turn the brain off? Notes stay where they are; nothing new is written.')) putSettings({ brain_enabled: false });
   if (a === 'promote' && confirm(d.upd ? `Apply the update to ${d.name}? The installed skill is replaced by this version.` : `Promote ${d.name}? It is copied to your Claude skills folder and every new session loads its description.`)) act(skill);
-  if (a === 'demote') act(skill);
+  if (a === 'demote' || a === 'restore') act(skill);
+  if (a === 'cons-propose' && confirm(`Propose consolidation for ${d.project}? ${d.calls} writer call${d.calls === '1' ? '' : 's'} (${S.brain_writer_model}) over ${d.n} skill candidates: ${d.est === '' ? 'no cost history yet, so no estimate' : `about $${Number(d.est).toFixed(2)} at list price`}. $${Number(d.left).toFixed(2)} of today's cap is left.\n\nIt only proposes: nothing changes until you apply a cluster.`)) act('brain/consolidate', { project: d.project });
+  if (a === 'cons-apply') {
+    const cs = Object.keys(ui.pick).filter((k) => ui.pick[k] && k.startsWith(`${d.id}:`)).map((k) => Number(k.split(':')[1]));
+    if (!cs.length) alert('Tick the clusters to apply.');
+    else if (confirm(`Apply ${cs.length} cluster${cs.length === 1 ? '' : 's'}? A merged skill becomes a new candidate (nothing is promoted); the fragments it replaces are hidden under “merged” and can be restored; where an installed skill covers a cluster, only a vault note is written. No installed skill is edited.`)) act(`brain/consolidations/${d.id}/apply`, { clusters: cs });
+  }
+  if (a === 'cons-dismiss') act(`brain/consolidations/${d.id}/dismiss`);
   if (a === 'reject' && confirm(d.upd ? `Discard the proposed update to ${d.name}? The installed skill stays as it is.` : `Reject ${d.name}? The candidate is deleted.`)) act(skill).then(() => { if (!d.upd) ui.note = 'index.md'; refresh(true); });
   if (a === 'scan' || a === 'distill' || a === 'force' || a === 'consolidate') { // model calls: seconds to minutes
     ui.busy.brain = d.sk ?? true; refresh(true);
-    const r = await send('POST', a === 'consolidate' ? 'brain/consolidate' : a === 'scan' ? 'brain/scan' : 'brain/distill', a === 'consolidate' ? { project: d.name } : { session: d.sk, force: a === 'force' }).catch((e) => ({ error: { type: e.message } }));
+    const r = await send('POST', a === 'consolidate' ? 'brain/consolidate-notes' : a === 'scan' ? 'brain/scan' : 'brain/distill', a === 'consolidate' ? { project: d.name } : { session: d.sk, force: a === 'force' }).catch((e) => ({ error: { type: e.message } }));
     delete ui.busy.brain;
     if (r?.error) alert(`Failed: ${r.error.type}`); else if (r?.queued) alert('The daily brain cap is spent. Queued: it runs when the cap frees up.');
     refresh(true);
@@ -1093,6 +1134,7 @@ document.addEventListener('change', (e) => {
   if (d.act === 'whatif') { ui.whatif = t.value; refresh(true); }
   if (d.act === 'tools-project') { ui.tproj = t.value; refresh(true); }
   if (d.act === 'facts-load') act('brain/facts-load', { on: t.checked });
+  if (d.pick) ui.pick[d.pick] = t.checked; // consolidation clusters ticked: kept across the poll's re-render
   if (d.warm && t.value) { // Keep warm: the quote first (ping and rebuild cost in dollars and in % of the windows, pings needed, break-even), then the one-off
     const hours = Number(t.value), path = `sessions/${encodeURIComponent(d.warm)}/warm`;
     get(`${path}?hours=${hours}`).then((q) => { t.value = ''; if (q.error) return alert('This session has no warm cache to keep.'); if (confirm(q.text)) act(path, { hours }); });
@@ -1143,7 +1185,7 @@ document.addEventListener('submit', async (e) => {
   if (fid === 'brain-settings') {
     const cap = Number(f.get('brain_daily_usd'));
     if (f.get('brain_daily_usd') === '' || !(cap >= 0)) return alert('Daily cap: dollars at list price, e.g. 1');
-    putSettings({ brain_distill: f.get('brain_distill'), brain_daily_usd: cap, classifier: f.get('classifier') });
+    putSettings({ brain_distill: f.get('brain_distill'), brain_consolidate: f.get('brain_consolidate'), brain_daily_usd: cap, classifier: f.get('classifier') });
   }
 });
 addEventListener('hashchange', () => { deep(); refresh(true); });

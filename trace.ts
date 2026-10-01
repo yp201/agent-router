@@ -296,7 +296,8 @@ export function minimal(t: Trace): Trace {
 const MD_MAX = 24_000; // ponytail: ~6,000 tokens at 4 characters each
 const dur = (ms: number | null) => (ms == null ? '' : ms < 1000 ? `${ms} ms` : ms < 60_000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`);
 // A numbered outline of a (minimal) trace: step, tool, target, outcome, duration; a subagent's steps are a nested list. Over `max` characters it keeps
-// every prompt, segment, subagent and write, and drops `explored` spans first, then the other steps, oldest first.
+// every prompt, segment, subagent and write, drops `explored` spans first, then the middle of the other steps (the first 25% and the last 55% stay,
+// a "… N steps omitted …" line marks the gap): the setup and the end of a run say more than its long middle, and the oldest steps are the setup.
 export function md(t: Trace, max = MD_MAX): string {
   type Item = { text: string; kids: Item[]; prio: number; gone?: boolean };
   const k = children(t.spans), steps = (id: string): number => (k.get(id) ?? []).reduce((a, x) => a + (x.kind === 'tool' || x.kind === 'subagent' ? 1 : 0) + steps(x.id), 0);
@@ -309,8 +310,13 @@ export function md(t: Trace, max = MD_MAX): string {
   const tree = items(null), flat: Item[] = [], depth = new Map<Item, number>();
   const walk = (xs: Item[], d: number) => xs.forEach((x) => { flat.push(x); depth.set(x, d); walk(x.kids, d + 1); });
   walk(tree, 0);
-  let size = flat.reduce((a, x) => a + x.text.length + 3 * depth.get(x)! + 6, 0), omitted = 0;
-  for (const x of [...flat.filter((x) => x.prio === 2), ...flat.filter((x) => x.prio === 1)]) { if (size <= max) break; x.gone = true; omitted++; size -= x.text.length + 3 * depth.get(x)! + 6; }
-  const lines = (xs: Item[], d: number): string[] => xs.filter((x) => !x.gone).flatMap((x, i) => [`${'   '.repeat(d)}${i + 1}. ${x.text}`, ...lines(x.kids, d + 1)]);
+  const w = (x: Item) => x.text.length + 3 * depth.get(x)! + 6;
+  let size = flat.reduce((a, x) => a + w(x), 0), omitted = 0, cut = 0;
+  for (const x of flat.filter((x) => x.prio === 2)) { if (size <= max) break; x.gone = true; omitted++; size -= w(x); }
+  // the other steps, middle out: from the point 35% of the way along (the middle of the 20% between "first 25%" and "last 55%") until it fits
+  const mid = flat.filter((x) => x.prio === 1), c = mid.length * 0.35;
+  for (const [, x] of mid.map((x, i) => [Math.abs(i - c), x] as const).sort((a, b) => a[0] - b[0])) { if (size <= max) break; x.gone = true; omitted++; cut++; size -= w(x); }
+  const gap = flat.find((x) => x.gone && x.prio === 1);
+  const lines = (xs: Item[], d: number): string[] => xs.filter((x) => !x.gone || x === gap).flatMap((x, i) => x === gap ? [`${'   '.repeat(d)}… ${cut} steps omitted …`] : [`${'   '.repeat(d)}${i + 1}. ${x.text}`, ...lines(x.kids, d + 1)]);
   return [`## Trace — ${t.title} (${t.kind}) · ${t.full ? `${t.full.steps} steps → ${t.counts.steps} after pruning` : `${t.counts.steps} steps`}${omitted ? `; ${omitted} more left out to fit` : ''}`, ...lines(tree, 0)].join('\n');
 }

@@ -28,7 +28,7 @@ export function windowOf(model: string | null, ctx = 0) {
 // second request that re-sends the whole prompt, thinks, and writes a 1h cache nobody reads. LEAN + the env below remove all four
 // (measured in NOTES.md "Brain"): what is billed is the prompt and the answer.
 const LEAN = ['--safe-mode', '--system-prompt', 'You are a precise text-processing function. Follow the instructions in the message exactly and output only what it asks for.'];
-export function claude(prompt: string, o: { model?: string; source?: string; timeout?: number } = {}): Promise<string | null> {
+export function claude(prompt: string, o: { model?: string; source?: string; timeout?: number; fail?: (why: string) => void } = {}): Promise<string | null> {
   const source = o.source ?? 'advisor';
   const env = { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CLAUDE_CODE_|ANTHROPIC_)/.test(k))), ANTHROPIC_CUSTOM_HEADERS: `x-agent-router-source: ${source}`,
     MAX_THINKING_TOKENS: '0', DISABLE_PROMPT_CACHING: '1' };
@@ -36,6 +36,7 @@ export function claude(prompt: string, o: { model?: string; source?: string; tim
     const c = execFile(CLAUDE_BIN, ['-p', '--model', o.model ?? settings().advisor_model, '--output-format', 'text', '--no-session-persistence', '--tools', '', '--name', `agent-router ${source}`, ...LEAN],
       { env, cwd: tmpdir(), timeout: o.timeout ?? 60_000, maxBuffer: 1 << 20 }, (e, out) => {
         if (e || !out.trim()) console.log(`${source}: ${CLAUDE_BIN} failed (${e ? e.code ?? e.signal ?? 'exit' : 'empty output'})`);
+        if (e || !out.trim()) o.fail?.(e ? (e.killed && e.code == null ? 'timeout' : `exit ${e.code ?? e.signal ?? '?'}`) : 'empty output'); // why, for the caller that records it (the brain's extract_detail)
         ok(e ? null : out.trim() || null);
       });
     c.stdin!.on('error', () => {}).end(prompt);

@@ -77,12 +77,15 @@ create table if not exists budget_events (budget_id text, period_key text, thres
 create table if not exists brain_sessions (session_key text primary key, last_captured_ts integer, note_path text, gate_json text, gate_backend text,
   gated_ts integer, distilled_ts integer, skill_candidate text, queued integer default 0, trivial integer,
   scan_usd real, extract_usd real, -- what the classifier / writer call for this unit cost (brain-tagged spend while it ran); null = not measured
+  extract_result text, extract_detail text, trace_trimmed integer, -- how the last writer call ended ('skill_created' | 'skill_refined' | 'no_skill' | 'parse_failed' | 'writer_error' | 'timeout'), a short reason; 1 = its trace outline was cut to fit
   kind text default 'session', parent text, agent_id text, seg_index integer, name text, started integer); -- kind: 'session' | 'subagent' | 'segment'
-create table if not exists brain_skills (name text primary key, status text, -- 'candidate' | 'promoted' | 'rejected'
+create table if not exists brain_skills (name text primary key, status text, -- 'candidate' | 'promoted' | 'rejected' | 'merged' | 'covered' (a fragment a consolidation replaced; files under skills/merged/)
   source text, source_session text, created_ts integer, promoted_ts integer,
-  update_ts integer); -- a promoted skill whose candidate copy holds a proposed update (a later run refined it), waiting for the user to apply it
--- every unit that wrote ('create') or improved ('refine') a skill; note = the refine's one-line changelog
+  update_ts integer, merged_into text, covered_by text); -- a promoted skill whose candidate copy holds a proposed update (a later run refined it), waiting for the user to apply it
+-- every unit that wrote ('create'), improved ('refine') or was folded into ('merge') a skill, or was linked to the skill its writer said it is 'related' to; note = the refine's one-line changelog
 create table if not exists skill_sources (skill text, unit_id text, ts integer, mode text, note text, primary key (skill, unit_id));
 -- keep warm: a per-session one-off (until_ts > 0), or the user's Stop (until_ts = 0, reason 'stopped by you': no warming until the session's
 -- next request). reason on a one-off = why the scheduler is not pinging it right now; null while it runs
 create table if not exists warm_sessions (session_key text primary key, until_ts integer, created_ts integer, reason text);
+-- consolidation proposals (brain.ts): a writer's plan to merge a project's or session's skill fragments into end-to-end skills; nothing changes until the user applies clusters of it
+create table if not exists brain_consolidations (id integer primary key, scope text, scope_key text, ts integer, plan_json text, usd real, status text); -- scope 'project' | 'session'; status 'proposed' | 'applied' | 'dismissed'

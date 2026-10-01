@@ -245,8 +245,12 @@ skills/          one note per skill (status, the session and project it came fro
   tags, with a skill tied to the session it came from and the sessions that used it. The same links are written into the notes,
   so Obsidian shows the same picture; *Open in Obsidian* appears when the app is installed, *Reveal folder* otherwise.
 
+- **Every writer call says how it ended, and fragments get consolidated.** A unit's pipeline row shows whether its extract wrote a skill, refined one, wrote none (an amber
+  **no skill written** chip with a **Retry**), could not be read (asked once more first) or failed. **Consolidate** (Notes view, Skills area, or `POST /router/brain/consolidate`) turns a
+  project's skill fragments into a proposal of end-to-end skills, or "covered by" an installed skill of yours; nothing changes until you apply a cluster, merged fragments stay restorable and an installed skill is never edited.
+
 Settings: `brain_enabled`, `brain_dir`, `brain_distill` (`manual` | `on_idle`), `brain_daily_usd`, `classifier`
-(`auto` | `jev` | `model`), `brain_classifier_model` (`haiku`), `brain_writer_model` (`sonnet`), `brain_confidence` (0.7).
+(`auto` | `jev` | `model`), `brain_classifier_model` (`haiku`), `brain_writer_model` (`sonnet`), `brain_confidence` (0.7), `brain_consolidate` (`after_extract` | `manual`).
 Design and the choices behind it: `docs/BRAIN.md`.
 
 ## Day to day

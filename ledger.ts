@@ -45,9 +45,10 @@ addCol('requests', 'source text');
 addCol('tool_uses', 'arg text');
 addCol('brain_sessions', 'trivial integer'); // 1 = a probe one-shot the brain keeps no note for; null = a note from before that test, judged on the next capture pass
 addCol('brain_sessions', 'scan_usd real'); addCol('brain_sessions', 'extract_usd real');
+for (const c of ['extract_result text', 'extract_detail text', 'trace_trimmed integer']) addCol('brain_sessions', c);
 // units (docs/BRAIN.md): rows from before them are sessions and keep their scan/extract state; a skill's first source is the session it came from
 for (const c of ["kind text default 'session'", 'parent text', 'agent_id text', 'seg_index integer', 'name text', 'started integer']) addCol('brain_sessions', c);
-addCol('brain_skills', 'update_ts integer');
+addCol('brain_skills', 'update_ts integer'); addCol('brain_skills', 'merged_into text'); addCol('brain_skills', 'covered_by text');
 db.exec(`insert or ignore into skill_sources (skill, unit_id, ts, mode) select name, source_session, created_ts, 'create' from brain_skills where source_session is not null`);
 db.exec('create index if not exists tool_uses_arg on tool_uses(arg)');
 db.exec(`insert or ignore into accounts (id, kind) values ('home', 'home')`);
@@ -85,6 +86,7 @@ export const DEFAULTS: Record<string, any> = {
   // brain (docs/BRAIN.md): off until enabled; brain_dir null = ~/agent-router-brain; distilling spends at most brain_daily_usd a day
   // (a stored brain_daily_units from before dollars is ignored)
   brain_enabled: false, brain_dir: null, brain_distill: 'manual', brain_daily_usd: 1, // brain_distill: 'manual' | 'on_idle'
+  brain_consolidate: 'after_extract', // 'manual' | 'after_extract': after an extract-all that wrote or refined 3+ skills of one session, propose merging that project's fragments (only a proposal)
   classifier: 'auto', brain_classifier_model: 'haiku', brain_writer_model: 'sonnet', brain_confidence: 0.7, // classifier: 'auto' | 'jev' | 'model'
   // keep warm (router.ts warmTick, console.ts warmPlan): off until enabled. While on, the last main-thread request of sessions with at least
   // warm_min_context cached tokens is held in memory and replayed warm_lead_min minutes before its 1h cache lapses, for sessions with a
