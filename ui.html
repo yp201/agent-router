@@ -79,6 +79,15 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 #graph .n.project text, #graph .n.skill text, #graph .n.candidate text, #graph.zoom text, #graph .n.hi text, #graph .n.match text { display: block; } #graph .n.hi text, #graph .n.match text { fill: var(--fg); }
 #graph.dim .n:not(.hi), #graph.dim .e:not(.hi), #graph.find .n:not(.match):not(.hi) { opacity: .15; }
 [hidden] { display: none !important; }
+.tree { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); max-height: 72vh; overflow: auto; outline: none; } .tree:focus-visible { border-color: var(--clay); outline: none; }
+.trow { display: grid; grid-template-columns: minmax(300px, 1.15fr) minmax(280px, 1fr); gap: 12px; align-items: center; padding: 3px 10px; border-bottom: 1px solid var(--line); min-width: 780px; font: 12px var(--mono); }
+.trow.th { position: sticky; top: 0; z-index: 1; background: var(--panel); color: var(--muted); font-family: var(--sans); padding: 6px 10px; } .trow:not(.th):hover { background: var(--panel); } .trow.sel { background: #2A2320; box-shadow: inset 2px 0 var(--clay); }
+.tl { display: flex; align-items: center; gap: 6px; min-width: 0; } .tl .nm { flex: 0 1 auto; } .tl .tg { flex: 1 1 0; min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.caret { flex: none; width: 14px; text-align: center; color: var(--muted); cursor: pointer; }
+.kc { flex: none; width: 16px; height: 16px; border-radius: 4px; display: inline-grid; place-items: center; font: 600 10px var(--sans); background: var(--line); color: var(--muted); }
+.kc.model { background: #3A2420; color: var(--clay); } .kc.tool { background: #23342F; color: var(--teal); } .kc.subagent { background: #3A2E24; color: var(--amber); }
+.tw { display: flex; align-items: center; gap: 8px; height: 16px; } .tk { position: relative; flex: 1 1 0; height: 16px; } .tb { position: absolute; top: 4px; height: 8px; min-width: 2px; border-radius: 3px; background: var(--gray); } .tb.model { background: var(--clay); } .tb.tool { background: var(--teal); } .tb.subagent { background: var(--amber); } .tb.bad { background: none; border: 1px solid var(--clay); }
+.tv { flex: none; width: 200px; text-align: right; font: 11px var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 @media (max-width: 1000px) { .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid2, .brain { grid-template-columns: 1fr; } }
 @media (max-width: 720px) {
@@ -104,6 +113,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 </div>
 <script>
 const $ = (s) => document.querySelector(s);
+const BUILD = '__BUILD__'; // the router fills this in when it serves the page; /router/health reports the current one
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const NA = '<span class="muted">—</span>';
 const tok = (n) => n == null ? NA : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(Math.round(n));
@@ -143,7 +153,7 @@ const model = (m) => esc((m ?? '—').replace(/^claude-/, '').replace(/-\d{8}$/,
 const get = (p) => fetch(`/router/${p}`).then((r) => r.json());
 const send = (method, p, body) => fetch(`/router/${p}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) }).then((r) => r.json());
 let S = {};            // last settings
-const ui = { cacheSession: 'all', cacheDays: 7, whatif: 'all', tproj: 'all', open: {}, added: null, tl: null, busy: {}, b: {}, note: 'index.md', bq: '', bedit: false, files: [], bview: 'pipeline', pstage: null, sig: null }; // view state that survives re-renders
+const ui = { cacheSession: 'all', cacheDays: 7, whatif: 'all', tproj: 'all', open: {}, added: null, tl: null, busy: {}, b: {}, note: 'index.md', bq: '', bedit: false, files: [], bview: 'pipeline', pstage: null, sig: null, tu: null, tmode: 'minimal', tq: '' }; // view state that survives re-renders
 const kt = (n) => n == null ? '—' : `${Math.round(n / 1000)}k`;
 const ctxColor = (s) => s.context_pct >= s.urgent_pct ? 'clay' : s.context_pct >= s.warn_pct ? 'amber' : 'muted';
 // Session timeline: x = turn, one lane per account (first appearance order), bar = context (teal read + clay write cap)
@@ -242,6 +252,9 @@ const brainPipeline = (p) => {
   const left = Math.max(0, p.cap.cap_usd - p.cap.spent_usd), run = p.running, off = ui.busy.brain || run ? 'disabled' : '', by = (i) => p.stages[i].label.split(' · ')[1];
   const all = (kind, label, i) => `<button class="sm" data-bact="${kind}-all" data-n="${p.todo[kind].count}" data-est="${p.todo[kind].estimate_usd ?? ''}" data-left="${left}" data-by="${esc(by(i))}" ${off || (p.todo[kind].count ? '' : 'disabled')}>${label} (${p.todo[kind].count})</button>`;
   const arrow = '<span class="muted" aria-hidden="true">→</span>';
+  // a scan-all / extract-all that stopped at the daily cap: how many units it left, and Resume (the same call, limited to what is left) once the cap allows
+  const sp = p.stopped, resume = sp && !run ? `<div class="inset warnbox" role="status" style="align-items:center;justify-content:space-between"><span class="small"><b>${sp.kind === 'scan' ? 'Scan' : 'Extract'} stopped at the daily cap</b> with ${sp.left} unit${sp.left === 1 ? '' : 's'} left${sp.session ? ' in that session' : ''}. ${left ? '' : 'Today\'s cap is spent: Resume works once the cap allows, tomorrow or after raising it in Settings.'}</span>
+    <button class="sm" data-bact="${sp.kind}-all" data-limit="${sp.left}" data-n="${sp.left}" data-est="${p.avg[sp.kind] == null ? '' : sp.left * p.avg[sp.kind]}" data-left="${left}" data-by="${esc(by(sp.kind === 'scan' ? 1 : 2))}"${sp.session ? ` data-session="${esc(sp.session)}"` : ''} ${off || (left ? '' : 'disabled')}>Resume (${sp.left} left)</button></div>` : '';
   // a session's own batch: its subagent runs and segments, oldest first
   const own = (r, kind, n, label) => `<button class="sm" data-bact="${kind}-all" data-session="${esc(r.session_key)}" data-n="${n}" data-est="${p.avg[kind] == null ? '' : n * p.avg[kind]}" data-left="${left}" data-by="${esc(by(kind === 'scan' ? 1 : 2))}" ${off || (n ? '' : 'disabled')}>${label}${kind === 'scan' && n && p.avg.scan != null ? ` — about $${(n * p.avg.scan).toFixed(2)}` : ''}</button>`;
   const tr = (r, kid) => { const sc = r.scan, ex = r.extract, sk = esc(r.session_key), busy = ui.busy.brain === r.session_key, anyway = !ex?.ts && (sc ? !sc.wanted : !r.pre); // the gate would say no: skip it
@@ -257,7 +270,7 @@ const brainPipeline = (p) => {
         ${r.skill ? `<button class="plain" data-note="skills/${esc(r.skill.name)}.md" title="${esc(r.skill.status)}">${chip(r.skill.status === 'promoted' ? 'ok' : 'dash', `Skill: ${esc(r.skill.name)}`)}</button>` : chip('', 'Skill: —')}</div>
       <div class="row" style="flex-wrap:wrap;gap:4px">${r.pre ? `<button class="sm" data-bact="scan" data-sk="${sk}" ${off}>${busy ? '…' : sc ? 'Rescan' : 'Scan'}</button>` : ''}
         <button class="sm" data-bact="${anyway ? 'force' : 'distill'}" data-sk="${sk}" ${off}>${busy ? '…' : ex?.ts ? 'Extract again' : anyway ? 'Extract anyway' : 'Extract'}</button>
-        <button class="sm" data-note="${esc(r.note_path)}">Open note</button>
+        <button class="sm" data-note="${esc(r.note_path)}">Open note</button><button class="sm" data-tropen="${sk}">Trace</button>
         ${u.length ? own(r, 'scan', n(toScan), `Scan this session's ${segs ? 'units' : 'subagents'} (${n(toScan)})`) + own(r, 'extract', n(toExtract), `Extract (${n(toExtract)})`) : ''}</div></div>
       ${u.length ? `<details data-k="pu-${sk}" ${ui.open[`pu-${r.session_key}`] ? 'open' : ''}><summary style="padding:2px 10px 6px 22px">${[[u.length - segs, 'subagent'], [segs, 'segment']].filter(([c]) => c).map(([c, l]) => `${c} ${l}${c === 1 ? '' : 's'}`).join(' · ')} · ${n((x) => x.scan)} scanned · ${n((x) => x.skill)} skill${n((x) => x.skill) === 1 ? '' : 's'}</summary>
         <div class="table">${u.filter(reached).map((x) => tr(x, true)).join('')}</div></details>` : ''}`; };
@@ -267,6 +280,7 @@ const brainPipeline = (p) => {
       <div class="between" style="flex-wrap:wrap"><div class="row" style="flex-wrap:wrap">${all('scan', 'Scan backlog', 1)}${all('extract', 'Extract scanned', 2)}
         ${run ? `<span class="row small" aria-live="polite" style="min-width:220px"><span class="dot"></span>${run.kind === 'scan' ? 'Scanning' : 'Extracting'} ${Math.min(run.done + 1, run.total)} of ${run.total}…${bar([[run.total ? run.done / run.total : 0, 'var(--teal)']])}</span>` : ''}</div>
         <span class="small muted">Brain spend today <span class="mono ${left ? '' : 'clay'}">${usd(p.cap.spent_usd)}</span> of ${usd(p.cap.cap_usd)} at list price · scanning and extracting stop at the cap</span></div>
+      ${resume}
       <div class="table">
         <div class="tr th" style="${PC}"><span>session, and its subagent runs and segments${ui.pstage ? ` · reached “${esc(p.stages[at(ui.pstage)].label.split(' · ')[0])}”` : ''}</span><span>project</span><span>steps</span><span>actions</span></div>
         ${rows.map((r) => tr(r)).join('') || `<div class="note">${p.rows.length ? 'No session has reached this stage yet.' : 'No sessions captured yet. A session gets its note once it has been idle for 15 minutes; “Capture now” in Notes writes them all.'}</div>`}
@@ -327,7 +341,7 @@ const gxf = () => `translate(${G.tx.toFixed(1)} ${G.ty.toFixed(1)}) scale(${G.k.
 const gbody = (found = G.found ?? new Set()) => { const f = (v) => v.toFixed(1), q = ui.bq.toLowerCase();
   return G.E.map((e) => `<line class="e ${e.kind}" x1="${f(G.N[e.a].x)}" y1="${f(G.N[e.a].y)}" x2="${f(G.N[e.b].x)}" y2="${f(G.N[e.b].y)}"/>`).join('')
     + G.N.map((n, i) => { const r = n.type === 'unit' ? 3 : Math.min(16, 3.5 + 1.7 * Math.sqrt(n.deg));
-      return `<g class="n ${esc(n.type)}${n.pin ? ' pin' : ''}${q && (n.title.toLowerCase().includes(q) || found.has(n.path)) ? ' match' : ''}" data-n="${i}" transform="translate(${f(n.x)} ${f(n.y)})"><title>${esc(n.title)} · ${esc(n.type)} · ${n.deg} link${n.deg === 1 ? '' : 's'}</title><circle r="${f(r)}"/><text x="${f(r + 3)}" dy=".32em">${esc(n.title.length > 30 ? `${n.title.slice(0, 29)}…` : n.title)}</text></g>`; }).join(''); };
+      return `<g class="n ${esc(n.type)}${n.pin ? ' pin' : ''}${q && (n.title.toLowerCase().includes(q) || found.has(n.path)) ? ' match' : ''}" data-n="${i}" transform="translate(${f(n.x)} ${f(n.y)})"><title>${esc(n.title)} · ${esc(n.type)} · ${n.deg} link${n.deg === 1 ? '' : 's'}${n.type === 'unit' ? ' · alt-click for its trace' : ''}</title><circle r="${f(r)}"/><text x="${f(r + 3)}" dy=".32em">${esc(n.title.length > 30 ? `${n.title.slice(0, 29)}…` : n.title)}</text></g>`; }).join(''); };
 const brainGraph = (g, hits) => {
   const count = (t) => g.nodes.filter((n) => (n.type === 'candidate' ? 'skill' : n.type) === t).length;
   const tools = `<div class="between" style="flex-wrap:wrap"><div class="row" style="flex-wrap:wrap" role="group" aria-label="Note types shown">${GT.map(([t, l, c]) => `<button class="sm" data-gtype="${t}" aria-pressed="${G.on[t]}" style="${G.on[t] ? '' : 'opacity:.5'}"><span class="dot" style="background:var(--${c})"></span> ${l} <span class="muted">${count(t)}</span></button>`).join('')}</div>
@@ -338,7 +352,7 @@ const brainGraph = (g, hits) => {
   return `<section class="panel">${tools}
     <svg id="graph" class="${G.k >= 1.6 ? 'zoom' : ''}${ui.bq ? ' find' : ''}" viewBox="0 0 1000 600" style="--k:${G.k.toFixed(3)}" role="img" aria-label="Graph of ${G.N.length} notes and ${G.E.length} links between them"><g id="gv" transform="${gxf()}">${gbody()}</g></svg>
     <div class="between small muted" style="flex-wrap:wrap"><span>${G.N.length} notes · ${G.E.length} links · laid out in ${G.ms.toFixed(0)} ms · teal lines: a skill and the session it came from or was used in</span>
-      <span class="row">drag to pan · scroll or pinch to zoom · drag a note to pin it · click to open <button class="sm" data-bact="greset">Reset layout</button></span></div></section>`;
+      <span class="row">drag to pan · scroll or pinch to zoom · drag a note to pin it · click to open it, alt-click a subagent or segment for its trace <button class="sm" data-bact="greset">Reset layout</button></span></div></section>`;
 };
 // gestures, on the document like every other handler here (the SVG is replaced on re-render)
 const gpt = (svg, e) => { const m = svg.getScreenCTM(); return [(e.clientX - m.e) / m.a, (e.clientY - m.f) / m.d]; }; // client px -> viewBox units
@@ -381,7 +395,8 @@ const gup = (e) => {
   G.drag = null;
   if (d.n == null || !$('#graph')) return;
   const p = G.N[d.n].path;
-  if (!d.far) { if (p) { ui.note = p; ui.bedit = false; location.hash = '#brain?view=notes'; } }                  // click: open the note in the reader
+  if (!d.far) { if (e.altKey && G.N[d.n].meta?.unit) location.hash = `#brain?view=trace&unit=${encodeURIComponent(G.N[d.n].meta.unit)}`; // alt-click a subagent or segment: its trace
+    else if (p) { ui.note = p; ui.bedit = false; location.hash = '#brain?view=notes'; } }                              // click: open the note in the reader
   else { glayout(G.N, G.E, 60, 6); $('#graph').firstElementChild.innerHTML = gbody(); }                              // dropped: the rest settles around the pin
 };
 document.addEventListener('pointerup', gup);
@@ -393,6 +408,129 @@ document.addEventListener('wheel', (e) => {
   gzoom(...gpt(svg, e), Math.exp(-e.deltaY * (e.ctrlKey ? .01 : .002)));
 }, { passive: false });
 document.addEventListener('pointerover', (e) => { const n = e.target.closest?.('#graph .n'); if (!G.drag) ghover(n ? +n.dataset.n : null); });
+
+// ---------- Brain: trace (a run tree with a waterfall, GET /router/brain/trace) ----------
+// trace:begin (test_router.ts loads this block)
+// The rows to draw from the spans loaded so far: a span's children only while it is open (a search shows every span that matches, and its ancestors).
+// `kids`: Map parent id ('' = top level) -> spans. Only open rows are drawn, so a unit costs what its open rows cost.
+// ponytail: 1,500 spans listed in a few ms and drawn as innerHTML; past ~20,000 open rows, window the list (draw only the rows in view)
+const tvisible = (kids, open, q = '') => {
+  const out = [], needle = q.trim().toLowerCase(), hit = new Map();
+  const has = (s) => { if (!hit.has(s.id)) hit.set(s.id, `${s.name} ${s.target}`.toLowerCase().includes(needle) || (kids.get(s.id) ?? []).some(has)); return hit.get(s.id); };
+  const walk = (xs, d) => { for (const s of xs) {
+    if (needle && !has(s)) continue;
+    const k = kids.get(s.id), o = !!k && (needle ? true : open.has(s.id));
+    out.push({ s, d, open: o });
+    if (o) walk(k, d + 1);
+  } };
+  walk(kids.get('') ?? [], 0);
+  return out;
+};
+const tfmt = (ms) => ms == null ? '' : ms < 1000 ? `${Math.round(ms)} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.floor(ms / 60000)}m ${Math.round(ms % 60000 / 1000)}s`;
+// trace:end
+const TR = { unit: null, mode: null, last_ts: null, head: null, err: null, kids: new Map(), open: new Set(), sel: null, rows: [], all: false, busy: false }; // the loaded trace; survives re-renders
+const TK = { prompt: 'P', segment: 'S', model: 'M', tool: 'T', subagent: 'A' };
+const tget = (q) => get(`brain/trace?unit=${encodeURIComponent(ui.tu)}&mode=${ui.tmode}&${q}`);
+// The poll brings only the unit's last_ts; the tree is fetched when the unit, the mode or last_ts changed (spans the user had open stay open),
+// top level only, then a span's children when it is opened. A search loads the whole trace once.
+async function tsync(meta) {
+  const u = ui.tu, m = ui.tmode, same = TR.unit === u && TR.mode === m;
+  if (TR.busy || (same && TR.last_ts === meta.last_ts)) return;
+  TR.busy = true;
+  try {
+    const r = await tget('depth=1'), kids = new Map([['', r.spans ?? []]]), open = new Set();
+    const ids = r.error ? [] : [...(same ? TR.open : []), ...(r.spans.length <= 3 ? r.spans.filter((s) => s.n_children).map((s) => s.id) : [])];
+    await Promise.all([...new Set(ids)].map(async (id) => { const k = await tget(`parent=${encodeURIComponent(id)}`); if (!k.error) { kids.set(id, k.spans); open.add(id); } }));
+    if (u === ui.tu && m === ui.tmode) Object.assign(TR, { unit: u, mode: m, last_ts: meta.last_ts, head: r.error ? null : { ...r, spans: undefined }, err: r.error?.type ?? null, kids, open, all: false, sel: same ? TR.sel : null });
+    if (TR.unit === u && TR.mode === m && ui.tq.trim() && !TR.err) await tall();
+  } finally { TR.busy = false; }
+  refresh(true);
+}
+async function tall() { // every span, for the search
+  const r = await tget('');
+  TR.kids = new Map();
+  for (const s of r.spans ?? []) TR.kids.set(s.parent ?? '', [...(TR.kids.get(s.parent ?? '') ?? []), s]);
+  TR.all = true;
+}
+async function ttoggle(id) {
+  if (TR.open.has(id)) TR.open.delete(id);
+  else { TR.open.add(id); if (!TR.kids.has(id)) TR.kids.set(id, (await tget(`parent=${encodeURIComponent(id)}`)).spans ?? []); }
+  tdraw();
+}
+const cents = (n) => `$${n < 0.01 ? n.toFixed(3) : n.toFixed(2)}`;
+const trows = () => {
+  const rows = TR.rows = tvisible(TR.kids, TR.open, ui.tq), t0 = TR.head.started, W = Math.max(1, TR.head.ended - t0);
+  return rows.map(({ s, d, open }, i) => {
+    const x = Math.max(0, Math.min(99.5, (s.t0 - t0) / W * 100)), w = Math.max(.4, Math.min(100 - x, (s.t1 - s.t0) / W * 100)), sel = s.id === TR.sel;
+    const lab = [tfmt(s.ms ?? s.t1 - s.t0), s.kind === 'model' ? `${tok(s.tokens.in + s.tokens.cache_read + s.tokens.cache_create)} in · ${tok(s.tokens.out)} out` : s.kind === 'tool' && s.out_tokens_est ? `${tok(s.out_tokens_est)} out` : '', s.usd ? cents(s.usd) : ''].filter(Boolean).join(' · ');
+    const tip = [`${s.kind} · ${s.name}${s.target ? ` ${s.target}` : ''}`, s.ok === false ? 'failed' : '', s.lim ? `${cents(s.usd)} ${s.lim}` : '', s.edits ? `${s.edits} writes to this file` : '', s.runs ? `${s.runs} runs of this command` : ''].filter(Boolean).join('\n');
+    return `<div class="trow${sel ? ' sel' : ''}" id="tr-${i}" role="treeitem" aria-level="${d + 1}" aria-selected="${sel}"${s.n_children ? ` aria-expanded="${open}"` : ''} data-sp="${esc(s.id)}" title="${esc(tip)}">
+      <div class="tl" style="padding-left:${d * 16}px"><span class="caret" data-tc="1">${s.n_children ? (open ? '▾' : '▸') : ''}</span><span class="kc ${s.kind}" title="${s.kind}">${TK[s.kind]}</span><span class="nm">${esc(s.name)}</span>${s.target ? `<span class="tg">${esc(s.target)}</span>` : ''}${s.ok === false ? '<span class="clay" title="failed" aria-label="failed">✕</span>' : ''}${s.edits ? chip('', `edits ${s.edits}`) : ''}${s.runs ? chip('', `runs ${s.runs}`) : ''}</div>
+      <div class="tw"><span class="tk"><span class="tb ${s.kind}${s.ok === false ? ' bad' : ''}" style="left:${x.toFixed(2)}%;width:${w.toFixed(2)}%"></span></span><span class="tv">${esc(lab)}</span></div></div>`;
+  }).join('') || `<div class="note" style="padding:12px">${ui.tq ? 'No span matches.' : 'No spans.'}</div>`;
+};
+const tdraw = () => { // rows only: the header, the search box and the focus stay where they are
+  const tree = $('#ttree');
+  if (!tree) return;
+  $('#trows').innerHTML = trows();
+  const i = TR.rows.findIndex((r) => r.s.id === TR.sel);
+  tree.setAttribute('aria-activedescendant', i < 0 ? '' : `tr-${i}`);
+  if (i >= 0) $(`#tr-${i}`)?.scrollIntoView({ block: 'nearest' });
+};
+async function trDistill() {
+  const p = await get('brain/pipeline'), left = Math.max(0, p.cap.cap_usd - p.cap.spent_usd), est = p.avg.extract;
+  if (confirm(`Distill “${TR.head.title}” from its minimal trace? One call with the writer model (${S.brain_writer_model}); the scan is skipped.\n\n${est == null ? 'No cost history yet, so no estimate.' : `About $${est.toFixed(2)} at list price (the recent average per call).`}\n$${left.toFixed(2)} of today's cap is left.`))
+    brainAct({ bact: 'force', sk: ui.tu });
+}
+const brainTrace = (meta) => {
+  const shell = (body) => `<section class="panel">${body}</section>`;
+  if (!ui.tu) return shell('<div class="note">Pick a unit to trace: “Trace” on a Pipeline row or in a note, alt-click a subagent or segment in the Graph, or “Open trace” on a session\'s timeline in Accounts &amp; routing.</div>');
+  if (meta?.error) return shell(`<div class="note err">No transcript for ${esc(ui.tu)}: ${esc(meta.error.type)}. The unit may be older than the transcript files on this machine.</div>`);
+  tsync(meta);
+  const h = TR.unit === ui.tu && TR.mode === ui.tmode ? TR.head : null;
+  if (!h) return shell(`<div class="note">${TR.unit === ui.tu && TR.mode === ui.tmode && TR.err ? `Could not load the trace: ${esc(TR.err)}` : 'Loading the trace…'}</div>`);
+  const c = h.full ?? h.counts, k = h.counts, pr = h.pruned ?? {}, minimal = h.mode === 'minimal';
+  const parts = [pr.failed_or_superseded && `dropped ${pr.failed_or_superseded} failed or superseded`, pr.collapsed && `collapsed ${pr.collapsed} reads into ${pr.collapsed_into}`, pr.overwritten_writes && `${pr.overwritten_writes} earlier writes to the same file`,
+    pr.repeated_commands && `${pr.repeated_commands} repeated commands`, `kept ${k.steps} of ${c.steps}`].filter(Boolean);
+  return shell(`<div class="between" style="flex-wrap:wrap;align-items:flex-start">
+      <div class="col" style="min-width:0"><h2 class="nm" style="font-size:20px">${esc(h.title)}</h2><div class="small muted">${chip('', esc(h.kind))} <span class="mono">${esc(h.unit_id)}</span> · ${h.started ? new Date(h.started).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : ''}</div></div>
+      <div class="row" style="flex-wrap:wrap"><div class="seg" role="group" aria-label="Which trace">${[['minimal', 'Minimal'], ['full', 'Full']].map(([m, l]) => `<button data-tmode="${m}" aria-pressed="${ui.tmode === m}">${l}</button>`).join('')}</div>
+        <button class="sm" data-tr="md">Copy as Markdown</button><button class="sm" data-tr="dl">Download JSON</button>${h.kind !== 'session' && S.brain_enabled ? '<button class="sm" data-tr="distill" title="Writes the unit\'s note and, if there is a procedure in it, a skill candidate: from the minimal trace">Distill from this trace</button>' : ''}</div></div>
+    <div class="row small" style="flex-wrap:wrap;gap:6px 18px"><span><b class="mono">${c.steps}</b> steps</span><span><b class="mono">${c.tool_calls}</b> tool calls</span><span><b class="mono ${c.failed ? 'clay' : ''}">${c.failed}</b> failed</span><span><b class="mono">${c.subagents}</b> subagents</span>
+      <span><b class="mono">${dur((h.ended - h.started) / 1000)}</b> end to end</span><span><b class="mono">${usd(h.usd)}</b> at list price ${lim(h.lim)}</span><span class="muted">${tok(h.tokens.in + h.tokens.cache_read + h.tokens.cache_create)} in · ${tok(h.tokens.out)} out</span></div>
+    ${minimal ? `<div class="small muted">Minimal: ${esc(parts.join(', '))}${pr.model_calls ? `. The ${pr.model_calls} model calls are hidden; the last one is the report.` : ''}</div>` : '<div class="small muted">Full: every prompt, model call, tool call and subagent run, in order.</div>'}
+    <div class="between" style="flex-wrap:wrap"><label class="sr" for="tq">Filter spans by name or target</label><input id="tq" value="${esc(ui.tq)}" placeholder="Filter spans by name or target…" style="min-width:260px" autocomplete="off">
+      <span class="small muted">↑ ↓ move · → expand · ← collapse · bars are on the unit's own time axis, ${tfmt(h.ended - h.started)} wide</span></div>
+    <div class="tree" id="ttree" tabindex="0" role="tree" aria-label="Spans of ${esc(h.title)}" data-scroll="ttree"><div class="trow th"><span>span</span><span class="tw"><span class="tk">0 → ${tfmt(h.ended - h.started)}</span><span class="tv">duration · tokens · dollars</span></span></div><div id="trows">${trows()}</div></div>`);
+};
+document.addEventListener('click', (e) => {
+  const row = e.target.closest?.('#ttree [data-sp]');
+  if (!row) return;
+  TR.sel = row.dataset.sp;
+  if (e.target.closest('[data-tc]') || e.detail === 2) ttoggle(TR.sel); else tdraw();
+  $('#ttree').focus();
+});
+document.addEventListener('keydown', (e) => {
+  if (!e.target.closest?.('#ttree') || !TR.rows.length) return;
+  const rows = TR.rows, i = Math.max(0, rows.findIndex((r) => r.s.id === TR.sel)), r = rows[i], k = e.key;
+  let to = null;
+  if (k === 'ArrowDown') to = rows[Math.min(rows.length - 1, i + 1)].s.id;
+  else if (k === 'ArrowUp') to = rows[Math.max(0, i - 1)].s.id;
+  else if (k === 'Home') to = rows[0].s.id;
+  else if (k === 'End') to = rows.at(-1).s.id;
+  else if (k === 'ArrowRight') { if (r.s.n_children && !r.open) { e.preventDefault(); return ttoggle(r.s.id); } if (r.open && rows[i + 1]?.d > r.d) to = rows[i + 1].s.id; }
+  else if (k === 'ArrowLeft') { if (r.open) { e.preventDefault(); return ttoggle(r.s.id); } to = r.s.parent; }
+  else if (k === 'Enter' || k === ' ') { e.preventDefault(); return r.s.n_children ? ttoggle(r.s.id) : undefined; }
+  else return;
+  e.preventDefault();
+  if (to && rows.some((x) => x.s.id === to)) { TR.sel = to; tdraw(); }
+});
+document.addEventListener('input', async (e) => {
+  if (e.target.getAttribute?.('id') !== 'tq') return;
+  ui.tq = e.target.value;
+  if (ui.tq.trim() && !TR.all) await tall();
+  tdraw();
+});
 
 // ---------- Cost: keep warm (GET /router/warm) ----------
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -516,7 +654,7 @@ const views = {
           <span>${s.last_switch_cost_actual != null ? `<span title="last switch, actual cache write">${tok(s.last_switch_cost_actual)}</span>` : s.switch_cost_est == null ? NA : '≈' + tok(s.switch_cost_est)}</span>
           <div class="row"><select class="sm" aria-label="Route session ${short(s.session_key)} to account" data-s="${esc(s.session_key)}">${accts.map((a) => `<option ${a.id === (ui.open[`pin-${s.session_key}`] ?? s.account_id) ? 'selected' : ''}>${esc(a.id)}</option>`).join('')}</select>
             <button class="sm" data-pin="${esc(s.session_key)}" data-cost="${s.switch_cost_est ?? ''}" data-actual="${s.last_switch_cost_actual ?? ''}">Switch</button></div></div>`
-          + (ui.tl === s.session_key && tl?.turns ? `<div class="inset" style="margin:2px 0 8px"><div class="between"><b>Timeline — ${esc(tl.title)}</b><span class="small muted">${tl.turns.length} turns · hover a bar for its numbers</span></div>${timelineSvg(tl)}
+          + (ui.tl === s.session_key && tl?.turns ? `<div class="inset" style="margin:2px 0 8px"><div class="between"><b>Timeline — ${esc(tl.title)}</b><span class="small muted">${tl.turns.length} turns · hover a bar for its numbers · <a href="#brain?view=trace&unit=${encodeURIComponent(tl.session_key)}">Open trace →</a></span></div>${timelineSvg(tl)}
             ${tl.carrying?.length ? `<div class="col small"><span class="muted">Carrying cost — tool results that every later turn re-read (tokens × turns × the model's read price)</span>
               ${tl.carrying.map((c) => `<div class="between mono"><span class="nm">${esc(c.tool)}${c.target !== c.tool ? ` <span class="muted">${esc(c.target)}</span>` : ''}</span><span>${tok(c.tokens)} × ${c.turns} turns · ${usd(c.usd)}</span></div>`).join('')}
               <span class="muted">Top one: ${code(tl.carrying[0].suggestion)}</span></div>` : ''}</div>` : '')
@@ -733,7 +871,7 @@ const views = {
   }],
 
   // second fetch = what the chosen view shows: the pipeline, the vault tree (Notes) or the graph
-  brain: [['brain/stats', () => `brain/${ui.bview === 'notes' ? 'tree' : ui.bview}`, () => ui.bview === 'notes' ? `brain/note?path=${encodeURIComponent(ui.note)}` : 'settings', () => ui.bq && ui.bview !== 'pipeline' ? `brain/search?q=${encodeURIComponent(ui.bq)}` : 'settings', 'settings'], (b, t, note, hits) => {
+  brain: [['brain/stats', () => ui.bview === 'trace' ? (ui.tu ? `brain/trace?unit=${encodeURIComponent(ui.tu)}&meta=1` : 'settings') : `brain/${ui.bview === 'notes' ? 'tree' : ui.bview}`, () => ui.bview === 'notes' ? `brain/note?path=${encodeURIComponent(ui.note)}` : 'settings', () => ui.bq && ui.bview !== 'pipeline' ? `brain/search?q=${encodeURIComponent(ui.bq)}` : 'settings', 'settings'], (b, t, note, hits) => {
     const sub = 'Notes about past sessions, as plain files, so the next session does not work the same thing out again.';
     if (!b.enabled) return head('Brain', sub) + `<form class="panel" id="brain-enable" style="max-width:760px">
       <h2>The brain is off</h2>
@@ -751,9 +889,10 @@ const views = {
           <label class="between small"><span>Classifier <span class="muted">(in use: ${esc(b.classifier_backend)})</span></span><select name="classifier" class="sm">${['auto', 'jev', 'model'].map((v) => `<option ${S.classifier === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <div class="row"><button class="sm">Save</button><button type="button" class="sm" data-bact="disable">Turn the brain off</button></div>
         </form></details>`)
-      + `<div class="between" style="flex-wrap:wrap"><div class="seg" role="group" aria-label="Brain view">${[['pipeline', 'Pipeline'], ['notes', 'Notes'], ['graph', 'Graph']].map(([v, l]) => `<button data-bview="${v}" aria-pressed="${ui.bview === v}">${l}</button>`).join('')}</div>
+      + `<div class="between" style="flex-wrap:wrap"><div class="seg" role="group" aria-label="Brain view">${[['pipeline', 'Pipeline'], ['notes', 'Notes'], ['graph', 'Graph'], ['trace', 'Trace']].map(([v, l]) => `<button data-bview="${v}" aria-pressed="${ui.bview === v}">${l}</button>`).join('')}</div>
         <div class="row" style="flex-wrap:wrap">${b.obsidian ? '<button class="sm" data-bact="open" data-target="obsidian">Open in Obsidian</button>'
           : '<span class="small muted">Obsidian isn\'t installed — the Graph view here shows the same links.</span><button class="sm" data-bact="open" data-target="folder">Reveal folder</button>'}</div></div>`;
+    if (ui.bview === 'trace') return top + brainTrace(t);
     if (ui.bview !== 'notes') return top + (t.error ? `<div class="note err">${esc(t.error.type)}</div>` : ui.bview === 'graph' ? brainGraph(t, hits) : brainPipeline(t));
     ui.files = t.files;
     const f = t.files, base = (p) => p.split('/').pop().replace(/\.md$/, ''), path = note.path ?? '';
@@ -776,11 +915,11 @@ const views = {
     const kind = path.startsWith('wiki/logs/') ? 'session' : path.startsWith('wiki/projects/') ? 'project' : cand.includes(path) ? 'candidate' : /^skills\/[^/]+\.md$/.test(path) ? 'skill' : path === 'CRITICAL_FACTS.md' ? 'facts' : '';
     const name = kind === 'candidate' ? path.split('/')[2] : kind === 'skill' ? base(path) : '', sk = b.skills.find((k) => k.name === name), s = note.session, g = s?.gate_json ? JSON.parse(s.gate_json) : null;
     const btn = (act, label, extra = '') => `<button class="sm" data-bact="${act}" ${extra} ${ui.busy.brain ? 'disabled' : ''}>${label}</button>`;
-    const acts = kind === 'session' && s ? btn('distill', ui.busy.brain ? 'Distilling…' : s.distilled_ts ? 'Distill again' : 'Distill', `data-sk="${esc(s.session_key)}"`) + (g && !g.gated ? btn('force', 'Distill anyway', `data-sk="${esc(s.session_key)}"`) : '')
+    const acts = (s ? `<button class="sm" data-tropen="${esc(s.session_key)}">Trace</button>` : '') + (kind === 'session' && s ? btn('distill', ui.busy.brain ? 'Distilling…' : s.distilled_ts ? 'Distill again' : 'Distill', `data-sk="${esc(s.session_key)}"`) + (g && !g.gated ? btn('force', 'Distill anyway', `data-sk="${esc(s.session_key)}"`) : '')
       : kind === 'project' ? btn('consolidate', ui.busy.brain ? 'Consolidating…' : 'Consolidate', `data-name="${esc(base(path))}"`)
       : sk?.status === 'promoted' ? (sk.update ? btn('promote', 'Apply update', `data-name="${esc(name)}" data-upd="1"`) + btn('reject', 'Discard update', `data-name="${esc(name)}" data-upd="1"`) : '') + btn('demote', 'Demote', `data-name="${esc(name)}"`)
       : (kind === 'candidate' || kind === 'skill') && sk ? btn('promote', 'Promote', `data-name="${esc(name)}"`) + btn('reject', 'Reject', `data-name="${esc(name)}"`)
-      : kind === 'facts' && !ui.bedit ? btn('edit', 'Edit') : '';
+      : kind === 'facts' && !ui.bedit ? btn('edit', 'Edit') : '');
     const gate = !s ? '' : `<div class="small muted">${s.queued ? '<span class="chip warn">queued: the daily cap is spent</span> ' : ''}${!g ? 'Not gated yet.' : g.forced ? 'Distilled without the gate.'
       : g.answers ? `Gate (${esc(g.backend)}): ${Object.entries(g.answers).map(([k, a]) => `${esc(k)} = ${esc(a.value)} <span class="mono">${a.confidence.toFixed(2)}</span>`).join(' · ')} → ${g.gated ? (g.want_skill ? 'distill, skill wanted' : 'distill, no skill') : 'not worth distilling'}`
       : `Gate: too little hands-on work (${g.pre.tool_calls} tool calls) → not distilled`}${s.distilled_ts ? ` · distilled ${ago(s.distilled_ts)}` : ''}</div>`;
@@ -829,8 +968,9 @@ const views = {
 // ---------- routing, polling, rendering ----------
 const route = () => { const r = location.hash.slice(1).split('?')[0]; return views[r] ? r : 'overview'; };
 // deep link to a session's timeline: #accounts?tl=<session key>
-// …and to a Brain view: #brain?view=pipeline|notes|graph
-const deep = () => { const q = new URLSearchParams(location.hash.split('?')[1] ?? ''); if (q.get('tl')) ui.tl = q.get('tl'); ui.bview = ['notes', 'graph'].includes(q.get('view')) ? q.get('view') : 'pipeline'; };
+// …and to a Brain view: #brain?view=pipeline|notes|graph|trace[&unit=<unit id>]
+const deep = () => { const q = new URLSearchParams(location.hash.split('?')[1] ?? ''); if (q.get('tl')) ui.tl = q.get('tl'); ui.bview = ['notes', 'graph', 'trace'].includes(q.get('view')) ? q.get('view') : 'pipeline';
+  if (q.get('unit') && q.get('unit') !== ui.tu) { ui.tu = q.get('unit'); ui.tq = ''; } };
 let seq = 0;
 async function refresh(force) {
   const r = route(), [paths, render] = views[r], my = ++seq;
@@ -839,17 +979,21 @@ async function refresh(force) {
     const [h, ...data] = await Promise.all(['health', ...paths.map((p) => (typeof p === 'function' ? p() : p))].map(get));
     if (my !== seq) return; // a newer refresh (route change) superseded this one
     if (data.at(-1)?.policy) S = data.at(-1); else if (data[0]?.settings) S = data[0].settings;
-    $('#status').innerHTML = `<div class="row"><span class="dot" style="background:${h.transparent ? 'var(--teal)' : 'var(--amber)'}"></span><span style="color:var(--fg)">Transparent mode ${h.transparent ? 'on' : 'off'}</span></div>
-      <div>${h.launchd ? 'launchd' : 'manual run'} · up ${dur(h.uptime)}</div><div class="mono">${h.transparent ? 'api.anthropic.com → 127.0.0.1' : 'explicit :4001 only'}</div>
-      <div>${h.requests.toLocaleString()} requests · ${h.sessions} sessions</div>`;
-    // never yank a control out from under the user; the next tick catches up
-    const f = document.activeElement, main = $('#main');
     // never yank a control out from under the user: focus anywhere in a form (buttons included) or a half-typed
     // field means the poll waits; clicking Create used to move focus to the button and get the form re-rendered away
+    const f = document.activeElement, main = $('#main');
     const dirty = [...main.querySelectorAll('input, textarea')].some((i) => i.type !== 'radio' && i.type !== 'checkbox' && i.value !== i.defaultValue);
-    if (!force && ((f && main.contains(f) && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(f.tagName)) || dirty || G.drag)) return;
-    // Brain pipeline and graph: a poll that brought nothing new is not rendered, so scroll, hover, pan, zoom and pins stay put
-    const sig = r === 'brain' && ui.bview !== 'notes' ? ui.bview + JSON.stringify(data) : null;
+    const busy = (f && main.contains(f) && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(f.tagName)) || dirty || G.drag;
+    // a restart with a new ui.html: reload now, or, mid-form, leave a chip (a page served without a build, e.g. a saved copy, never compares)
+    const stale = !BUILD.startsWith('__') && h.build && h.build !== BUILD;
+    if (stale && !busy) return location.reload();
+    $('#status').innerHTML = `<div class="row"><span class="dot" style="background:${h.transparent ? 'var(--teal)' : 'var(--amber)'}"></span><span style="color:var(--fg)">Transparent mode ${h.transparent ? 'on' : 'off'}</span></div>
+      <div>${h.launchd ? 'launchd' : 'manual run'} · up ${dur(h.uptime)}</div><div class="mono">${h.transparent ? 'api.anthropic.com → 127.0.0.1' : 'explicit :4001 only'}</div>
+      <div>${h.requests.toLocaleString()} requests · ${h.sessions} sessions</div>${stale ? '<button class="chip warn" data-act="reload">New version — reload</button>' : ''}`;
+    if (!force && busy) return; // the next tick catches up
+    // Brain pipeline, graph and trace: a poll that brought nothing new is not rendered, so scroll, hover, pan, zoom and pins stay put. The trace view's poll is only
+    // the unit's last_ts (data[1]), so the tree is rebuilt when the unit changed, and never because the brain's spend moved.
+    const sig = r === 'brain' && ui.bview !== 'notes' ? ui.bview + JSON.stringify(ui.bview === 'trace' ? data[1] : data) : null;
     if (!force && sig && sig === ui.sig) return;
     ui.sig = sig;
     const keep = [...main.querySelectorAll('[data-scroll]')].map((x) => [x.dataset.scroll, x.scrollTop]); // inner scrollers survive the re-render
@@ -876,7 +1020,7 @@ async function brainAct(d) {
   if (a === 'greset') { Object.assign(G, { pos: {}, key: '', moved: false }); refresh(true); }
   if (a === 'scan-all' || a === 'extract-all') { // background run on the server: confirm with the count, the estimate and what is left of the cap
     const scan = a === 'scan-all', n = Number(d.n);
-    if (confirm(`${scan ? 'Scan' : 'Extract'} ${n} ${d.session ? 'of this session\'s subagent runs and segments' : `unit${n === 1 ? '' : 's'} (sessions, subagent runs, segments)`} with ${d.by}, one after the other, oldest first?\n\n${d.est === '' ? 'No cost history yet, so no estimate: the first calls set it.' : `About $${Number(d.est).toFixed(2)} at list price (${n} × the recent average per call).`}\n$${Number(d.left).toFixed(2)} of today's cap is left; it stops there.`)) act(`brain/${a}`, d.session ? { session: d.session } : undefined);
+    if (confirm(`${scan ? 'Scan' : 'Extract'} ${n} ${d.session ? 'of this session\'s subagent runs and segments' : `unit${n === 1 ? '' : 's'} (sessions, subagent runs, segments)`} with ${d.by}, one after the other, oldest first?\n\n${d.est === '' ? 'No cost history yet, so no estimate: the first calls set it.' : `About $${Number(d.est).toFixed(2)} at list price (${n} × the recent average per call).`}\n$${Number(d.left).toFixed(2)} of today's cap is left; it stops there.`)) act(`brain/${a}`, d.session || d.limit ? { ...(d.session && { session: d.session }), ...(d.limit && { limit: Number(d.limit) }) } : undefined);
   }
   if (a === 'disable' && confirm('Turn the brain off? Notes stay where they are; nothing new is written.')) putSettings({ brain_enabled: false });
   if (a === 'promote' && confirm(d.upd ? `Apply the update to ${d.name}? The installed skill is replaced by this version.` : `Promote ${d.name}? It is copied to your Claude skills folder and every new session loads its description.`)) act(skill);
@@ -896,7 +1040,12 @@ document.addEventListener('click', (e) => {
   if (!t) return;
   const d = t.dataset;
   if (d.note) { ui.note = d.note; ui.bedit = false; if (ui.bview === 'notes') refresh(true); else location.hash = '#brain?view=notes'; }
-  if (d.bview) location.hash = `#brain?view=${d.bview}`;
+  if (d.bview) location.hash = `#brain?view=${d.bview}${d.bview === 'trace' && ui.tu ? `&unit=${encodeURIComponent(ui.tu)}` : ''}`;
+  if (d.tropen) location.hash = `#brain?view=trace&unit=${encodeURIComponent(d.tropen)}`;
+  if (d.tmode) { ui.tmode = d.tmode; refresh(true); }
+  if (d.tr === 'md') fetch(`/router/brain/trace.md?unit=${encodeURIComponent(ui.tu)}`).then((r) => r.text()).then((x) => navigator.clipboard.writeText(x)).then(() => { t.textContent = 'Copied'; });
+  if (d.tr === 'dl') location.href = `/router/brain/trace?unit=${encodeURIComponent(ui.tu)}&mode=${ui.tmode}&download=1`;
+  if (d.tr === 'distill') trDistill();
   if (d.stage) { ui.pstage = ui.pstage === d.stage ? null : d.stage; refresh(true); }
   if (d.gtype) { G.on[d.gtype] = !G.on[d.gtype]; G.moved = false; refresh(true); } // another set of notes: laid out and fitted again
   if (d.wl) { // [[wikilink]]: a vault path, else the note with that name
@@ -920,6 +1069,7 @@ document.addEventListener('click', (e) => {
     if (confirm(`Route session ${d.pin.slice(0, 8)} to ${acct}?\nIts next turn re-writes the whole cache on ${acct}${cost}.`))
       act(`sessions/${encodeURIComponent(d.pin)}/pin`, { account_id: acct }).then(() => delete ui.open[`pin-${d.pin}`]);
   }
+  if (d.act === 'reload') location.reload();
   if (d.act === 'pause-routing') putSettings({ policy: S.policy === 'manual' ? 'sticky_least_utilized' : 'manual' });
   if (d.act === 'focus-add') $('#add-id')?.focus();
   if (d.act === 'goto-add') { location.hash = '#accounts'; setTimeout(() => $('#add-id')?.focus(), 400); }

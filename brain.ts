@@ -10,6 +10,7 @@ import { db, settings, now } from './ledger.ts';
 import { claude, claudeHome } from './advisor.ts';
 import { ROOT, desc } from './tailer.ts';
 import { MSG, spendOf, fmtUsd } from './console.ts';
+import { trace, minimal, md, lastTs } from './trace.ts'; // trace.ts imports this file back; each calls the other's functions only at run time
 
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
@@ -45,12 +46,12 @@ export const scrub = (s: string) => s
   .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[po]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16})/g, '[redacted]')
   .replace(/([\w-]*(?:password|passwd|secret|token|api[_-]?key)[\w-]*["']?\s*[=:]\s*["']?)[^\s"'&;,]+/gi, '$1[redacted]');
 // an excerpt: scrubbed, one line, never able to close one of our marker comments
-const clip = (s: string, n: number) => scrub(s).replace(/\s+/g, ' ').replace(/<!--/g, '<!- -').trim().slice(0, n);
-const strip = (s: string) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+export const clip = (s: string, n: number) => scrub(s).replace(/\s+/g, ' ').replace(/<!--/g, '<!- -').trim().slice(0, n);
+export const strip = (s: string) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
 const fname = (s: string) => s.replace(/[\\/:*?"<>|#^[\]\x00-\x1f]/g, ' ').replace(/\s+/g, ' ').trim().replace(/^\.+/, '').slice(0, 80).trim();
 const tag = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 const li = (xs: string[]) => (xs.length ? xs.map((v) => `- ${v}`).join('\n') : '- none');
-const code = (s: string) => (s.includes('`') ? `\`\` ${s} \`\`` : `\`${s}\``);
+export const code = (s: string) => (s.includes('`') ? `\`\` ${s} \`\`` : `\`${s}\``);
 const link = (p: string) => `[[${p.split('/').pop()!.replace(/\.md$/, '')}]]`;
 const day = (ms: number) => new Date(ms).toLocaleDateString('sv'); // local YYYY-MM-DD
 // tolerates ```json fences and prose around the object, and on a second try backslashes JSON does not know: a model copying `\:` or `\,`
@@ -198,21 +199,26 @@ function digest(R: Run, ev = R.ev, [np, na, nc] = [300, 600, 200]) {
   return { prompts: of('p', np), texts: of('a', na).slice(-4), final: of('h', na).at(-1) ?? of('a', na).at(-1) ?? '', calls: ev.filter((e) => e.t === 'u').length,
     tools: [...tools].sort((a, b) => b[1] - a[1]), files: [...files], commands: [...commands] };
 }
-async function extract(sk: string) {
+// a session's main-thread transcript(s), oldest first
+export function mainPaths(sk: string) {
   let paths = all(`select jsonl_path p from requests where session_key = ? and agent_id is null and jsonl_path is not null group by 1 order by min(ts)`, sk)
     .map((r) => r.p as string).filter((p) => existsSync(p));
   // no joined request (a session from before the router, or never routed): the CLI names the transcript after the session
   if (!paths.length && /^[\w-]+$/.test(sk)) try { paths = readdirSync(ROOT).map((d) => `${ROOT}/${d}/${sk}.jsonl`).filter((p) => existsSync(p)); } catch {}
+  return paths;
+}
+async function extract(sk: string) {
+  const paths = mainPaths(sk);
   if (!paths.length) return null;
   const R = await read(paths);
   return { ...digest(R), R, paths, cwd: R.cwd, t0: R.t0, t1: R.t1 };
 }
 
 // ---- units: a subagent run, or a task segment of a long main thread, gets its own note and its own pipeline row ----
-const MINU = 8, LONG = 150, SEG = 25; // a subagent run from 8 tool calls; a main thread of more than 150, cut into segments of at least 25
+export const MINU = 8, LONG = 150, SEG = 25; // a subagent run from 8 tool calls; a main thread of more than 150, cut into segments of at least 25
 const iso = (ms: number) => new Date(ms).toISOString();
 // Cut at typed prompts of 15 characters or more, once the segment so far holds SEG tool calls; a short tail joins the segment before it.
-function segments(ev: Ev[]) {
+export function segments(ev: Ev[]) {
   const out: Ev[][] = [[]];
   let n = 0;
   for (const e of ev) {
@@ -226,7 +232,7 @@ function segments(ev: Ev[]) {
 // Commands that worked, capped near 3,000 tokens: under the cap all of them; over it, the first of each command family, then the final
 // third of the run from its end backwards, in their original order.
 // ponytail: a family is the first two words after leading `cd … &&` and VAR=… prefixes; parse the shell if that groups badly
-const family = (c: string) => c.replace(/^(cd [^&;]+(&&|;)\s*)+/, '').replace(/^(\w+=\S+\s+)+/, '').split(' ').slice(0, 2).join(' ');
+export const family = (c: string) => c.replace(/^(cd [^&;]+(&&|;)\s*)+/, '').replace(/^(\w+=\S+\s+)+/, '').split(' ').slice(0, 2).join(' ');
 function keep(cmds: string[], max = 12_000) {
   if (cmds.reduce((n, c) => n + c.length + 4, 0) <= max) return cmds;
   const fam = new Set<string>(), pick = new Set<number>();
@@ -238,13 +244,13 @@ function keep(cmds: string[], max = 12_000) {
 }
 type Parent = { sk: string; rel: string; project: string | null };
 // One unit's note, `<parent note> — <name>.md`, and its brain_sessions row (parent = the session). `where` selects its ledger requests.
-function unit(root: string, p: Parent, u: { id: string; kind: 'subagent' | 'segment'; agent?: string; seg?: number; name: string; file?: string; ev: Ev[]; R: Run; where: any[] }) {
+function unit(root: string, p: Parent, u: { id: string; kind: 'subagent' | 'segment'; agent?: string; seg?: number; name: string; file?: string; ev: Ev[]; R: Run; where: any[]; trace: string }) {
   const x = digest(u.R, u.ev, [1500, 2000, 300]), old = one('select note_path p from brain_sessions where session_key = ?', u.id)?.p as string | undefined;
   let rel = `${p.rel.slice(0, -3)} — ${fname(u.file ?? u.name).slice(0, 60).trim() || u.id.slice(-8)}.md`;
   if (rel !== old && existsSync(`${root}/${rel}`)) rel = rel.replace(/\.md$/, ` (${u.id.split('/').pop()!.slice(0, 8)}).md`); // another run of this session, same name
   if (old && old !== rel && existsSync(`${root}/${old}`)) renameSync(`${root}/${old}`, `${root}/${rel}`);                 // the session was retitled
   const [w, ...a] = u.where, q = `${w} and ${MSG()} and status < 400`, t0 = u.ev[0]?.ts || u.R.t0 || Date.now(), kept = keep(x.commands);
-  put(root, rel, [`# ${u.name}`, `Session: ${link(p.rel)} · Project: ${p.project ? `[[${p.project}]]` : '—'}`,
+  put(root, rel, [`# ${u.name}`, `Session: ${link(p.rel)} · Project: ${p.project ? `[[${p.project}]]` : '—'}`, ...(u.trace ? [u.trace] : []),
     '## Brief', li(u.kind === 'subagent' ? x.prompts.slice(0, 1) : fit(x.prompts.map((s) => s.slice(0, 300)), 1500)),
     '## Commands that worked', li(kept.map(code)) + (kept.length < x.commands.length ? `\n- … and ${x.commands.length - kept.length} more (listed: the first of each kind and the final third)` : ''),
     '## Files written', li(fit(x.files, 3000).map(code)),
@@ -257,6 +263,11 @@ function unit(root: string, p: Parent, u: { id: string; kind: 'subagent' | 'segm
     .run(u.id, u.kind, p.sk, u.agent ?? null, u.seg ?? null, u.name, t0, Date.now(), rel);
   return `[[${rel.split('/').pop()!.slice(0, -3)}|${fname(u.name)}]]`;
 }
+// a unit note's trace line: a link to the console's Trace view, and what pruning left of the steps
+async function traceLine(id: string) {
+  const t = await trace(id).catch(() => null);
+  return t ? `Trace: [open in the console](http://localhost:${process.env.PORT ?? 4001}/router/ui#brain?view=trace&unit=${encodeURIComponent(id)}) · ${t.counts.steps} steps → ${minimal(t).counts.steps} after pruning` : '';
+}
 // A session's units, oldest first. Returns what the parent note lists: every subagent (a link when it has a note, else its name) and the segments.
 async function units(root: string, p: Parent, x: { R: Run; paths: string[] }) {
   const runs: { id: string; name: string; R: Run }[] = [], calls = (ev: Ev[]) => ev.filter((e) => e.t === 'u').length;
@@ -268,11 +279,12 @@ async function units(root: string, p: Parent, x: { R: Run; paths: string[] }) {
       runs.push({ id, R, name: clip(one('select name from agents where agent_id = ?', id)?.name ?? desc(`${d}/${f}`) ?? R.ev.find((e) => e.t === 'p')?.s ?? id, 80) });
     }
   }
-  const subs = runs.sort((a, b) => a.R.t0 - b.R.t0).map((u) => calls(u.R.ev) < MINU ? u.name
-    : unit(root, p, { id: `${p.sk}/${u.id}`, kind: 'subagent', agent: u.id, name: u.name, ev: u.R.ev, R: u.R, where: ['session_key = ? and agent_id = ?', p.sk, u.id] }));
+  const subs: string[] = [], segs: string[] = [];
+  for (const u of runs.sort((a, b) => a.R.t0 - b.R.t0)) subs.push(calls(u.R.ev) < MINU ? u.name
+    : unit(root, p, { id: `${p.sk}/${u.id}`, kind: 'subagent', agent: u.id, name: u.name, ev: u.R.ev, R: u.R, where: ['session_key = ? and agent_id = ?', p.sk, u.id], trace: await traceLine(`${p.sk}/${u.id}`) }));
   const parts = calls(x.R.ev) > LONG ? segments(x.R.ev) : [];
-  const segs = parts.length < 2 ? [] : parts.map((ev, i) => unit(root, p, { id: `${p.sk}/seg-${i + 1}`, kind: 'segment', seg: i + 1, file: `part ${i + 1}`,
-    name: `part ${i + 1} — ${ev.find((e) => e.t === 'p' && e.s.length >= 15)?.s.slice(0, 60) ?? ''}`, ev, R: x.R,
+  if (parts.length > 1) for (const [i, ev] of parts.entries()) segs.push(unit(root, p, { id: `${p.sk}/seg-${i + 1}`, kind: 'segment', seg: i + 1, file: `part ${i + 1}`,
+    name: `part ${i + 1} — ${ev.find((e) => e.t === 'p' && e.s.length >= 15)?.s.slice(0, 60) ?? ''}`, ev, R: x.R, trace: await traceLine(`${p.sk}/seg-${i + 1}`),
     where: ['session_key = ? and agent_id is null and ts >= ? and ts < ?', p.sk, ev[0].ts, parts[i + 1]?.[0].ts ?? 9e15] }));
   return { subs, segs, notes: segs.length + subs.filter((v) => v.startsWith('[[')).length };
 }
@@ -430,7 +442,10 @@ export async function classify(state: string, questions: Q): Promise<{ answers: 
 const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 // what the scan looks for: a repeatable skill, not just something worth remembering
 const REUSABLE = 'The session worked out a multi-step procedure (commands, tool sequence, or workflow) that the same person would want to repeat in a different project — for example setting up a pipeline, producing a video, deploying a service. A one-off fix or a discussion is not reusable.';
-const known = (root: string) => all(`select name from brain_skills where status != 'rejected'`).map((k) => {
+// The skills a unit may be matched to (and so refine): the ones the brain made or imported and still owns. Not the built-in recall skill, and not a promoted
+// one whose installed directory lost its marker (somebody else's now).
+const known = (root: string) => all(`select name, status, source from brain_skills where status != 'rejected'`)
+  .filter((k) => k.source !== 'builtin' && (k.status !== 'promoted' || existsSync(`${skillsDir()}/${k.name}/${MARK}`))).map((k) => {
   try { return [k.name, front(readFileSync(`${root}/skills/candidates/${k.name}/SKILL.md`, 'utf8'))?.description ?? k.name]; } catch { return [k.name, k.name]; } });
 const questions = (skills: string[][]): Q => ({
   reusable: { type: 'noul', instructions: REUSABLE },
@@ -443,7 +458,8 @@ const questions = (skills: string[][]): Q => ({
 // ---- distill: one writer call per gated session ----
 const WRITE = `You distill one finished Claude Code session into durable notes. The input is a structured extract (what the user asked, files written,
 commands that succeeded, tools, the closing assistant text), not the transcript. For one subagent run or one task segment of a session the same
-facts come as its note in "run" (Brief, Commands that worked, Files written, Tools, Final report). Return ONLY one JSON object, no prose, no code fences:
+facts come in "run": its Brief, a minimal trace (a numbered outline of the steps that worked, in order: failed and repeated steps are left out, a run of
+exploration is one "explored N files" line, "edits" and "runs" count what was merged into a step) and its Final report. Return ONLY one JSON object, no prose, no code fences:
 {"summary": "2-4 sentences: what was asked and what was done",
  "decisions": ["a choice that was made and why, one sentence each"],
  "learnings": ["a fact or gotcha that was discovered and will matter again"],
@@ -537,12 +553,20 @@ async function load(sk: string) {
   const note = readFileSync(`${root}/${b.note_path}`, 'utf8'), { ok, ...pre } = preOf(note);
   return { root, b, x, note, skills: known(root), pre: x ? { tool_calls: x.calls, files: x.files.length, commands: x.commands.length } : pre };
 }
+// What the model reads of a subagent run or a task segment (docs/BRAIN.md "Trace"): its Brief, its minimal trace (`head`: only that many lines of it)
+// and its Final report. A unit whose transcript is gone falls back to its note's own listing.
+async function input(sk: string, note: string, head?: number) {
+  const t = await trace(sk).catch(() => null);
+  if (!t) return (getBlock(note) ?? '').slice(0, 20_000);
+  const lines = md(minimal(t)).split('\n');
+  return [`# ${front(note)?.title}`, '## Brief', sec(note, 'Brief'), (head ? lines.slice(0, head) : lines).join('\n'), '## Final report', sec(note, 'Final report')].join('\n\n');
+}
 // scan = the gate alone: deterministic pre-filter, then the classifier. Stores the answers, the backend and what the call cost; never calls the writer.
 async function gate1(sk: string, s?: Loaded | null): Promise<Record<string, any>> {
   if (!(s ??= await load(sk))) return { error: 'no_note' };
   const { pre, note, skills } = s, conf = settings().brain_confidence, t0 = now();
-  // the state is the unit's own note: for a subagent run or a segment its brief, commands and final report, not the whole session's
-  const c = pre.tool_calls >= 8 && (pre.files || pre.commands) ? await classify((getBlock(note) ?? '').slice(0, s.b.parent ? 20_000 : 12_000), questions(skills)) : undefined;
+  // the state is the unit's own: for a subagent run or a segment its brief, the head of its minimal trace and its final report, not the whole session's
+  const c = pre.tool_calls >= 8 && (pre.files || pre.commands) ? await classify(s.b.parent ? await input(sk, note, 40) : (getBlock(note) ?? '').slice(0, 12_000), questions(skills)) : undefined;
   if (c === null) return { pre, gated: false, why: 'classifier_failed' };
   const a = c?.answers, gated = !!a && a.kind.value !== 'nothing' && a.kind.confidence >= conf;
   // a skill is wanted for kind = skill and reusable at the confidence: a new one, or (`refine`) the existing one `matches` names at the confidence
@@ -560,13 +584,15 @@ async function distill1(sk: string, force: boolean): Promise<Record<string, any>
   // A session's units are scanned in one go, before any of them has written a skill, so none could match a sibling's. One that asked for a
   // new skill is scanned again if a skill has appeared since: later runs then refine the earlier one's skill instead of repeating it.
   if (b.parent && (fresh?.want_skill || fresh?.refine) && one(`select 1 from brain_skills where status != 'rejected' and created_ts > ?`, b.gated_ts)) fresh = null;
-  const gate: Record<string, any> = force ? { pre, gated: true, want_skill: true, forced: true } : fresh ?? await gate1(sk, s);
+  let gate: Record<string, any> = force ? { pre, gated: true, want_skill: true, forced: true } : fresh ?? await gate1(sk, s);
   if (!gate.gated) return gate;
+  // a stored scan may name a skill that is no longer ours to refine (the recall skill, an unmarked directory): that is a new skill
+  if (gate.refine && !skills.some(([n]) => n === gate.refine)) { const { refine: _, ...rest } = gate; gate = { ...rest, want_skill: true }; }
   const project = fname(b.cwd?.split('/').pop() ?? '') || null, t0 = now(), cur = gate.refine ? skillText(root, gate.refine) : null;
   // ponytail: "near 8k tokens" by characters (4 per token): prompts 10k, the latest commands 14k, files 3k, closing text 2.4k
   const out = json(await llm(`${WRITE}${cur ? REFINE : gate.want_skill && !gate.forced ? ASK : ''}\n\n${JSON.stringify({ title: front(note)?.title, project, want_skill: gate.want_skill || !!cur, existing_skills: skills.map(([n]) => n),
     ...(x ? { asked: fit(x.prompts, 10_000), files_touched: fit(x.files, 3_000), commands_run: fit([...x.commands].reverse(), 14_000).reverse(), tools: Object.fromEntries(x.tools.slice(0, 20)), closing_assistant_text: x.texts }
-      : { run: (getBlock(note) ?? '').slice(0, 20_000) }), ...(cur && { existing_skill: cur }) })}`, st.brain_writer_model, 180_000));
+      : { run: await input(sk, note) }), ...(cur && { existing_skill: cur }) })}`, st.brain_writer_model, 180_000));
   if (typeof out?.summary !== 'string') { console.log('brain: writer did not return the JSON asked for'); return { ...gate, distilled: false, why: 'writer_failed' }; }
   const arr = (v: any, n = 400): string[] => (Array.isArray(v) ? v.filter((s) => typeof s === 'string' && s.trim()).map((s) => clip(s, n)) : []);
   const parts: [string, string, string[]][] = [['Decisions', 'decision', arr(out.decisions)], ['Learnings', 'learning', arr(out.learnings)], ['Open threads', 'open', arr(out.open_threads)]];
@@ -706,7 +732,8 @@ export function stats() {
 const STAGES = ['captured', 'scanned', 'extracted', 'candidate', 'promoted'];
 const cap1 = (m: string) => m.replace(/^claude-/, '').replace(/^./, (c) => c.toUpperCase());
 // The gate's pre-filter (>= 8 tool calls, a file written or a command run) read off the captured note, so this view never opens a transcript.
-const bullets = (t: string, h: string) => (t.match(new RegExp(`^## ${h}\\n\\n([\\s\\S]*?)(?=\\n\\n## |\\n<!-- )`, 'm'))?.[1] ?? '').split('\n').filter((l) => l.startsWith('- ') && l !== '- none');
+const sec = (t: string, h: string) => t.match(new RegExp(`^## ${h}\\n\\n([\\s\\S]*?)(?=\\n\\n## |\\n<!-- )`, 'm'))?.[1] ?? '';
+const bullets = (t: string, h: string) => sec(t, h).split('\n').filter((l) => l.startsWith('- ') && l !== '- none');
 const preOf = (t: string) => { const n = bullets(t, 'Tools').reduce((a, l) => a + Number(l.match(/× (\d+)$/)?.[1] ?? 0), 0), files = bullets(t, 'Files (?:touched|written)').length, commands = bullets(t, 'Commands (?:run|that worked)').length;
   return { tool_calls: n, files, commands, ok: n >= 8 && files + commands > 0 }; };
 // mean cost of the last 20 measured calls of one stage; null = no history yet
@@ -714,6 +741,7 @@ const avgUsd = (kind: 'scan' | 'extract') => { const [col, ts] = kind === 'scan'
   return one(`select avg(u) a from (select ${col} u from brain_sessions where ${col} is not null order by ${ts} desc limit 20)`).a as number | null; };
 const estimate = (kind: 'scan' | 'extract', n: number, avg = avgUsd(kind)) => (avg == null ? null : n * avg); // count × recent average
 let running: { kind: 'scan' | 'extract'; done: number; total: number } | null = null; // the one scan-all / extract-all in flight
+let stopped: { kind: 'scan' | 'extract'; session?: string; left: number } | null = null; // the last one that hit the daily cap, and how many units it left
 // ponytail: reads every unit's note per call for the pre-filter (the console polls this while the Pipeline view is open); store it at capture if that shows up
 // rows: one per session, newest first, each with `units`: its subagent runs and task segments, oldest first. Stage counts and todo are over all of them.
 export function pipeline() {
@@ -735,12 +763,15 @@ export function pipeline() {
   });
   const rows = flat.filter((r) => !r.parent).map((r) => ({ ...r, units: flat.filter((u) => u.parent === r.session_key).reverse() })), every = rows.flatMap((r) => [r, ...r.units]);
   const todo = (kind: 'scan' | 'extract', n: number) => ({ count: n, estimate_usd: estimate(kind, n) });
+  const left = stopped && Math.min(stopped.left, every.filter(stopped.kind === 'scan' ? toScan : toExtract).length);
   return {
     stages: ([['captured', 'Captured · no model', null], ['scanned', `Scanned · ${jev ? 'Jev' : cap1(st.brain_classifier_model)}`, jev ? 'jev' : st.brain_classifier_model],
       ['extracted', `Extracted · ${cap1(st.brain_writer_model)}`, st.brain_writer_model], ['candidate', 'Skill candidate · you review', null], ['promoted', 'Promoted · you decide', null]] as [string, string, string | null][])
       .map(([id, label, model], i) => ({ id, label, model, count: every.filter((r) => STAGES.indexOf(r.stage) >= i).length })), // cumulative: reads as a funnel
     rows, cap: { spent_usd: spend(), cap_usd: st.brain_daily_usd as number }, running: running && { ...running }, avg: { scan: avgUsd('scan'), extract: avgUsd('extract') },
     todo: { scan: todo('scan', every.filter(toScan).length), extract: todo('extract', every.filter(toExtract).length) },
+    // units a scan-all / extract-all left when it stopped at the cap: fewer once some were done by hand; the UI's Resume runs scan-all / extract-all again with `limit: left`
+    stopped: left ? { ...stopped!, left } : null,
   };
 }
 const toScan = (r: { stage: string; pre: boolean }) => r.stage === 'captured' && r.pre;            // captured, big enough, never scanned
@@ -752,9 +783,13 @@ function batch(kind: 'scan' | 'extract', limit: unknown, session?: string): [num
   const p = pipeline(), sks = p.rows.flatMap((r) => (session ? r.session_key === session ? r.units : [] : [r, ...r.units])).filter(kind === 'scan' ? toScan : toExtract).map((r) => r.session_key).slice(0, Number(limit) > 0 ? Number(limit) : undefined);
   if (p.cap.spent_usd >= p.cap.cap_usd) return [409, err('brain_over_cap')];
   const run = (running = { kind, done: 0, total: sks.length });
+  stopped = null;
   void (async () => {
     try { for (const sk of sks) { if (!settings().brain_enabled) break; await locked(sk, () => (kind === 'scan' ? gate1(sk) : distill1(sk, false))); run.done++; } }
-    catch (e: any) { console.log(e instanceof Over ? `brain: ${kind}-all stopped at the daily cap after ${run.done} of ${run.total}` : `brain: ${kind}-all failed: ${e.message}`); }
+    catch (e: any) {
+      if (e instanceof Over) stopped = { kind, ...(session && { session }), left: run.total - run.done };
+      console.log(e instanceof Over ? `brain: ${kind}-all stopped at the daily cap after ${run.done} of ${run.total}` : `brain: ${kind}-all failed: ${e.message}`);
+    }
     finally { running = null; }
   })();
   return [202, { ok: true, kind, total: sks.length, estimate_usd: estimate(kind, sks.length), cap: p.cap }];
@@ -831,10 +866,24 @@ function search(q: string) {
   return out;
 }
 
+// GET trace?unit=<id>&mode=full|minimal[&depth=1 | &parent=<span id>][&download=1] · trace?unit=<id>&meta=1 (just its last_ts, for polling) · trace.md?unit=<id> (the minimal trace as an outline).
+// depth=1 is the top-level spans only, parent=<id> one span's children; both carry n_children, so a big unit loads in pieces.
+async function traceApi(what: string, q: URLSearchParams): Promise<[number, any, Record<string, string>?]> {
+  const unit = q.get('unit') ?? '';
+  if (!/^[\w-]+(\/[\w-]+)?$/.test(unit)) throw new Bad();
+  if (q.get('meta')) { const t = lastTs(unit); return t ? [200, { unit_id: unit, last_ts: t }] : [404, err('no_transcript')]; }
+  const t = await trace(unit);
+  if (!t) return [404, err('no_transcript')];
+  if (what === 'trace.md') return [200, md(minimal(t)) + '\n', { 'content-type': 'text/markdown; charset=utf-8' }];
+  const x = q.get('mode') === 'minimal' ? minimal(t) : t, parent = q.get('parent'), depth = Number(q.get('depth'));
+  const spans = parent ? x.spans.filter((s) => s.parent === parent) : depth === 1 ? x.spans.filter((s) => !s.parent) : x.spans;
+  return [200, { ...x, spans }, q.get('download') ? { 'content-disposition': `attachment; filename="trace-${unit.replace(/\W+/g, '-')}-${x.mode}.json"` } : undefined];
+}
 // /router/brain/…  Reads always answer (an empty vault is an empty tree). Every write (and `open`) is 409 brain_disabled until the brain is enabled.
-export async function brainApi(m: string, [what = '', a, b]: string[], q: URLSearchParams, input: any): Promise<[number, any]> {
+export async function brainApi(m: string, [what = '', a, b]: string[], q: URLSearchParams, input: any): Promise<[number, any, Record<string, string>?]> {
   try {
     if (m === 'GET') {
+      if (what === 'trace' || what === 'trace.md') return await traceApi(what, q);
       if (what === 'stats') return [200, stats()];
       if (what === 'pipeline') return [200, pipeline()];
       if (what === 'graph') return [200, graph()];

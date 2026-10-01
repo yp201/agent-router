@@ -1533,9 +1533,9 @@ test('brain open: obsidian flag follows OBSIDIAN_APP; open runs the opener on th
   b.noLeak();
 });
 
-test('ui.html: Brain has the Pipeline, Notes and Graph views; the layout runs to rest on 200 notes and leaves a pinned one alone; no form.id read', () => {
+test('ui.html: Brain has the Pipeline, Notes, Graph and Trace views; the layout runs to rest on 200 notes and leaves a pinned one alone; no form.id read', () => {
   const page = readFileSync(new URL('./ui.html', import.meta.url), 'utf8');
-  for (const x of ["['pipeline', 'Pipeline'], ['notes', 'Notes'], ['graph', 'Graph']", 'data-bview=', 'brainPipeline(t)', 'brainGraph(t, hits)', 'id="graph"', "data-target=\"folder\">Reveal folder", "Obsidian isn\\'t installed — the Graph view here shows the same links."])
+  for (const x of ["['pipeline', 'Pipeline'], ['notes', 'Notes'], ['graph', 'Graph'], ['trace', 'Trace']", 'data-bview=', 'brainPipeline(t)', 'brainGraph(t, hits)', 'id="graph"', "data-target=\"folder\">Reveal folder", "Obsidian isn\\'t installed — the Graph view here shows the same links."])
     assert.ok(page.includes(x), `ui.html lacks ${x}`);
   assert.ok(!page.includes('e.target.id ===') && !page.includes('obsidian://'), 'no form.id read, no dead obsidian:// link');
   const glayout = new Function(`${page.slice(page.indexOf('// graph:begin'), page.indexOf('// graph:end'))}; return glayout;`)() as (N: any[], E: any[], iters?: number, step?: number) => void;
@@ -1587,7 +1587,7 @@ test('brain units: a subagent run of 8+ tool calls and each segment of a 160-cal
   assert.deepEqual(readdirSync(`${b.vault}/wiki/logs`).sort(), [`${P} — Build trailer v3.md`, `${P} — part 1.md`, `${P} — part 2.md`, `${P} — part 3.md`, `${P}.md`].sort(), 'no note for the 3-call subagent');
   let big = b.read(`wiki/logs/${P} — Build trailer v3.md`);
   assert.match(big, /^---\nunit: u1\/big\nkind: subagent\nparent: u1\nagent: big\ntitle: Build trailer v3\nproject: proj-x\nstarted: "\d{4}-.*"\nended: ".*"\nturns: 1\nmodel: claude-haiku-4\ntool_calls: 12\nusd: 0\.825\ntags: \[unit, subagent, proj-x\]\n---\n<!-- agent-router:begin -->\n# Build trailer v3\n/);
-  assert.ok(big.includes(`\n\nSession: [[${P}]] · Project: [[proj-x]]\n\n## Brief\n\n- Brief big: render the video\n\n## Commands that worked\n\n- \`ffmpeg -i in.mp4 step-0\`\n`), big);
+  assert.ok(big.includes(`\n\nSession: [[${P}]] · Project: [[proj-x]]\n\nTrace: [open in the console](http://localhost:0/router/ui#brain?view=trace&unit=u1%2Fbig) · 12 steps → 4 after pruning\n\n## Brief\n\n- Brief big: render the video\n\n## Commands that worked\n\n- \`ffmpeg -i in.mp4 step-0\`\n`), big);
   assert.match(big, /- `ffmpeg -i in\.mp4 step-7`\n- `curl -H "Authorization: \[redacted\]" https:\/\/tts\.example\.com\/speak`\n\n## Files written\n\n- `render\.js`\n\n## Tools\n\n- Bash × 10\n- Write × 1\n- SubagentHandback × 1\n\n## Final report\n\nTrailer v3 rendered to out\/trailer\.mp4\n<!-- agent-router:end -->/);
   for (const x of [SECRET, 'depoly', 'TOOL-OUTPUT', 'Handed back']) assert.ok(!big.includes(x), `${x} in the unit note`);
   // segments: cut at the three long prompts; over the ~3,000-token cap a segment lists the first of each command family and its final third
@@ -1596,6 +1596,13 @@ test('brain units: a subagent run of 8+ tool calls and each segment of a 160-cal
   assert.match(p1, /## Brief\n\n- cut the trailer from the script\n- ok\n\n## Commands that worked\n\n- `ffmpeg -i part0\.mp4 step-0 [^\n]*\n- `ffmpeg -i part0\.mp4 step-40 /);
   assert.match(p1, /step-59 [^\n]*\n- … and 39 more \(listed: the first of each kind and the final third\)\n\n## Files written\n\n- none\n\n## Tools\n\n- Bash × 60\n\n## Final report\n\npart 0 is done\n/);
   assert.match(p2, /# part 2 — now add the voice track please\n[\s\S]*## Brief\n\n- now add the voice track please\n\n[\s\S]*## Tools\n\n- Bash × 50\n\n## Final report\n\npart 1 is done\n/);
+  assert.ok(p1.includes('\n\nTrace: [open in the console](http://localhost:0/router/ui#brain?view=trace&unit=u1%2Fseg-1) · 60 steps → 1 after pruning\n\n## Brief'), p1);
+  // the session's trace groups its prompts into the same segments; a segment's own trace holds only its prompts
+  const segs = (await b.call('GET', 'trace?unit=u1&mode=minimal&depth=1'))[1];
+  assert.deepEqual(segs.spans.map((x: any) => [x.kind, x.id, x.n_children]), [['segment', 'seg-1', 2], ['segment', 'seg-2', 1], ['segment', 'seg-3', 1]]);
+  const s2 = (await b.call('GET', 'trace?unit=u1/seg-2&mode=full'))[1];
+  assert.deepEqual([s2.kind, s2.counts.tool_calls, s2.spans[0].kind, s2.spans[0].name], ['segment', 50, 'prompt', 'now add the voice track please']);
+  assert.equal((await b.call('GET', 'trace?unit=u1/seg-9'))[0], 404);
   // the session's note keeps its overview (the last 80 commands) and links every unit; the small run is only a name
   const main = b.read(`wiki/logs/${P}.md`);
   assert.ok(main.includes(`\n- … and 80 earlier ones\n\n## Tools\n\n- Bash × 160\n\n## Subagents\n\n- [[${P} — Build trailer v3|Build trailer v3]]\n- Check fonts\n\n## Task segments\n\n- [[${P} — part 1|part 1 — cut the trailer from the script]]\n- [[${P} — part 2|part 2 — now add the voice track please]]\n- [[${P} — part 3|part 3 — export it for the web as mp4]]\n\n## Account switches`), main);
@@ -1628,7 +1635,9 @@ test('brain units: scan and extract run per unit on its own note; a run that mat
   assert.deepEqual([r.gated, r.want_skill, r.refine, r.skill, r.pre], [true, true, undefined, 'deploy-worker', { tool_calls: 10, files: 0, commands: 10 }]);
   assert.deepEqual(b.calls(), [`classifier haiku ${TAG}`, `writer sonnet ${TAG}`]);
   const state = readFileSync(`${b.tmp}/prompt.classifier`, 'utf8').split('Session note:\n')[1];
-  assert.ok(state.startsWith('# Render video a\n') && state.includes('## Brief\n\n- Brief a: render the video\n\n## Commands that worked\n\n- `ffmpeg -i in.mp4 step-0`') && !state.includes('wrangler'), state);
+  // the gate reads the unit's Brief, the head of its minimal trace (ten runs of one command family are one step) and its Final report, no longer the note's command lists
+  assert.match(state, /^# Render video a\n\n## Brief\n\n- Brief a: render the video\n\n## Trace — Render video a \(subagent\) · 10 steps → 1 after pruning\n1\. Prompt: Brief a: render the video\n   1\. Bash `ffmpeg -i in\.mp4 step-9` — ok, runs: 10(, \d+ ms)?\n\n## Final report\n\n—$/);
+  assert.ok(!state.includes('Commands that worked') && !state.includes('wrangler') && !state.includes('step-0'), state);
   assert.match(readFileSync(`${b.tmp}/prompt.writer`, 'utf8'), /The classifier found a repeatable skill[\s\S]*End with a short "## Verify" step\. Never invent a step[\s\S]*"want_skill":true,"existing_skills":\[\],"run":"# Render video a\\n/);
   assert.match(b.read(`wiki/logs/${N('a')}.md`), /## Distilled\n\nDeployed the worker\.[\s\S]*Skill candidate: \[\[skills\/deploy-worker\|deploy-worker\]\]\n<!-- agent-router:end distilled -->/);
 
@@ -1758,6 +1767,270 @@ test('ui.html: the Pipeline nests a session\'s units, the Graph has a Subagents 
   const ldiff = new Function(`${page.slice(page.indexOf('// diff:begin'), page.indexOf('// diff:end'))}; return ldiff;`)() as (a: string, b: string) => [string, string][];
   assert.deepEqual(ldiff('a\nb\nc\nd', 'a\nc\nx\nd').map(([m, l]) => m + l), ['  a', '- b', '  c', '+ x', '  d']);
   assert.deepEqual([ldiff('same', 'same'), ldiff('old', 'new').map(([m]) => m).sort()], [[['  ', 'same']], ['+ ', '- ']]);
+});
+
+// ---- agent trace (docs/BRAIN.md "Trace"): a run tree per unit from the transcripts and the ledger; a deterministic minimal version; the brain's writer reads that ----
+const T0 = Date.now() - 600_000;
+// a transcript row moved to ms after T0
+const at = (ms: number, row: string) => row.replace(/"timestamp":"[^"]*"/, `"timestamp":"${new Date(T0 + ms).toISOString()}"`);
+// a tool_result row; its output is a recognisable string that must never reach a trace
+const res = (sk: string, id: string, ms: number, chars: number, err = false) => at(ms, jrow(sk, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: `OUT${'y'.repeat(chars)}`, ...(err && { is_error: true }) }] } }));
+const TRACE_SECRET = 'sk-ant-api03-SECRETSECRETSECRET';
+const CURL = `curl -H "Authorization: Bearer ${TRACE_SECRET}" https://tts.example.com/speak?token=abc ${'-v '.repeat(60)}`;
+const CURL_TARGET = 'curl -H "Authorization: [redacted]" https://tts.example.com/speak?token=[redacted] '.concat('-v '.repeat(60)).replace(/\s+/g, ' ').trim().slice(0, 120);
+// One session: a prompt, ten routed requests (model calls) and the tool calls between them: a failing Bash and one that never returned (both of families that
+// later succeed), a command with a secret, four read-only calls in a row, two writes to one file, an Agent call whose subagent transcript runs one command twice.
+// Model calls end at fixed times in the ledger; tools and the subagent have the transcript's times.
+async function traced(t: TestContext) {
+  const b = await brainSetup(t), sk = 'tt', rid: Record<string, string> = {}, end: Record<string, number> = { A: 950, B: 2350, C: 4950, D: 6950, D2: 7950, E: 9450, F: 9950, G: 29900, S1: 10950, S2: 12950 };
+  b.s.usage = B_USAGE; // each model call: $0.825 on Haiku 4.5
+  for (const k in end) { await b.msg(sk, { model: 'claude-haiku-4-5' }); rid[k] = `req_${b.s.n}`; }
+  b.s.usage = null;
+  await until(async () => (await b.rows('select count(*) n from requests'))[0].n === 10, 'every request logged');
+  const wdb = new DatabaseSync(b.ledger, { timeout: 2000 });
+  t.after(() => wdb.close());
+  for (const k in end) wdb.prepare('update requests set ts = ?, latency_ms = 800 where request_id = ?').run(T0 + end[k], rid[k]);
+  const r = rid, main = [
+    at(0, jrow(sk, { type: 'user', message: { role: 'user', content: 'build the trailer from the script' } })),
+    at(1000, tuse(sk, r.A, 't1', 'Bash', { command: 'ffmpeg -i bad.mp4 out.mp4' })), res(sk, 't1', 2000, 30, true),
+    at(2400, tuse(sk, r.B, 't0', 'Bash', { command: 'npm run lint' })), // never returned
+    at(2500, tuse(sk, r.B, 't2', 'Bash', { command: CURL })), res(sk, 't2', 4500, 10),
+    at(5000, tuse(sk, r.C, 't3', 'Read', { file_path: '/tmp/proj-x/a.txt' })), at(5010, tuse(sk, r.C, 't4', 'Grep', { pattern: 'foo' })),
+    at(5020, tuse(sk, r.C, 't5', 'Read', { file_path: '/tmp/proj-x/b.txt' })), at(5030, tuse(sk, r.C, 't6', 'Bash', { command: 'ls src' })),
+    res(sk, 't3', 5100, 400), res(sk, 't4', 5110, 40), res(sk, 't5', 5120, 4000), res(sk, 't6', 5130, 80),
+    at(7000, tuse(sk, r.D, 't7', 'Write', { file_path: '/tmp/proj-x/render.js', content: 'FILE-BODY' })), res(sk, 't7', 7100, 5),
+    at(8000, tuse(sk, r.D2, 't8', 'Edit', { file_path: '/tmp/proj-x/render.js', old_string: 'OLD-TEXT', new_string: 'NEW-TEXT' })),
+    at(8010, tuse(sk, r.D2, 't9', 'Write', { file_path: '/tmp/proj-x/other.txt', content: 'x' })), res(sk, 't8', 8100, 5), res(sk, 't9', 8110, 5),
+    at(9500, tuse(sk, r.E, 't10', 'Bash', { command: 'npm run lint' })), res(sk, 't10', 9700, 5),
+    at(10000, tuse(sk, r.F, 't11', 'Agent', { description: 'Render the stills', subagent_type: 'general-purpose', prompt: 'SECRET-PROMPT-TEXT render everything' })),
+    at(10100, jrow(sk, { type: 'user', toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'ag1' }, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't11', content: 'Async agent launched. agentId: ag1' }] } })),
+    at(30000, arow(r.G, { in: 10, read: 0, create: 100 }, [{ type: 'text', text: 'Trailer built, report written.' }], sk))].join('');
+  const sub = [at(10500, jrow(sk, { type: 'user', message: { role: 'user', content: 'Brief ag1: render the stills' } })),
+    at(11000, tuse(sk, r.S1, 's1', 'Bash', { command: 'node render.js stills' })), res(sk, 's1', 12000, 20),
+    at(13000, tuse(sk, r.S2, 's2', 'Bash', { command: 'node render.js stills full' })), res(sk, 's2', 14000, 20)].join('').replace(/^\{/gm, '{"isSidechain":true,');
+  const f = `${b.proj}/-tmp-proj-x/${sk}`;
+  mkdirSync(`${f}/subagents`, { recursive: true });
+  writeFileSync(`${f}.jsonl`, main);
+  writeFileSync(`${f}/subagents/agent-ag1.jsonl`, sub);
+  await until(async () => (await b.rows('select count(*) n from requests where session_key = ? and jsonl_path is not null', sk))[0].n === 10, 'every request joined');
+  return { ...b, rid, get: (q: string) => b.call('GET', `trace?${q}`), ids: (x: any) => x.spans.map((s: any) => s.id) };
+}
+
+test('agent trace: the run tree of a session from its transcripts and the ledger: order, durations, ok flags, dollars, a subagent under its Agent call, secret scrubbed, no tool output', async (t) => {
+  const b = await traced(t), [status, tr] = await b.get('unit=tt&mode=full'), R = b.rid;
+  assert.equal(status, 200);
+  const sp = Object.fromEntries(tr.spans.map((s: any) => [s.id, s]));
+  // the tree, in order: the prompt; under it each model call and the tool calls it led to; the Agent call owns its subagent's spans
+  assert.deepEqual(tr.spans.map((s: any) => [s.id, s.parent, s.kind]), [['p1', null, 'prompt'], [R.A, 'p1', 'model'], ['t1', 'p1', 'tool'], [R.B, 'p1', 'model'], ['t0', 'p1', 'tool'], ['t2', 'p1', 'tool'], [R.C, 'p1', 'model'],
+    ['t3', 'p1', 'tool'], ['t4', 'p1', 'tool'], ['t5', 'p1', 'tool'], ['t6', 'p1', 'tool'], [R.D, 'p1', 'model'], ['t7', 'p1', 'tool'], [R.D2, 'p1', 'model'], ['t8', 'p1', 'tool'], ['t9', 'p1', 'tool'], [R.E, 'p1', 'model'],
+    ['t10', 'p1', 'tool'], [R.F, 'p1', 'model'], ['t11', 'p1', 'subagent'], ['ag1/p1', 't11', 'prompt'], [R.S1, 'ag1/p1', 'model'], ['s1', 'ag1/p1', 'tool'], [R.S2, 'ag1/p1', 'model'], ['s2', 'ag1/p1', 'tool'], [R.G, 'p1', 'model']]);
+  assert.deepEqual([tr.unit_id, tr.kind, tr.mode, tr.title, tr.counts], ['tt', 'session', 'full', 'build the trailer from the script', { steps: 14, tool_calls: 13, failed: 1, subagents: 1, models: 10 }]);
+  assert.deepEqual([sp.p1.name, sp.p1.n_children, sp.t11.n_children, sp.t11.name, sp['ag1/p1'].name, sp['ag1/p1'].n_children], ['build the trailer from the script', 20, 1, 'Render the stills', 'Brief ag1: render the stills', 4]);
+  // tools: tool_use to its tool_result; no result is no ok and no duration; a failing call is ok = false
+  assert.deepEqual([sp.t1, sp.t2, sp.t0].map((s: any) => [s.name, s.ms, s.ok]), [['Bash', 1000, false], ['Bash', 2000, true], ['Bash', null, null]]);
+  assert.deepEqual([sp.t1.t0, sp.t1.t1].map((x: number) => x - T0), [1000, 2000]);
+  assert.deepEqual(['t3', 't4', 't5', 't6'].map((k) => [sp[k].target, sp[k].out_tokens_est]), [['a.txt', 101], ['foo', 11], ['b.txt', 1001], ['ls src', 21]], 'targets are short and relative to the cwd; the result size is chars / 4');
+  assert.deepEqual([sp.t8.target, sp.t11.target], ['render.js', ''], 'an edit keeps its path, never its text');
+  // a subagent: first to last row of its own transcript; a model call: the ledger's latency and dollars; containers add up what is beneath them
+  assert.deepEqual([sp.t11.kind, sp.t11.t0 - T0, sp.t11.t1 - T0, sp.t11.ms, sp.t11.ok], ['subagent', 10500, 14000, 3500, true]);
+  assert.deepEqual([sp[R.A].ms, sp[R.A].t1 - T0, sp[R.A].t0 - T0, sp[R.A].ok, sp[R.A].name, sp[R.A].tokens], [800, 950, 150, true, 'claude-haiku-4-5', { in: 100000, out: 20000, cache_read: 1000000, cache_create: 300000 }]);
+  close(sp[R.A].usd, B_USD); close(sp.t11.usd, 2 * B_USD, 'the subagent: its two model calls'); close(sp.p1.usd, 10 * B_USD, 'the prompt: everything beneath it'); close(tr.usd, 10 * B_USD);
+  assert.deepEqual(tr.tokens, { in: 1e6, out: 2e5, cache_read: 1e7, cache_create: 3e6 });
+  assert.deepEqual([tr.started - T0, tr.ended - T0], [0, 29900], 'the unit\'s own time axis');
+  // the command target is scrubbed and cut; no tool input beyond a target, no tool output, no prompt text anywhere
+  assert.equal(sp.t2.target, CURL_TARGET);
+  const all = JSON.stringify(tr);
+  for (const x of [TRACE_SECRET, 'OUTyyy', 'FILE-BODY', 'OLD-TEXT', 'NEW-TEXT', 'SECRET-PROMPT-TEXT', 'Async agent launched']) assert.ok(!all.includes(x), `${x} in the trace`);
+  // the same transcript is a run of its own; nothing of a trace is stored in the ledger
+  const [, own] = await b.get('unit=tt/ag1&mode=full');
+  assert.deepEqual([own.kind, own.title, own.counts.steps, b.ids(own)], ['subagent', 'Brief ag1: render the stills', 2, ['ag1/p1', R.S1, 's1', R.S2, 's2']]);
+  assert.deepEqual(await b.rows(`select name from sqlite_master where name like '%trace%'`), []);
+  b.noLeak();
+});
+
+test('agent trace: minimal() applies its rules in order with exact counts; lazy loading, the Markdown outline, the download header', async (t) => {
+  const b = await traced(t), R = b.rid, [, m] = await b.get('unit=tt&mode=minimal');
+  // 1 drops the failed Bash and the unanswered `npm run lint` that a later success supersedes · 2 collapses the four reads into one span with the three largest targets ·
+  // 3 keeps the last write to render.js · 4 keeps the last of the two `node render.js` runs · 5 keeps the prompts, the subagent and each scope's last model call
+  assert.deepEqual(m.pruned, { failed_or_superseded: 2, collapsed: 4, collapsed_into: 1, overwritten_writes: 1, repeated_commands: 1, model_calls: 8 });
+  assert.deepEqual(b.ids(m), ['p1', 't2', 't3', 't8', 't9', 't10', 't11', 'ag1/p1', R.S2, 's2', R.G]);
+  assert.deepEqual([m.mode, m.counts, m.full], ['minimal', { steps: 7, tool_calls: 6, failed: 0, subagents: 1, models: 2 }, { steps: 14, tool_calls: 13, failed: 1, subagents: 1, models: 10 }], '14 steps, 7 kept: 2 + 3 + 1 + 1 dropped');
+  const sp = Object.fromEntries(m.spans.map((s: any) => [s.id, s]));
+  assert.deepEqual([sp.t3.name, sp.t3.target, sp.t3.out_tokens_est, sp.t3.ms], ['explored 4 files', 'b.txt, a.txt, ls src', 101 + 11 + 1001 + 21, 130]);
+  assert.deepEqual([sp.t8.name, sp.t8.edits, sp.s2.runs, sp.t2.runs, sp.p1.n_children, sp.t11.n_children, sp['ag1/p1'].n_children], ['Edit', 2, 2, undefined, 7, 1, 2]);
+  close(m.usd, 10 * B_USD, 'pruning keeps the unit\'s real totals');
+  const [, one] = await b.get('unit=tt/ag1&mode=minimal');
+  assert.deepEqual([one.counts.steps, one.full.steps, one.pruned], [1, 2, { repeated_commands: 1, model_calls: 1 }]);
+  // lazy loading: the top level with n_children, then one span's children
+  const [, top] = await b.get('unit=tt&mode=full&depth=1');
+  assert.deepEqual([top.spans.map((s: any) => [s.id, s.n_children]), top.counts.steps], [[['p1', 20]], 14]);
+  assert.deepEqual((await b.get('unit=tt&mode=full&parent=t11'))[1].spans.map((s: any) => [s.id, s.n_children]), [['ag1/p1', 4]]);
+  assert.deepEqual(b.ids((await b.get(`unit=tt&mode=full&parent=${encodeURIComponent('ag1/p1')}`))[1]), [R.S1, 's1', R.S2, 's2']);
+  assert.deepEqual(b.ids((await b.get('unit=tt&mode=minimal&parent=p1'))[1]), ['t2', 't3', 't8', 't9', 't10', 't11', R.G]);
+  // ids are validated, an unknown unit is a 404, meta is just last_ts, the download names its file
+  assert.deepEqual([(await b.get('unit=..%2Fetc'))[0], (await b.get('unit='))[0], (await b.get('unit=nope'))[0], (await b.get('unit=tt/nope'))[0]], [400, 400, 404, 404]);
+  const [, meta] = await b.get('unit=tt&meta=1');
+  assert.deepEqual([Object.keys(meta), meta.last_ts > T0], [['unit_id', 'last_ts'], true]);
+  const dl = await fetch(`${b.base}/router/brain/trace?unit=tt&mode=minimal&download=1`);
+  assert.deepEqual([dl.status, dl.headers.get('content-disposition'), (await dl.json()).mode], [200, 'attachment; filename="trace-tt-minimal.json"', 'minimal']);
+  // the outline: numbered steps (tool, target, outcome, duration), a subagent as a nested list, the pruned steps absent
+  const r = await fetch(`${b.base}/router/brain/trace.md?unit=tt`), text = await r.text();
+  assert.deepEqual([r.status, r.headers.get('content-type')], [200, 'text/markdown; charset=utf-8']);
+  assert.equal(text, ['## Trace — build the trailer from the script (session) · 14 steps → 7 after pruning', '1. Prompt: build the trailer from the script', `   1. Bash \`${CURL_TARGET}\` — ok, 2.0 s`,
+    '   2. explored 4 files: b.txt, a.txt, ls src', '   3. Edit `render.js` — ok, edits: 2, 100 ms', '   4. Write `other.txt` — ok, 100 ms', '   5. Bash `npm run lint` — ok, 200 ms', '   6. Subagent: Render the stills — 1 step, 3.5 s',
+    '      1. Prompt: Brief ag1: render the stills', '         1. Bash `node render.js stills full` — ok, runs: 2, 1.0 s', ''].join('\n'));
+  for (const x of ['bad.mp4', 'failed', 'node render.js stills`', 'FILE-BODY', 'OUTyyy', TRACE_SECRET]) assert.ok(!text.includes(x), `${x} in the outline`);
+  b.noLeak();
+});
+
+test('agent trace: each rule of minimal() on its own; md() keeps prompts, subagents and writes and trims explored spans first', async () => {
+  await arith(); // LEDGER_PATH to a temp ledger before trace.ts (which imports the ledger) is loaded
+  const { md, minimal } = await import('./trace.ts');
+  let n = 0;
+  const span = (kind: string, name: string, target = '', o: any = {}) => ({ id: `s${++n}`, parent: 'p', kind, name, target, t0: n * 10, t1: n * 10 + 5, ms: 5, ok: true, n_children: 0, ...o });
+  const tr = (spans: any[]) => ({ unit_id: 'u', title: 'T', kind: 'subagent', mode: 'full', started: 0, ended: 1e4, usd: 1, lim: '', last_ts: 1, tokens: { in: 0, out: 0, cache_read: 0, cache_create: 0 },
+    counts: { steps: 0, tool_calls: 0, failed: 0, subagents: 0, models: 0 }, spans: [span('prompt', 'do it', '', { id: 'p', parent: null }), ...spans] }) as any;
+  const run = (spans: any[]) => minimal(tr(spans));
+  // 1: a failed call goes; an unanswered one goes when a later success of its family supersedes it, and stays when nothing does
+  let m = run([span('tool', 'Bash', 'make build', { ok: false }), span('tool', 'Bash', 'make test', { ok: null }), span('tool', 'Bash', 'make test --fast'), span('tool', 'Bash', 'make lint', { ok: null }), span('tool', 'Edit', 'a.js', { ok: false })]);
+  assert.deepEqual([m.pruned, m.spans.slice(1).map((s: any) => s.target)], [{ failed_or_superseded: 3 }, ['make test --fast', 'make lint']]);
+  // 2: a run of two or more read-only calls is one span; Bash that only looks (ls, cat, head, grep, find) counts, Bash that runs something or redirects breaks the run; a lone read stays
+  m = run([span('tool', 'Read', 'a'), span('tool', 'Bash', 'ls -la src'), span('tool', 'Grep', 'x'), span('tool', 'Bash', 'npm test'), span('tool', 'Read', 'b'), span('tool', 'Bash', 'cat f > g'),
+    span('tool', 'WebFetch', 'h/x'), span('tool', 'Glob', '*.ts'), span('model', 'm')]);
+  assert.deepEqual([m.pruned, m.spans.slice(1).map((s: any) => s.name)], [{ collapsed: 5, collapsed_into: 2 }, ['explored 3 files', 'Bash', 'Read', 'Bash', 'explored 2 files', 'm']]);
+  // 3: of the writes to one path the last, with its count; another path is its own
+  m = run([span('tool', 'Write', 'a.js'), span('tool', 'Edit', 'a.js'), span('tool', 'Write', 'b.js'), span('tool', 'Edit', 'a.js')]);
+  assert.deepEqual([m.pruned, m.spans.slice(1).map((s: any) => [s.name, s.target, s.edits])], [{ overwritten_writes: 2 }, [['Write', 'b.js', undefined], ['Edit', 'a.js', 3]]]);
+  // 4: of the successful commands of one family the last, with its count; the family is the executable and the first argument, after `cd … &&` and VAR=…
+  m = run([span('tool', 'Bash', 'cd /x && npm run build'), span('tool', 'Bash', 'npm run deploy'), span('tool', 'Bash', 'git status'), span('tool', 'Bash', 'FOO=1 npm run build --prod')]);
+  assert.deepEqual([m.pruned, m.spans.slice(1).map((s: any) => [s.target, s.runs])], [{ repeated_commands: 2 }, [['git status', undefined], ['FOO=1 npm run build --prod', 3]]]);
+  // 5: a subagent keeps its place and is pruned on its own; each scope keeps its last model call and drops the others
+  m = run([span('model', 'a'), span('tool', 'Bash', 'x one'), span('tool', 'Agent', 'run', { kind: 'subagent', name: 'sub', id: 'sa' }), span('model', 'b'),
+    span('model', 'c', '', { parent: 'sa' }), span('tool', 'Bash', 'y one', { parent: 'sa' }), span('tool', 'Bash', 'y one', { parent: 'sa' }), span('model', 'd', '', { parent: 'sa' })]);
+  assert.deepEqual([m.pruned, m.spans.map((s: any) => [s.kind, s.name, s.parent])], [{ repeated_commands: 1, model_calls: 2 }, [['prompt', 'do it', null], ['tool', 'Bash', 'p'], ['subagent', 'sub', 'p'], ['tool', 'Bash', 'sa'], ['model', 'd', 'sa'], ['model', 'b', 'p']]]);
+  // md: over the cap the explored spans (oldest first) go before anything else; then the other steps; prompts, subagents and writes always stay
+  const long = [...Array.from({ length: 300 }, (_, i) => span('tool', `explored ${i} files`, `dir/${i}/${'x'.repeat(90)}`)), ...Array.from({ length: 20 }, (_, i) => span('tool', 'Write', `out-${i}.txt`)),
+    ...Array.from({ length: 40 }, (_, i) => span('tool', 'Bash', `tool${i} run`)), span('tool', 'Agent', 'run', { kind: 'subagent', name: 'sub' })];
+  const whole = md(tr(long), 1e9), cut = md(tr(long), 8000), tight = md(tr(long), 1500);
+  assert.ok(whole.length > 40_000 && cut.length < 8200 && tight.length < 1700, `${whole.length} ${cut.length} ${tight.length}`);
+  const lines = (x: string, re: RegExp) => x.split('\n').filter((l) => re.test(l)).length;
+  assert.deepEqual([lines(cut, /Write/), lines(cut, /Bash/), lines(cut, /Subagent/), lines(cut, /Prompt/)], [20, 40, 1, 1], 'explored spans alone were trimmed');
+  assert.ok(/explored 0 files/.test(whole) && !/explored 0 files/.test(cut) && /explored 299 files/.test(cut), 'the oldest explored spans go first');
+  assert.match(cut.split('\n')[0], /; \d+ more left out to fit$/);
+  assert.deepEqual([lines(tight, /explored/), lines(tight, /Write/), lines(tight, /Subagent/), lines(tight, /Prompt/), lines(tight, /Bash/) < 40], [0, 20, 1, 1, true], 'then the other steps, never writes, subagents or prompts');
+});
+
+test('brain distill from the trace: the gate reads the head of a unit\'s minimal trace, the writer all of it; the failed command is in neither, the commands that worked are', async (t) => {
+  const b = await brainSetup(t), TAG = 'x-agent-router-source: brain';
+  await b.session('w1', (rid) => worked('w1', rid, 2));
+  // 59 tool calls: one that failed, eight distinct commands that worked, fifty writes to fifty files
+  await subrun(b, 'w1', 'a', 'Render everything', tuse('w1', 'req_none', 'wf', 'Bash', { command: 'ffmpeg -i NOPE-FAILED.mp4 out.mp4' }) + tres('w1', 'wf', true)
+    + okcmds('w1', 'req_none', 'wk', 8, (i) => `tool${i} run --input data-${i}.csv`)
+    + Array.from({ length: 50 }, (_, i) => tuse('w1', 'req_none', `ww${i}`, 'Write', { file_path: `/tmp/proj-x/out-${i}.txt`, content: 'x' }) + tres('w1', `ww${i}`)).join(''));
+  assert.equal((await b.call('POST', 'capture', {}))[1].units, 1);
+  assert.equal((await b.call('POST', 'scan', { session: 'w1/a' }))[1].gated, true);
+  const gate = readFileSync(`${b.tmp}/prompt.classifier`, 'utf8').split('Session note:\n')[1];
+  assert.match(gate, /^# Render everything\n\n## Brief\n\n- Brief a: render the video\n\n## Trace — Render everything \(subagent\) · 59 steps → 58 after pruning\n1\. Prompt: Brief a: render the video\n   1\. Bash `tool0 run --input data-0\.csv` — ok/);
+  assert.ok(gate.includes('Write `out-29.txt`') && !gate.includes('out-30.txt') && gate.endsWith('\n\n## Final report\n\n—'), 'the first 40 lines of the outline, then the final report');
+  assert.ok(!gate.includes('NOPE-FAILED'));
+  assert.equal((await b.call('POST', 'distill', { session: 'w1/a' }))[1].distilled, true);
+  assert.deepEqual(b.calls(), [`classifier haiku ${TAG}`, `writer sonnet ${TAG}`], 'the stored scan was used');
+  const asked = readFileSync(`${b.tmp}/prompt.writer`, 'utf8'), input = JSON.parse(asked.slice(asked.lastIndexOf('\n\n{"title":') + 2));
+  assert.deepEqual(Object.keys(input), ['title', 'project', 'want_skill', 'existing_skills', 'run'], 'the writer\'s input and output schema are unchanged');
+  assert.match(input.run, /^# Render everything\n\n## Brief\n\n- Brief a: render the video\n\n## Trace — Render everything \(subagent\) · 59 steps → 58 after pruning\n1\. Prompt: [^\n]*\n   1\. Bash `tool0 run --input data-0\.csv`/);
+  for (const x of ['tool7 run --input data-7.csv', 'Write `out-0.txt`', 'Write `out-49.txt`']) assert.ok(input.run.includes(x), `${x} missing from the writer's input`);
+  assert.ok(!asked.includes('NOPE-FAILED') && !input.run.includes('Commands that worked') && !input.run.includes('Files written'), 'the failed command is pruned away; the note\'s own listings are not sent');
+  assert.equal(input.run.split('\n').length, 70, 'title, Brief, the outline (a header, the prompt, 58 steps) and the final report: every surviving step is one line');
+  b.noLeak();
+});
+
+test('brain cap: a scan-all that stops at the daily cap says how many units are left; Resume (the same call, limited to them) finishes once the cap allows', async (t) => {
+  const b = await brainSetup(t), pipe = async () => (await b.call('GET', 'pipeline'))[1];
+  for (const sk of ['r1', 'r2', 'r3']) await b.session(sk, (rid) => worked(sk, rid));
+  await b.call('POST', 'capture', {});
+  await b.put({ brain_daily_usd: 0.5 });
+  writeFileSync(`${b.tmp}/hold`, '');
+  assert.equal((await b.call('POST', 'scan-all', {}))[0], 202);
+  await until(() => b.calls().length === 1, 'first scan started');
+  b.s.usage = B_USAGE; // $0.825 of brain spend while it runs: over the cap
+  await b.msg('own', { model: 'claude-haiku-4-5' }, { 'x-agent-router-source': 'brain' });
+  await until(async () => (await pipe()).cap.spent_usd > 0.5, 'brain spend logged');
+  rmSync(`${b.tmp}/hold`);
+  let p = await until(async () => { const x = await pipe(); return !x.running && x; }, 'stopped at the cap');
+  assert.deepEqual([p.stopped, p.todo.scan.count, p.stages[1].count], [{ kind: 'scan', left: 2 }, 2, 1]);
+  assert.deepEqual(await b.call('POST', 'scan-all', { limit: 2 }), [409, { error: { type: 'brain_over_cap' } }], 'Resume before the cap allows is refused');
+  assert.deepEqual((await pipe()).stopped, { kind: 'scan', left: 2 }, 'and leaves what is left as it was');
+  await b.put({ brain_daily_usd: 100 });
+  const [s, r] = await b.call('POST', 'scan-all', { limit: p.stopped.left });
+  assert.deepEqual([s, r.kind, r.total], [202, 'scan', 2]);
+  p = await until(async () => { const x = await pipe(); return !x.running && x; }, 'resumed');
+  assert.deepEqual([p.stopped, p.todo.scan.count, p.stages[1].count], [null, 0, 3]);
+  assert.equal(b.calls().length, 3, 'one classifier call per unit, none repeated');
+  b.noLeak();
+});
+
+test('brain matches: the built-in recall skill and a promoted skill whose directory lost its marker are never offered to the gate; a scan that names one still gets a new skill, not an update', async (t) => {
+  const b = await brainSetup(t), asked = () => JSON.parse(readFileSync(`${b.tmp}/prompt.classifier`, 'utf8').split('Questions:\n')[1].split('\n\nSession note:')[0]);
+  await b.session('m1', (rid) => worked('m1', rid, 2));
+  for (const id of ['a', 'b', 'c', 'd']) await subrun(b, 'm1', id, `Render ${id}`, okcmds('m1', 'req_none', id, 10));
+  await b.call('POST', 'capture', {});
+  assert.equal((await b.call('POST', 'recall'))[0], 200); // the built-in `brain` skill: promoted, source 'builtin', with the marker
+  const brain = b.read('skills/candidates/brain/SKILL.md'), upd = async () => (await b.rows(`select name, update_ts from brain_skills where update_ts is not null`));
+  // only the built-in skill exists: there is nothing to match, so no `matches` question, and an answer naming `brain` is not a gate to refine it
+  writeFileSync(`${b.tmp}/classifier.json`, matchJson('brain', 0.9));
+  let g = (await b.call('POST', 'scan', { session: 'm1/a' }))[1];
+  assert.deepEqual([Object.keys(asked()), g.want_skill, g.refine], [['reusable', 'kind'], true, undefined]);
+  assert.equal((await b.call('POST', 'distill', { session: 'm1/a' }))[1].skill, 'deploy-worker');
+  // now one skill of the brain's own exists: it is offered, the recall skill is not
+  g = (await b.call('POST', 'scan', { session: 'm1/b' }))[1];
+  assert.deepEqual(Object.keys(asked().matches.criteria), ['deploy-worker', 'new']);
+  // a stored scan from before this rule that names `brain`: refine mode is refused, the writer is asked for a new skill
+  const wdb = new DatabaseSync(b.ledger, { timeout: 2000 });
+  t.after(() => wdb.close());
+  wdb.prepare(`update brain_sessions set gate_json = ?, gated_ts = ? where session_key = 'm1/c'`).run(JSON.stringify({ pre: g.pre, answers: g.answers, gated: true, backend: 'model', want_skill: false, refine: 'brain' }), Date.now() + 3600e3);
+  writeFileSync(`${b.tmp}/writer.json`, JSON.stringify({ ...WRITER, skill: { ...WRITER.skill, name: 'other-skill' } }));
+  const r = (await b.call('POST', 'distill', { session: 'm1/c' }))[1];
+  assert.deepEqual([r.skill, r.refined, r.refine, r.want_skill], ['other-skill', undefined, undefined, true]);
+  assert.ok(!readFileSync(`${b.tmp}/prompt.writer`, 'utf8').includes('existing_skill"'), 'create mode');
+  assert.deepEqual([b.read('skills/candidates/brain/SKILL.md') === brain, await upd(), (await b.rows(`select skill, unit_id, mode from skill_sources where skill = 'other-skill'`)).map((x) => [x.unit_id, x.mode])], [true, [], [['m1/c', 'create']]]);
+  // a promoted skill whose directory no longer carries our marker is somebody else's now
+  assert.equal((await b.call('POST', 'skills/deploy-worker/promote'))[0], 200);
+  rmSync(`${b.skills}/deploy-worker/.agent-router`);
+  await b.call('POST', 'scan', { session: 'm1/d' });
+  assert.deepEqual(Object.keys(asked().matches.criteria), ['other-skill', 'new']);
+  b.noLeak();
+});
+
+test('health.build is a short hash of ui.html: it changes when the file does, and the served page carries it', async (t) => {
+  const { base, ledger } = await startRouter(t, { ...(await fakeUpstream(t, sse([]))), LEDGER_PATH: undefined as any });
+  const src = `${dirname(dirname(ledger))}/src`, build = async () => (await (await fetch(`${base}/router/health`)).json()).build, page = async () => (await fetch(`${base}/router/ui`)).text();
+  const a = await build();
+  assert.match(a, /^[0-9a-f]{8}$/);
+  assert.ok((await page()).includes(`const BUILD = '${a}';`), 'the page remembers the build it was served with');
+  appendFileSync(`${src}/ui.html`, '\n<!-- a new version -->\n');
+  const b = await build();
+  assert.notEqual(b, a);
+  assert.deepEqual([await build(), (await page()).includes(`const BUILD = '${b}';`)], [b, true], 'stable while the file is, and the next page load carries the new one');
+});
+
+test('ui.html: the Trace view (tree of open spans on a waterfall, lazy children, search, keys), the stale-console reload, Resume after the cap', () => {
+  const page = readFileSync(new URL('./ui.html', import.meta.url), 'utf8');
+  for (const x of ["['trace', 'Trace']", 'brainTrace(t)', 'data-tropen=', 'data-tmode=', 'Copy as Markdown', 'Download JSON', 'Distill from this trace', 'role="tree"', 'id="tq"', 'Open trace →', 'alt-click a subagent or segment',
+    "ui.bview === 'trace' ? data[1] : data", "const BUILD = '__BUILD__'", 'New version — reload', 'if (stale && !busy) return location.reload()', 'Resume (${sp.left} left)', 'data-limit="${sp.left}"', "k === 'ArrowRight'"])
+    assert.ok(page.includes(x), `ui.html lacks ${x}`);
+  assert.ok(!page.includes('e.target.id ===') && page.split('__BUILD__').length === 2, 'no form.id read; the build placeholder appears once, as the router replaces only the first');
+  const { tvisible, tfmt } = new Function(`${page.slice(page.indexOf('// trace:begin'), page.indexOf('// trace:end'))}; return { tvisible, tfmt };`)() as { tvisible: (k: Map<string, any[]>, open: Set<string>, q?: string) => { s: any; d: number; open: boolean }[]; tfmt: (ms: number | null) => string };
+  // 30 prompts of 49 steps each: 1,500 spans. Only open rows are listed; a closed span hides its children; a search lists matches and their ancestors, opened
+  const kids = new Map<string, any[]>([['', Array.from({ length: 30 }, (_, i) => ({ id: `p${i}`, name: `prompt ${i}`, target: '', n_children: 49 }))]]);
+  for (let i = 0; i < 30; i++) kids.set(`p${i}`, Array.from({ length: 49 }, (_, j) => ({ id: `p${i}.${j}`, name: j % 2 ? 'Bash' : 'Read', target: `step-${i}-${j}`, n_children: 0 })));
+  let t0 = performance.now();
+  const closed = tvisible(kids, new Set()), some = tvisible(kids, new Set(['p3', 'p29'])), found = tvisible(kids, new Set(), 'step-7-1');
+  assert.deepEqual([closed.length, some.length, some[4].s.id, some[4].d, some[4].open], [30, 30 + 98, 'p3.0', 1, false]);
+  assert.deepEqual(found.map((r) => [r.s.id, r.d, r.open]), [['p7', 0, true], ...['p7.1', ...Array.from({ length: 10 }, (_, i) => `p7.${10 + i}`)].map((id) => [id, 1, false])], 'step-7-1 and step-7-10…19, under their prompt');
+  const all = tvisible(kids, new Set(Array.from({ length: 30 }, (_, i) => `p${i}`)));
+  assert.equal(all.length, 1500);
+  assert.ok(performance.now() - t0 < 500, `1,500 spans listed in ${(performance.now() - t0).toFixed(0)} ms`);
+  assert.deepEqual([tfmt(null), tfmt(40), tfmt(1500), tfmt(125_000)], ['', '40 ms', '1.5 s', '2m 5s']);
 });
 
 // ---- limits as the unit, keep warm, tool loading advisor, facts switch (docs/COST-INSIGHTS.md "Next") ----

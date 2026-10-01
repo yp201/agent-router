@@ -53,8 +53,9 @@ async function dial(opts: Record<string, any>, body: Buffer | undefined, retry =
 const RL = 'anthropic-ratelimit-unified-';
 let dumped = 0;
 
-const json = (res: ServerResponse, status: number, body: unknown) =>
-  res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+// `more` with a content-type: `body` is that text, as is (the brain's trace.md); without one it is JSON, plus any other headers
+const json = (res: ServerResponse, status: number, body: unknown, more?: Record<string, string>) =>
+  res.writeHead(status, { 'content-type': 'application/json', ...more }).end(more?.['content-type'] ? (body as string) : JSON.stringify(body));
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
 const migrate = (...r: any[]) => db.prepare('insert into migrations (ts, session_key, from_account, to_account, est_cost_tokens, request_id, reason) values (?, ?, ?, ?, ?, ?, ?)').run(...r);
@@ -472,6 +473,9 @@ const accountsView = () => {
   });
 };
 
+// the console page as served, and its build: a short hash of ui.html's bytes. The page remembers the build it was served with (the __BUILD__ placeholder) and
+// reloads itself when /router/health reports another one, so a restart with a new ui.html never leaves a stale console open.
+const page = () => { const raw = readFileSync(`${import.meta.dirname}/ui.html`, 'utf8'), build = h16(raw).slice(0, 8); return { build, html: raw.replace('__BUILD__', build) }; };
 async function api(req: IncomingMessage, res: ServerResponse, path: string, body: Buffer) {
   const url = new URL(req.url!, 'http://x');
   const [, , what = '', id, action] = path.split('/').map(decodeURIComponent);
@@ -479,9 +483,9 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
   let input: any = {};
   try { input = JSON.parse(body.toString() || '{}'); } catch {}
   if (m === 'GET' && (what === '' || what === 'ui'))
-    return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(readFileSync(`${import.meta.dirname}/ui.html`));
+    return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(page().html);
   if (m === 'GET' && what === 'health')
-    return json(res, 200, { ok: true, transparent: tlsOn, launchd: /agent-router/.test(process.env.XPC_SERVICE_NAME ?? ''), upstream: { host: UP_HOST, port: UP_PORT, ip: await upstreamIp().catch(() => null) }, uptime: process.uptime(), claude_bin: CLAUDE_BIN,
+    return json(res, 200, { ok: true, build: page().build, transparent: tlsOn, launchd: /agent-router/.test(process.env.XPC_SERVICE_NAME ?? ''), upstream: { host: UP_HOST, port: UP_PORT, ip: await upstreamIp().catch(() => null) }, uptime: process.uptime(), claude_bin: CLAUDE_BIN,
       ...one('select (select count(*) from accounts) accounts, (select count(*) from sessions where account_id is not null) sessions, (select count(*) from requests) requests, (select count(*) from migrations) migrations') });
   if (m === 'GET' && what === 'stats') return json(res, 200, all('select * from requests order by id desc limit 100'));
   if (m === 'GET' && what === 'settings') return json(res, 200, settings());

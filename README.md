@@ -237,6 +237,10 @@ skills/          one note per skill (status, the session and project it came fro
   tool calls, gets its own note and its own row under its session, and is scanned and extracted on its own, so the work a
   session delegated can become a skill too. A run that repeats the procedure of a skill you already have improves that skill
   instead of adding a near copy; for a promoted skill the improvement waits as a diff until you apply it.
+- **Trace.** Every unit (a session, a subagent run, a task segment) has a run tree built from its transcript and the ledger: prompts, model
+  calls with their latency and dollars, tool calls with a short scrubbed target, and a subagent's own steps under the `Agent` call that started it.
+  The console's **Trace** view draws it as a collapsible tree on a waterfall, in full or *minimal* (failed, repeated and exploratory steps pruned by fixed
+  rules); the minimal trace is what the brain's writer now reads, and it can be copied as Markdown or downloaded as JSON. No model is called to build one.
 - **Graph.** An Obsidian-style graph of the vault drawn in the console (no Obsidian needed): sessions, projects, days, skills and
   tags, with a skill tied to the session it came from and the sessions that used it. The same links are written into the notes,
   so Obsidian shows the same picture; *Open in Obsidian* appears when the app is installed, *Reveal folder* otherwise.

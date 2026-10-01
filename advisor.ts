@@ -45,7 +45,7 @@ export function claude(prompt: string, o: { model?: string; source?: string; tim
 const TARGET = new Set(['Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash']);
 // a tool call's short target (file, pattern or command, 60 chars) and a tool result's size: all that is ever kept of either
 const targetOf = (b: any) => (TARGET.has(b.name) ? String(Object.values(b.input ?? {}).find((v) => typeof v === 'string') ?? '').slice(0, 60) : String(b.name));
-const resultChars = (b: any): number => typeof b.content === 'string' ? b.content.length
+export const resultChars = (b: any): number => typeof b.content === 'string' ? b.content.length
   : Array.isArray(b.content) ? b.content.reduce((a: number, x: any) => a + (x?.type === 'text' ? String(x.text ?? '').length : 0), 0) : 0; // ponytail: images not counted
 const strip = (s: string) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
 // One pass over a transcript. Tool results are counted since the last compaction (that's what is in context now); prompts,

@@ -49,7 +49,8 @@ with 1,608 tool calls, 814 more on the main thread of which the note kept the la
 
 Each subagent or segment unit has its own note next to the session's, `wiki/logs/<date> <session title> — <name>.md` (a segment is
 `— part N`), written by the session's capture: frontmatter (`unit`, `kind`, `parent`, `agent`, project, started, ended, turns, model,
-tool calls, usd at list price from the ledger rows of that `agent_id`, or of that time window for a segment) and sections **Brief**
+tool calls, usd at list price from the ledger rows of that `agent_id`, or of that time window for a segment), a `Trace:` line (a link to the console's Trace view and
+"214 steps → 38 after pruning") and sections **Brief**
 (a subagent's first message, 1,500 characters; a segment's prompts), **Commands that worked** (every distinct Bash command whose
 result was not an error, 300 characters each; no cap of 80, but past ~3,000 tokens only the first of each command family and the
 final third of the run are listed), **Files written**, **Tools**, **Final report** (a `SubagentHandback` message if the run ended
@@ -94,12 +95,14 @@ and keep their scan and extract state. A command family is the first two words a
    A model answer that is not the JSON asked for is no gate at all. "Distill anyway" skips the gate.
    `POST scan {session}` runs this step alone and stores the answer; the writer is not called. A distill then uses a stored scan that no
    writer has used yet and that is newer than the session's last turn; otherwise it scans first. A scan over the cap is refused (409), not queued.
-   **Per unit.** `session` in `scan` / `distill` is a unit key. A subagent or segment unit is gated on its own note (Brief, Commands
-   that worked, Final report; up to 20k characters), not the session's, with the same questions and the same pre-filter.
+   **Per unit.** `session` in `scan` / `distill` is a unit key. A subagent or segment unit is gated on its own Brief, the first 40 lines of its
+   minimal trace and its Final report, not the session's note, with the same questions and the same pre-filter.
    **Matching.** `matches` lists every existing skill and candidate with its one-line description and asks: "Answer with an existing
    skill only if this run performs the same procedure with the same main tools; similar topic is not enough. When unsure, answer new."
    For `kind = skill` and `reusable` at the confidence, `matches = new` (or an unsure match) asks the writer for a new skill;
-   `matches = <skill>` at the confidence is **refine mode** (`gate.refine`).
+   `matches = <skill>` at the confidence is **refine mode** (`gate.refine`). Only skills the brain made or imported and still owns are offered:
+   never the built-in recall skill (`brain_skills.source = 'builtin'`), and never a promoted skill whose installed directory has lost its
+   `.agent-router` marker. A stored scan that names one anyway is read as `new`.
 3. **Distill (one Sonnet call per gated session).** The writer is a separate, stronger model than the
    classifier: `brain_writer_model`, default the CLI alias `sonnet` (resolves to the newest Sonnet the account has). Structured input, capped near 8k tokens, never the raw
    transcript. Output JSON: `summary`, `decisions[]`, `learnings[]`, `open_threads[]`, `tags[]`, and
@@ -109,8 +112,9 @@ and keep their scan and extract state. A command family is the first two words a
    asks for the skill outright: a name, a when-to-use description, and a body with `## Prerequisites`, `## Steps` (numbered, the exact
    commands that worked), `## Pitfalls` (seen in the session) and a short `## Verify` step; prerequisites name tools, versions and
    keys, never their values; inventing a step is forbidden.
-   A subagent or segment unit sends its note as `run` instead of the session extract; its summary goes into that unit note's
-   distilled block and its bullets onto the project note.
+   A subagent or segment unit sends `run` instead of the session extract: its Brief, its **minimal trace** (see Trace) and its Final report
+   (the note's own Commands and Files lists are no longer sent); its summary goes into that unit note's distilled block and its bullets onto
+   the project note. The output schema and refine mode are unchanged.
    **Refine mode** (the gate matched an existing skill): the input also carries that skill's current `SKILL.md`, and the writer
    returns the improved skill under the same name (keep what is still right, replace steps this run did better, add pitfalls this
    run hit, never drop a prerequisite without evidence) plus a one-line `changelog`. The classifier sees only descriptions, so the
@@ -157,7 +161,7 @@ and keep their scan and extract state. A command family is the first two words a
 
 ## Viewer (console Brain tab)
 
-Three views, chosen with a segmented control and kept in the hash (`#brain?view=pipeline|notes|graph`).
+Four views, chosen with a segmented control and kept in the hash (`#brain?view=pipeline|notes|graph|trace[&unit=<id>]`).
 
 - **Pipeline** (default). A funnel strip of five stages, each naming who does the work: Captured · no model → Scanned · Haiku (or Jev) →
   Extracted · Sonnet → Skill candidate → Promoted. Counts are over units and cumulative (a unit counts in every stage it passed); clicking
@@ -169,7 +173,8 @@ Three views, chosen with a segmented control and kept in the hash (`#brain?view=
   (M)** runs the writer for every unit whose scan said to keep something and that has no extract yet. Both run sequentially in the
   background, one run at a time (a second is 409), stop at the daily cap or when the brain is turned off, and show progress inline. The
   confirm states the count, an estimate (count × the mean of the last 20 measured calls; none until there is history) and what is left
-  of the cap.
+  of the cap. A batch that stops at the daily cap leaves a banner ("Scan stopped at the daily cap with 12 units left") with **Resume (12 left)**:
+  the same call limited to what is left (`pipeline.stopped = {kind, session?, left}`), disabled while the cap is still spent. Every row has a **Trace** button.
 - **Notes.** Tree on the left (Sessions by date with their unit notes nested beneath, Projects, Skills promoted / candidates, Daily, Index, Facts), rendered
   Markdown in the middle (small built-in renderer; `[[wikilinks]]` navigate in place), search across the vault
   with snippets. A candidate that is an update to a promoted skill is shown as a line diff against the installed copy, with Apply update
@@ -185,17 +190,56 @@ Three views, chosen with a segmented control and kept in the hash (`#brain?view=
   wheel or pinch to zoom, drag a note to pin it, hover to light a note and its neighbours, click to open it in Notes; type chips filter,
   the search box highlights matches. It is laid out again only when the set of notes or links changes; pan, zoom and pins survive polls.
 
+- **Trace.** See "Trace" below. Reached from a pipeline row, a note, a graph unit node (alt-click) and a session's timeline in Accounts & routing.
+
 **Open in Obsidian** shows when Obsidian is installed (macOS: `/Applications/Obsidian.app` or `~/Applications/Obsidian.app`; elsewhere
 `obsidian` on PATH; `OBSIDIAN_APP` overrides the path probed) and runs `open -a Obsidian <vault>`. Otherwise the button is **Reveal
 folder** (`open <vault>` / `xdg-open`). The directory is always the configured vault; nothing from the request reaches the command.
 
+## Trace
+
+A trace is the run tree of one unit, the way LangGraph/LangSmith show a run: `trace(unit)` in `trace.ts`, built from the transcripts and joined to the ledger by
+`requestId`, recomputed on demand (a pure function of those files; nothing is stored, and a trace holds no tool input beyond a short `target` and no tool output).
+
+```
+{ unit_id, title, kind: session|subagent|segment, mode, started, ended, usd, tokens: {in, out, cache_read, cache_create}, lim, last_ts, counts,
+  spans: [ { id, parent, kind: prompt|model|tool|subagent|segment, name, target, t0, t1, ms, ok, out_tokens_est, usd, tokens, lim, n_children } ] }
+```
+
+Spans are a flat pre-order list with `parent` ids. A prompt span (first 80 characters of the typed prompt) is at the top; under it, in order, the model calls (name =
+model id; times, `ok` and dollars from the ledger row; a transcript with no ledger row falls back to its own usage) and the tool calls each led to (tool_use to its
+tool_result: `ms`, `ok` = not `is_error`, `out_tokens_est` = result chars / 4; `target` = file path relative to the cwd, first 120 characters of a command, URL host and
+path, search query, skill or description, scrubbed). An `Agent` call whose result names a subagent transcript becomes a `subagent` span (first to last row of that file) with
+that run's own spans under it. A main thread of more than 150 tool calls is grouped into `segment` spans, the same segments the unit notes use; a segment unit's trace is just
+its prompts. Containers carry the dollars and tokens of everything beneath them; `usd` and `tokens` of the trace are the sum of its model calls. `counts` = `steps`
+(tool calls and subagent runs), `tool_calls`, `failed`, `subagents`, `models`.
+
+**Minimal trace**, `minimal(trace)`, applies in this order: (1) drop tool spans with `ok = false`, and an unanswered call that a later success of the same family supersedes;
+(2) collapse runs of consecutive read-only exploration (`Read`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `ToolSearch`, and Bash that is `ls`, `cat`, `head`, `tail`, `grep`, `rg`,
+`find`, `tree`, `pwd`, `wc`, `stat`, `file` without a redirect) into one `explored N files` span that keeps the 3 largest targets; (3) of the writes to one path keep the last
+(`edits: n`); (4) of the successful Bash commands of one family keep the last (`runs: n`); (5) keep every prompt and segment, every subagent span (pruned on its own, recursively) and
+each unit's last model call, which is its report. Every other model call is dropped (it carries no content). A *family* is the same tool; for Bash the executable plus the first
+argument (the unit notes' command family: after leading `cd … &&` and `VAR=…`); for the file tools the same path. The definition of read-only and of a family is in one place at the top
+of `trace.ts`. The result has `pruned` (`failed_or_superseded`, `collapsed`, `collapsed_into`, `overwritten_writes`, `repeated_commands`, `model_calls`), `counts` of what is kept
+and `full` (the counts before). The same coarse family rule groups `npm run build` with `npm run deploy` and every `ffmpeg -i …`: only the last of each is kept, with `runs`.
+
+`md(trace)` renders a minimal trace as a numbered outline (step, tool, target, outcome, duration; a subagent's steps as a nested list), at most ~6,000 tokens (24,000 characters):
+over that it drops `explored` spans first, then the other steps, oldest first, and never a prompt, subagent or write. **The writer reads this outline**, with the unit's Brief
+and Final report; the scan reads its first 40 lines. A unit note carries a line `Trace: [open in the console](…) · 214 steps → 38 after pruning`.
+
+The console's **Trace** view: a collapsible tree (kind chip, name, target, a red mark for a failed step) with a duration bar on the unit's own time axis beside each row, and for model
+calls tokens and dollars (with the "% of your 5-hour window" phrasing in the tooltip and header). Header: totals, Full / Minimal with the pruning summary ("dropped 41 failed or
+superseded, collapsed 96 reads into 12, kept 38 of 214"), Copy as Markdown, Download JSON, and Distill from this trace (a subagent run or segment; the usual cost confirm). Only open
+rows are drawn, children load when a span is opened, a filter box loads the whole trace once, arrows move and expand. The poll fetches only the unit's `last_ts`.
+
 ## API (all under `/router/brain/`)
 
 `GET stats` (incl. `obsidian`) · `GET tree` (`files`, `units`: unit note → session note) · `GET note?path=` (`installed` for a proposed
-update) · `GET search?q=` · `GET pipeline` (`stages`, `rows` each with `units`, `cap`, `running`, `todo`, `avg`) ·
-`GET graph` (`nodes`, `edges`) · `POST capture {session?}` · `POST scan {session}` · `POST distill {session, force?}` (`session` = a unit key) ·
+update) · `GET search?q=` · `GET pipeline` (`stages`, `rows` each with `units`, `cap`, `running`, `stopped`, `todo`, `avg`) ·
+`GET graph` (`nodes`, `edges`) · `GET trace?unit=<id>&mode=full|minimal[&depth=1 | &parent=<span id>][&download=1]` (`unit` = a session, `<session>/<agent id>` or `<session>/seg-<n>`;
+`depth=1` the top-level spans, `parent` one span's children, both with `n_children`; 404 `no_transcript`; `meta=1` is just `{unit_id, last_ts}`) · `GET trace.md?unit=` (the minimal trace as an outline) · `POST capture {session?}` · `POST scan {session}` · `POST distill {session, force?}` (`session` = a unit key) ·
 `POST scan-all {limit?, session?}` · `POST extract-all {limit?, session?}` (`session`: only that session's subagent and segment units, oldest
-first; 202 `{total, estimate_usd, cap}`; 409 `brain_busy` while one runs) · `POST open {target: obsidian|folder}` ·
+first; 202 `{total, estimate_usd, cap}`; 409 `brain_busy` while one runs; `pipeline.stopped` says what a batch left at the cap, and Resume is this call with `limit` = what is left) · `POST open {target: obsidian|folder}` ·
 `POST consolidate {project}` · `POST skills/import {url}` · `POST skills/<name>/promote|demote|reject` · `POST recall` ·
 `PUT facts {text}` · `POST facts-load {on}` (adds or removes the one line `@<vault>/CRITICAL_FACTS.md` in `<CLAUDE_HOME or ~/.claude>/CLAUDE.md`;
 `stats.facts_loaded` reads it back). Reads always answer; every write is `409 brain_disabled` until `brain_enabled`. Enabling is

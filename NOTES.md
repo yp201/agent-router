@@ -527,3 +527,32 @@ Spec: `docs/BRAIN.md` "Units". Code: `brain.ts` (`read()`/`digest()` replace the
 - **Not built:** `status = 'update'` as a status (it is `update_ts` on a promoted skill, so every `status = 'promoted'` check stays true);
   automatic extraction of units on idle (`on_idle` still covers sessions only); cleaning up unit rows whose transcript is gone; a unit note the
   user moved is written again rather than found by its `unit` key; a segment's turns and dollars are the ledger rows inside its time window.
+
+## Agent trace (2026-10-01)
+Spec: `docs/BRAIN.md` "Trace". Code: `trace.ts` (new: `trace()`, `minimal()`, `md()`), `brain.ts` (`input()` feeds the gate and the writer, `traceLine()`, `mainPaths()`, `pipeline().stopped`, `known()`),
+`router.ts` (`json()` takes headers, `page()` and `health.build`), `ui.html` (Trace view, build check, Resume).
+- **A trace is recomputed, never stored.** Flat pre-order spans with `parent` ids; `depth=1` / `parent=<id>` just filter that list, so the UI loads a unit in pieces. The one cost is parsing the transcript, so
+  the last 96 parses stay in memory keyed by file size, mtime and the session's ledger row count (a lazy expansion, or the 22 segments of one session, do not re-read a 50 MB file). An Agent call becomes a
+  `subagent` span through `toolUseResult.agentId` on its result row (the CLI writes it; the id names `<session>/subagents/agent-<id>.jsonl`).
+- **Model calls are in the full trace and out of the minimal one** (they carry no content; only each scope's last one stays, as the report), so "steps" means tool calls and subagent runs.
+- **The family rule is the notes' own (`family()`: executable + first argument), and it is coarse.** On the dry-run unit 130 of 272 steps were "repeated commands" (every `ffmpeg -i`, every
+  `~/.venv/bin/python voiceover.py`): only the last of each is kept, with `runs: n`; `npm run build` and `npm run deploy` are one family. That is what the spec asks for; if the skills lose steps, split on more words here.
+- **Main-thread session units keep their own extract.** The writer's trace input is for subagent runs and segments (the units whose input was the note's Commands/Files lists); a session's input is
+  unchanged (its note still lists the last 80 commands) and its test asserts that. Both the gate and the writer fall back to the note when a unit's transcript is gone.
+- **Built-in and unmarked skills are no match targets** (coordinator's addition, after the recall skill `brain` was offered to a unit and got a proposed update): `known()` drops `source = 'builtin'` and a promoted
+  skill whose directory has no `.agent-router` marker; a stored scan that names one is read as `new`. The pending update on the live vault was left for the human to reject.
+- **Dry run, dev router on a copy of the live ledger and vault, real transcripts** ("Google Docs link", the subagent unit "Build trailer v3 from Aayush's script"):
+  | | full | minimal |
+  | --- | --- | --- |
+  | spans | 515 (1 prompt, 242 model, 272 tool) | 80 (1 prompt, 78 tool, 1 model) |
+  | steps | 272 (5 failed) | 78 |
+  | JSON | 170,043 bytes | 27,556 bytes; the outline 12,182 bytes (about 3k tokens, under the 6k cap) |
+  Pruned: 5 failed, 85 reads collapsed into 26 `explored` spans, 130 repeated commands, 241 model calls hidden (so 5 + 59 + 130 = 194 steps dropped). Time over HTTP: 122 ms cold (112 ms in
+  process, the transcript read included), 8 ms from the memo; `depth=1` is 1,001 bytes in 8 ms. The whole session (29 subagents, 22 segments): 4,864 spans, 1.5 MB, 588 ms cold, 38 ms warm;
+  minimal 1,235 spans, 380 KB, steps 2,422 → 1,021; one segment 174 spans in 160 ms. The unit's top level is one prompt with 79 children, in order (names only): explored ×3, Write ×3, Bash ×3, explored, Bash, explored, Read, explored, Bash, explored, Bash, Read, explored, Monitor, … (a `SubagentHandback` each time the run was continued) … and the final model call.
+  **Distill from the trace, once** (the stored scan reused: refine mode against `incremental-prototype-with-real-data-eval`, 0.88): one Sonnet call, 10,353 in / 2,461 out, $0.045 at list price; the skill
+  was rewritten in place from 13 to 31 lines (27 added, 9 removed, 4 unchanged): a material change, the trailer-specific steps added. The call went through :4101 (its row is in the dev ledger, and the dev log).
+- **Stale console.** `health.build` is the first 8 hex of a hash of ui.html; the router serves the page with it filled in (`const BUILD`), the page compares on every poll and reloads itself, or shows a
+  "New version — reload" chip while a form is dirty or an input has focus (checked in the browser: typing in the filter box held the reload, clearing it let it happen).
+- **Not built:** trace search is over the loaded spans after one full fetch (no server-side search); a very long idle gap (the subagent above spans 5 h 42 min for 342 minutes of wall time, mostly waiting) makes
+  the bars thin: no axis break; spans are not windowed past ~20,000 open rows.
