@@ -25,7 +25,7 @@ const agent = db.prepare(`insert into agents values (:id, :sk, coalesce(:force, 
 const SUB = /([^/]+)\/subagents\/agent-([^/]+)\.jsonl$/; // <session>/subagents/agent-<id>.jsonl
 const typed = (c: any) => typeof c === 'string' ? c.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').replace(/\s+/g, ' ').trim().slice(0, 60) : '';
 // the desktop's short subagent label ("description") lives next to the transcript in agent-<id>.meta.json
-const desc = (path: string) => { try { return JSON.parse(readFileSync(path.replace(/\.jsonl$/, '.meta.json'), 'utf8')).description || null; } catch { return null; } };
+export const desc = (path: string) => { try { return JSON.parse(readFileSync(path.replace(/\.jsonl$/, '.meta.json'), 'utf8')).description || null; } catch { return null; } };
 const named = new Set<string>(); // files whose first typed prompt was already used this run
 const tool = db.prepare('insert or ignore into tool_uses (id, request_id, name, arg) values (?, ?, ?, ?)'); // arg: the skill name, Skill tool only
 const getOff = db.prepare('select offset from tail_offsets where path = ?');

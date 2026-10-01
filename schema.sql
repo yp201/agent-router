@@ -71,12 +71,18 @@ create table if not exists settings (key text primary key, value text);         
 create index if not exists requests_ts on requests(ts);
 -- budgets (settings.budgets): one row the first time a budget crosses a threshold in a period; dedupes notifications, doubles as history
 create table if not exists budget_events (budget_id text, period_key text, threshold real, ts integer);
--- brain (brain.ts): what was captured / gated / distilled per session, and every skill candidate it knows
+-- brain (brain.ts): what was captured / gated / distilled per unit, and every skill candidate it knows. A unit is a session's main thread
+-- (session_key = the session, parent null), one subagent run (session_key = '<session>/<agent id>') or one task segment of a long main
+-- thread ('<session>/seg-<n>'); the last two carry `parent` = the session and have their own note and pipeline state
 create table if not exists brain_sessions (session_key text primary key, last_captured_ts integer, note_path text, gate_json text, gate_backend text,
   gated_ts integer, distilled_ts integer, skill_candidate text, queued integer default 0, trivial integer,
-  scan_usd real, extract_usd real); -- what the classifier / writer call for this session cost (brain-tagged spend while it ran); null = not measured
+  scan_usd real, extract_usd real, -- what the classifier / writer call for this unit cost (brain-tagged spend while it ran); null = not measured
+  kind text default 'session', parent text, agent_id text, seg_index integer, name text, started integer); -- kind: 'session' | 'subagent' | 'segment'
 create table if not exists brain_skills (name text primary key, status text, -- 'candidate' | 'promoted' | 'rejected'
-  source text, source_session text, created_ts integer, promoted_ts integer);
+  source text, source_session text, created_ts integer, promoted_ts integer,
+  update_ts integer); -- a promoted skill whose candidate copy holds a proposed update (a later run refined it), waiting for the user to apply it
+-- every unit that wrote ('create') or improved ('refine') a skill; note = the refine's one-line changelog
+create table if not exists skill_sources (skill text, unit_id text, ts integer, mode text, note text, primary key (skill, unit_id));
 -- keep warm: a per-session one-off (until_ts > 0), or the user's Stop (until_ts = 0, reason 'stopped by you': no warming until the session's
 -- next request). reason on a one-off = why the scheduler is not pinging it right now; null while it runs
 create table if not exists warm_sessions (session_key text primary key, until_ts integer, created_ts integer, reason text);

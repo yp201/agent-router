@@ -490,3 +490,40 @@ Spec: `docs/COST-INSIGHTS.md` "Next". Code: `console.ts` (`limits()`, `asLimits(
 - **Facts switch.** `~/.claude/CLAUDE.md` on this machine is the single line `@~/agent-router-brain/CRITICAL_FACTS.md`; the switch reads
   "on". `CLAUDE_HOME` stands in for `~/.claude` (and `${CLAUDE_HOME}.json` for `~/.claude.json`) in development and tests.
 
+## Brain units: subagent runs and task segments (2026-10-01)
+Spec: `docs/BRAIN.md` "Units". Code: `brain.ts` (`read()`/`digest()` replace the one-pass `extract()` body; `units()`, `unit()`, `segments()`, `keep()`,
+`refine()`), `ledger.ts` + `schema.sql` (columns on `brain_sessions`, `brain_skills.update_ts`, table `skill_sources`), `ui.html`.
+- **Why.** "Google Docs link" was scanned `reusable = false (0.95)`: its note listed 29 subagents by name and the last 80 of 814 main-thread
+  tool calls, while the subagents ran 1,608 tool calls, 154 of them ffmpeg-type commands.
+- **Units are rows of `brain_sessions`**, not a new table: `kind`, `parent`, `agent_id`, `seg_index`, `name`, `started` added with `alter table`;
+  the key is `<session>/<agent id>` or `<session>/seg-<n>`. Old rows are `kind = 'session'` and keep their state with no copy. Every query that
+  means "sessions" now says `parent is null`; a unit's project comes from its parent (`coalesce(b.parent, b.session_key)`).
+- **A subagent transcript** is all `isSidechain` rows; its first user row is the brief, the reminder and image rows are `isMeta`, follow-up
+  messages carry a non-human `origin`. 28 of 29 runs end with a `SubagentHandback` tool call whose `message` is the report, followed by a
+  one-line assistant text, so the final report is the last handback when there is one.
+- **`matches` is weak on a small model.** With one existing candidate (a yt-dlp/Python prototype skill) Haiku matched 9 of 28 skill-kind units
+  to it at 0.70–0.85, two trailer builds among them. "When unsure, answer new" took that to 4; listing each skill's main tools moved one more
+  and was removed again. So the writer has the last word: in refine mode it gets the matched `SKILL.md` and answers under the same name only
+  if it is the same procedure; a new name is a new candidate. In the run below no trailer unit ended up in the prototype skill.
+- **Scan-all then extract-all cannot merge siblings by itself**: every unit is scanned before any skill exists. A unit whose stored scan asked
+  for a skill is scanned again at extract time when a skill has appeared since (one more classifier call, about half a cent).
+- **Writers copy shell escapes into JSON.** The four longest skill bodies (ffmpeg filters with `\:`) failed `JSON.parse`; `json()` now retries
+  with unknown backslash escapes doubled. Three of the four then parsed, the fourth parsed on the next run.
+- **Dry run, dev router on a copy of the live vault and ledger, that one session, real models through :4101:**
+  | step | units | result | cost (list price) | wall |
+  | --- | --- | --- | --- | --- |
+  | capture | 28 subagent + 22 segment notes; 1 subagent of 6 tool calls stays a name | vault 424 → 1,008 KB, 54 → 104 notes | free | 0.5 s |
+  | scan (Haiku 4.5) | 49 (1 failed the pre-filter: no command, no file) | 28 `kind = skill` and reusable (0.75–0.92), 21 project-knowledge (0.75–0.92), 0 nothing | $0.24 | 143 s |
+  | extract (Sonnet 5) | 49 | 12 skills created, 10 refinements, 22 units tied to a skill | $1.84 incl. re-scans and 5 unparsed answers | 17 min |
+  Skills: `canvas-rendered-explainer-video-with-ffmpeg` (CBAM explainer video; refined by the R1 cohort trailer, the JS-canvas rebuild and
+  trailer v3), `clone-voice-with-qwen3-tts-mlx` (segment 11; refined by the Qwen3-TTS setup and the voice clone),
+  `re-voice-video-with-tts-and-music-bed`, `self-contained-html-tool-with-site-styling-and-playwright-tests` (+2 refinements),
+  `integrate-cashfree-payment-links-and-webhook` (+2), `add-gst-invoice-gen-to-cloudflare-lms` (+1), `canvas-social-cards-with-playwright-core`,
+  `fact-grounded-outreach-kit-from-site-source`, `before-after-clutter-audit-for-responsive-copy`, `local-role-based-redteam-for-cloudflare-lms`,
+  `promote-redesign-shot-to-production-paths`, `ai-image-realism-review-and-site-integration`. All carry Prerequisites, Steps, Pitfalls, Verify.
+  Pipeline endpoint with 106 units: 26–32 ms. Each dev `claude -p` also sends one `HEAD /api/hello` through the transparent :443 path, which the
+  live router logs as a zero-token brain-tagged row; every `/v1/messages` call went to :4101.
+- **The default $1 daily cap is below one such session** ($2.1 here): the batch stops at the cap and does not resume by itself.
+- **Not built:** `status = 'update'` as a status (it is `update_ts` on a promoted skill, so every `status = 'promoted'` check stays true);
+  automatic extraction of units on idle (`on_idle` still covers sessions only); cleaning up unit rows whose transcript is gone; a unit note the
+  user moved is written again rather than found by its `unit` key; a segment's turns and dollars are the ledger rows inside its time window.

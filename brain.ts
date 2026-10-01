@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { resolve, dirname, sep } from 'node:path';
 import { db, settings, now } from './ledger.ts';
 import { claude, claudeHome } from './advisor.ts';
-import { ROOT } from './tailer.ts';
+import { ROOT, desc } from './tailer.ts';
 import { MSG, spendOf, fmtUsd } from './console.ts';
 
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
@@ -53,8 +53,13 @@ const li = (xs: string[]) => (xs.length ? xs.map((v) => `- ${v}`).join('\n') : '
 const code = (s: string) => (s.includes('`') ? `\`\` ${s} \`\`` : `\`${s}\``);
 const link = (p: string) => `[[${p.split('/').pop()!.replace(/\.md$/, '')}]]`;
 const day = (ms: number) => new Date(ms).toLocaleDateString('sv'); // local YYYY-MM-DD
-// tolerates ```json fences and prose around the object
-const json = (s: string | null) => { try { return JSON.parse(s!.slice(s!.indexOf('{'), s!.lastIndexOf('}') + 1)); } catch { return null; } };
+// tolerates ```json fences and prose around the object, and on a second try backslashes JSON does not know: a model copying `\:` or `\,`
+// out of a shell command into a string (measured: the four longest skill bodies of a video session, all ffmpeg filters, failed to parse)
+const json = (s: string | null) => {
+  const t = s?.slice(s.indexOf('{'), s.lastIndexOf('}') + 1) ?? '';
+  for (const x of [t, t.replace(/\\([\s\S])/g, (m, c) => ('"\\/bfnrtu'.includes(c) ? m : `\\\\${c}`))]) try { return JSON.parse(x); } catch {}
+  return null;
+};
 
 // Generated text sits between markers; everything outside them is the user's and survives every rewrite.
 const mark = (n = '') => [`<!-- agent-router:begin${n && ` ${n}`} -->`, `<!-- agent-router:end${n && ` ${n}`} -->`];
@@ -146,43 +151,130 @@ function safe(rel: string) {
 }
 
 // ---- capture: transcript -> wiki/logs/<day> <title>.md, no model call ----
-// One pass over the session's main transcript(s). Kept: typed prompts, tool names, Bash commands whose result was not an error,
-// files written. Tool output is never read into the note.
+// One pass over a transcript (a session's main one(s); with `side`, one subagent's), in order: typed prompts, assistant text, tool calls,
+// and which calls failed. Tool output is never read. Excerpts are cut to the longest any note shows; the session's overview cuts shorter.
+type Ev = { t: 'p' | 'a' | 'h' | 'u'; s: string; ts: number; id?: string; name?: string }; // prompt | assistant text | handback report | tool use
+type Run = { ev: Ev[]; failed: Set<string>; ok: Set<string>; cwd: string | null; model: string | null; t0: number; t1: number };
+async function read(paths: string[], side = false): Promise<Run> {
+  const ev: Ev[] = [], seen = new Set<string>(), failed = new Set<string>(), ok = new Set<string>();
+  let cwd: string | null = null, model: string | null = null, t0 = 0, t1 = 0;
+  for (const p of paths) for await (const l of createInterface({ input: createReadStream(p), crlfDelay: Infinity })) {
+    if (!l.includes('"message"')) continue; // user/assistant rows only
+    let r: any;
+    try { r = JSON.parse(l); } catch { continue; }
+    if ((r.isSidechain && !side) || r.isMeta || r.isCompactSummary || r.isVisibleInTranscriptOnly) continue;
+    const ts = Date.parse(r.timestamp) || 0, c = r.message?.content;
+    if (ts) { t0 ||= ts; t1 = ts; }
+    cwd ??= r.cwd ?? null;
+    if (r.type === 'assistant') model = r.message?.model ?? model;
+    for (const b of typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : []) {
+      if (b?.type === 'text' && r.type === 'user' && (!r.origin || r.origin.kind === 'human')) {
+        const t = strip(String(b.text)); // injected blocks (<task-notification>, <command-name>, …) are not something the user asked
+        if (t && !/^(<|\[Request interrupted)/.test(t)) ev.push({ t: 'p', s: clip(t, 1500), ts });
+      }
+      if (b?.type === 'text' && r.type === 'assistant' && b.text?.trim()) ev.push({ t: 'a', s: clip(String(b.text), 2000), ts });
+      if (b?.type === 'tool_use' && b.id && !seen.has(b.id)) {
+        seen.add(b.id);
+        ev.push({ t: 'u', ts, id: b.id, name: String(b.name), s: b.name === 'Bash' ? clip(String(b.input?.command ?? ''), 300)
+          : /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(b.name) ? clip(String(b.input?.file_path ?? b.input?.notebook_path ?? ''), 200) : '' });
+        if (b.name === 'SubagentHandback' && typeof b.input?.message === 'string') ev.push({ t: 'h', s: clip(b.input.message, 2000), ts }); // how a subagent run ends: its report
+      }
+      if (b?.type === 'tool_result') (b.is_error ? failed : ok).add(b.tool_use_id);
+    }
+  }
+  return { ev, failed, ok, cwd, model, t0, t1 };
+}
+// What a note lists from a stretch of events, each excerpt cut to [prompt, text, command] characters: prompts, closing assistant text, the
+// final report (a handback if the run ended with one, else the last assistant text), tool counts, files written, and Bash commands whose
+// result came back and was not an error.
+function digest(R: Run, ev = R.ev, [np, na, nc] = [300, 600, 200]) {
+  const tools = new Map<string, number>(), files = new Set<string>(), commands = new Set<string>(), of = (t: string, n: number) => ev.filter((e) => e.t === t).map((e) => e.s.slice(0, n));
+  for (const e of ev) if (e.t === 'u') {
+    tools.set(e.name!, (tools.get(e.name!) ?? 0) + 1);
+    if (e.name === 'Bash' ? !R.ok.has(e.id!) : R.failed.has(e.id!)) continue;
+    const arg = e.name === 'Bash' ? e.s.slice(0, nc) : e.s;
+    if (arg) (e.name === 'Bash' ? commands : files).add(R.cwd && arg.startsWith(`${R.cwd}/`) ? arg.slice(R.cwd.length + 1) : arg);
+  }
+  return { prompts: of('p', np), texts: of('a', na).slice(-4), final: of('h', na).at(-1) ?? of('a', na).at(-1) ?? '', calls: ev.filter((e) => e.t === 'u').length,
+    tools: [...tools].sort((a, b) => b[1] - a[1]), files: [...files], commands: [...commands] };
+}
 async function extract(sk: string) {
   let paths = all(`select jsonl_path p from requests where session_key = ? and agent_id is null and jsonl_path is not null group by 1 order by min(ts)`, sk)
     .map((r) => r.p as string).filter((p) => existsSync(p));
   // no joined request (a session from before the router, or never routed): the CLI names the transcript after the session
   if (!paths.length && /^[\w-]+$/.test(sk)) try { paths = readdirSync(ROOT).map((d) => `${ROOT}/${d}/${sk}.jsonl`).filter((p) => existsSync(p)); } catch {}
   if (!paths.length) return null;
-  const uses = new Map<string, { name: string; arg: string | null }>(), failed = new Set<string>(), ok = new Set<string>();
-  const prompts: string[] = [], texts: string[] = [];
-  let cwd: string | null = null, t0 = 0, t1 = 0;
-  for (const p of paths) for await (const l of createInterface({ input: createReadStream(p), crlfDelay: Infinity })) {
-    if (!l.includes('"message"')) continue; // user/assistant rows only
-    let r: any;
-    try { r = JSON.parse(l); } catch { continue; }
-    if (r.isSidechain || r.isMeta || r.isCompactSummary || r.isVisibleInTranscriptOnly) continue;
-    const ts = Date.parse(r.timestamp), c = r.message?.content;
-    if (ts) { t0 ||= ts; t1 = ts; }
-    cwd ??= r.cwd ?? null;
-    for (const b of typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : []) {
-      if (b?.type === 'text' && r.type === 'user' && (!r.origin || r.origin.kind === 'human')) {
-        const t = strip(String(b.text)); // injected blocks (<task-notification>, <command-name>, …) are not something the user asked
-        if (t && !/^(<|\[Request interrupted)/.test(t)) prompts.push(clip(t, 300));
-      }
-      if (b?.type === 'text' && r.type === 'assistant' && b.text?.trim()) { texts.push(clip(String(b.text), 600)); if (texts.length > 4) texts.shift(); }
-      if (b?.type === 'tool_use' && b.id) uses.set(b.id, { name: String(b.name), arg: b.name === 'Bash' ? clip(String(b.input?.command ?? ''), 200)
-        : /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(b.name) ? clip(String(b.input?.file_path ?? b.input?.notebook_path ?? ''), 200) : null });
-      if (b?.type === 'tool_result') (b.is_error ? failed : ok).add(b.tool_use_id);
+  const R = await read(paths);
+  return { ...digest(R), R, paths, cwd: R.cwd, t0: R.t0, t1: R.t1 };
+}
+
+// ---- units: a subagent run, or a task segment of a long main thread, gets its own note and its own pipeline row ----
+const MINU = 8, LONG = 150, SEG = 25; // a subagent run from 8 tool calls; a main thread of more than 150, cut into segments of at least 25
+const iso = (ms: number) => new Date(ms).toISOString();
+// Cut at typed prompts of 15 characters or more, once the segment so far holds SEG tool calls; a short tail joins the segment before it.
+function segments(ev: Ev[]) {
+  const out: Ev[][] = [[]];
+  let n = 0;
+  for (const e of ev) {
+    if (e.t === 'p' && e.s.length >= 15 && n >= SEG) { out.push([]); n = 0; }
+    out.at(-1)!.push(e);
+    if (e.t === 'u') n++;
+  }
+  if (out.length > 1 && n < SEG) out.at(-2)!.push(...out.pop()!);
+  return out;
+}
+// Commands that worked, capped near 3,000 tokens: under the cap all of them; over it, the first of each command family, then the final
+// third of the run from its end backwards, in their original order.
+// ponytail: a family is the first two words after leading `cd … &&` and VAR=… prefixes; parse the shell if that groups badly
+const family = (c: string) => c.replace(/^(cd [^&;]+(&&|;)\s*)+/, '').replace(/^(\w+=\S+\s+)+/, '').split(' ').slice(0, 2).join(' ');
+function keep(cmds: string[], max = 12_000) {
+  if (cmds.reduce((n, c) => n + c.length + 4, 0) <= max) return cmds;
+  const fam = new Set<string>(), pick = new Set<number>();
+  let n = 0;
+  const take = (i: number) => { if (!pick.has(i) && n + cmds[i].length + 4 <= max) { pick.add(i); n += cmds[i].length + 4; } };
+  cmds.forEach((c, i) => { if (!fam.has(family(c))) { fam.add(family(c)); take(i); } });
+  for (let i = cmds.length - 1; i >= cmds.length * 2 / 3; i--) take(i);
+  return cmds.filter((_, i) => pick.has(i));
+}
+type Parent = { sk: string; rel: string; project: string | null };
+// One unit's note, `<parent note> — <name>.md`, and its brain_sessions row (parent = the session). `where` selects its ledger requests.
+function unit(root: string, p: Parent, u: { id: string; kind: 'subagent' | 'segment'; agent?: string; seg?: number; name: string; file?: string; ev: Ev[]; R: Run; where: any[] }) {
+  const x = digest(u.R, u.ev, [1500, 2000, 300]), old = one('select note_path p from brain_sessions where session_key = ?', u.id)?.p as string | undefined;
+  let rel = `${p.rel.slice(0, -3)} — ${fname(u.file ?? u.name).slice(0, 60).trim() || u.id.slice(-8)}.md`;
+  if (rel !== old && existsSync(`${root}/${rel}`)) rel = rel.replace(/\.md$/, ` (${u.id.split('/').pop()!.slice(0, 8)}).md`); // another run of this session, same name
+  if (old && old !== rel && existsSync(`${root}/${old}`)) renameSync(`${root}/${old}`, `${root}/${rel}`);                 // the session was retitled
+  const [w, ...a] = u.where, q = `${w} and ${MSG()} and status < 400`, t0 = u.ev[0]?.ts || u.R.t0 || Date.now(), kept = keep(x.commands);
+  put(root, rel, [`# ${u.name}`, `Session: ${link(p.rel)} · Project: ${p.project ? `[[${p.project}]]` : '—'}`,
+    '## Brief', li(u.kind === 'subagent' ? x.prompts.slice(0, 1) : fit(x.prompts.map((s) => s.slice(0, 300)), 1500)),
+    '## Commands that worked', li(kept.map(code)) + (kept.length < x.commands.length ? `\n- … and ${x.commands.length - kept.length} more (listed: the first of each kind and the final third)` : ''),
+    '## Files written', li(fit(x.files, 3000).map(code)),
+    '## Tools', li(x.tools.map(([n, c]) => `${n} × ${c}`)),
+    '## Final report', x.final || '—'].join('\n\n'),
+    { front: { unit: u.id, kind: u.kind, parent: p.sk, agent: u.agent, title: u.name, project: p.project, started: iso(t0), ended: iso(u.ev.at(-1)?.ts || t0),
+      turns: one(`select count(*) n from requests where ${q}`, ...a).n, model: u.R.model, tool_calls: x.calls, usd: +spendOf(q, ...a).usd.toFixed(4), tags: ['unit', u.kind, ...(p.project ? [tag(p.project)] : [])] } });
+  db.prepare(`insert into brain_sessions (session_key, kind, parent, agent_id, seg_index, name, started, last_captured_ts, note_path, trivial) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    on conflict (session_key) do update set name = excluded.name, started = excluded.started, last_captured_ts = excluded.last_captured_ts, note_path = excluded.note_path`)
+    .run(u.id, u.kind, p.sk, u.agent ?? null, u.seg ?? null, u.name, t0, Date.now(), rel);
+  return `[[${rel.split('/').pop()!.slice(0, -3)}|${fname(u.name)}]]`;
+}
+// A session's units, oldest first. Returns what the parent note lists: every subagent (a link when it has a note, else its name) and the segments.
+async function units(root: string, p: Parent, x: { R: Run; paths: string[] }) {
+  const runs: { id: string; name: string; R: Run }[] = [], calls = (ev: Ev[]) => ev.filter((e) => e.t === 'u').length;
+  for (const d of x.paths.map((f) => `${f.slice(0, -6)}/subagents`)) { // <session>/subagents/agent-<id>.jsonl, next to the transcript
+    let fs: string[] = [];
+    try { fs = readdirSync(d).filter((f) => /^agent-.+\.jsonl$/.test(f)); } catch {}
+    for (const f of fs) {
+      const id = f.slice(6, -6), R = await read([`${d}/${f}`], true);
+      runs.push({ id, R, name: clip(one('select name from agents where agent_id = ?', id)?.name ?? desc(`${d}/${f}`) ?? R.ev.find((e) => e.t === 'p')?.s ?? id, 80) });
     }
   }
-  const tools = new Map<string, number>(), files = new Set<string>(), commands = new Set<string>();
-  for (const [id, u] of uses) {
-    tools.set(u.name, (tools.get(u.name) ?? 0) + 1);
-    if (u.name === 'Bash' ? !ok.has(id) : failed.has(id)) continue;
-    if (u.arg) (u.name === 'Bash' ? commands : files).add(cwd && u.arg.startsWith(`${cwd}/`) ? u.arg.slice(cwd.length + 1) : u.arg);
-  }
-  return { prompts, texts, cwd, t0, t1, calls: uses.size, tools: [...tools].sort((a, b) => b[1] - a[1]), files: [...files], commands: [...commands] };
+  const subs = runs.sort((a, b) => a.R.t0 - b.R.t0).map((u) => calls(u.R.ev) < MINU ? u.name
+    : unit(root, p, { id: `${p.sk}/${u.id}`, kind: 'subagent', agent: u.id, name: u.name, ev: u.R.ev, R: u.R, where: ['session_key = ? and agent_id = ?', p.sk, u.id] }));
+  const parts = calls(x.R.ev) > LONG ? segments(x.R.ev) : [];
+  const segs = parts.length < 2 ? [] : parts.map((ev, i) => unit(root, p, { id: `${p.sk}/seg-${i + 1}`, kind: 'segment', seg: i + 1, file: `part ${i + 1}`,
+    name: `part ${i + 1} — ${ev.find((e) => e.t === 'p' && e.s.length >= 15)?.s.slice(0, 60) ?? ''}`, ev, R: x.R,
+    where: ['session_key = ? and agent_id is null and ts >= ? and ts < ?', p.sk, ev[0].ts, parts[i + 1]?.[0].ts ?? 9e15] }));
+  return { subs, segs, notes: segs.length + subs.filter((v) => v.startsWith('[[')).length };
 }
 
 const MAXC = 80; // ponytail: a note lists the last 80 distinct commands that worked; the transcript has the rest
@@ -213,13 +305,14 @@ async function captureOne(sk: string, root: string) {
   if (old && !existsSync(`${root}/${old}`)) old = tree(root).find((p) => p.startsWith('wiki/logs/') && front(readFileSync(`${root}/${p}`, 'utf8'))?.session === sk);
   if (rel !== old && existsSync(`${root}/${rel}`)) rel = rel.replace(/\.md$/, ` (${sk.slice(0, 8)}).md`); // another session, same title and day
   if (old && old !== rel) renameSync(`${root}/${old}`, `${root}/${rel}`);                                // retitled
-  const more = x.commands.length - MAXC;
+  const more = x.commands.length - MAXC, kids = await units(root, { sk, rel, project }, x);
   put(root, rel, [`# ${title}`, `Project: ${project ? `[[${project}]]` : '—'} · Day: [[${d}]]`,
     '## Asked', li(x.prompts),
     '## Files touched', li(x.files.map(code)),
     '## Commands run', li(x.commands.slice(-MAXC).map(code)) + (more > 0 ? `\n- … and ${more} earlier ones` : ''),
     '## Tools', li(x.tools.map(([n, c]) => `${n} × ${c}`)),
-    '## Subagents', li(all('select coalesce(name, agent_id) n from agents where session_key = ? order by first_ts', sk).map((r) => clip(r.n, 80))),
+    '## Subagents', li(kids.subs.length ? kids.subs : all('select coalesce(name, agent_id) n from agents where session_key = ? order by first_ts', sk).map((r) => clip(r.n, 80))),
+    ...(kids.segs.length ? ['## Task segments', li(kids.segs)] : []),
     '## Account switches', li(all('select ts, from_account f, to_account t, reason from migrations where session_key = ? order by ts', sk)
       .map((m) => `${new Date(m.ts).toLocaleString('sv').slice(0, 16)} ${m.f ?? '—'} → ${m.t} (${m.reason ?? '—'})`))].join('\n\n'),
     { front: { session: sk, title, project, started: new Date(started).toISOString(), ended: new Date(ended).toISOString(), turns: a.turns,
@@ -227,14 +320,14 @@ async function captureOne(sk: string, root: string) {
       usd: +spendOf(`session_key = ? and ${MSG()} and status < 400`, sk).usd.toFixed(4),
       cache_hit: a.inp ? +(a.cr / a.inp).toFixed(3) : null, peak_context: a.peak ?? null, tags: ['session', ...(project ? [tag(project)] : [])] } });
   done(rel);
-  log(root, `capture ${rel}`);
-  return { day: d, project };
+  log(root, `capture ${rel}${kids.notes ? ` and ${kids.notes} unit notes` : ''}`);
+  return { day: d, project, units: kids.notes };
 }
 function dayNote(root: string, d: string) {
   const t0 = new Date(`${d}T00:00:00`).getTime(), t1 = new Date(t0).setDate(new Date(t0).getDate() + 1);
   const w = `${MSG()} and status < 400 and ts >= ? and ts < ?`, u = spendOf(w, t0, t1);
   put(root, `wiki/daily/${d}.md`, [`# ${d}`, `Spend: ${fmtUsd(u.usd)} at list price over ${u.n} requests${u.unpriced ? ` (${u.unpriced} on unpriced models not counted)` : ''}, of which the brain ${fmtUsd(spendOf(`source = 'brain' and ${w}`, t0, t1).usd)}.`, '## Sessions',
-    li(all(`select note_path p from brain_sessions where note_path like ? and coalesce(trivial, 0) = 0 order by 1`, `wiki/logs/${d} %`).map((r) => link(r.p)))].join('\n\n'), { front: { date: d, tags: ['daily'] } });
+    li(all(`select note_path p from brain_sessions where note_path like ? and coalesce(trivial, 0) = 0 and parent is null order by 1`, `wiki/logs/${d} %`).map((r) => link(r.p)))].join('\n\n'), { front: { date: d, tags: ['daily'] } });
 }
 // Sessions list is regenerated; the `knowledge` block above it is appended to by distill and rewritten only by Consolidate.
 function projectNote(root: string, project: string) {
@@ -242,12 +335,12 @@ function projectNote(root: string, project: string) {
     where b.note_path is not null and coalesce(b.trivial, 0) = 0 and substr(s.cwd, -length(?) - 1) = '/' || ? order by 1 desc`, project, project).map((r) => link(r.p)))}`,
     { front: { project, tags: ['project'] }, head: `# ${project}\n\n## Knowledge\n\n${mark('knowledge').join('\n')}\n\n` });
 }
-// The session note's distilled block ends with one line per skill that came out of it (brain_skills.source_session): the link survives a
+// A note's distilled block ends with one line per skill its unit wrote or refined (skill_sources): the link survives a
 // later writer run that returns no skill, and goes when the skill is rejected.
 function skillLinks(root: string, sk: string, rel: string) {
   const p = `${root}/${rel}`, cur = existsSync(p) ? getBlock(readFileSync(p, 'utf8'), 'distilled') : undefined;
   if (cur === undefined) return;
-  const want = all(`select name, status from brain_skills where source_session = ? and status != 'rejected' order by created_ts`, sk)
+  const want = all(`select k.name, k.status from skill_sources x join brain_skills k on k.name = x.skill where x.unit_id = ? and k.status != 'rejected' order by k.created_ts`, sk)
     .map((k) => `Skill${k.status === 'promoted' ? '' : ' candidate'}: [[skills/${k.name}|${k.name}]]`);
   const next = [(cur ?? '## Distilled').split('\n').filter((l) => !/^Skill( candidate)?: \[\[skills\//.test(l)).join('\n').trim(), want.join('\n')].filter(Boolean).join('\n\n');
   if (cur === null ? want.length : next !== cur) put(root, rel, next, { name: 'distilled' });
@@ -255,20 +348,24 @@ function skillLinks(root: string, sk: string, rel: string) {
 // index.md (the catalogue Claude reads first) and the skill notes. skills/<name>.md exists while a skill is promoted or came out of a
 // session: it links back to that session and its project, and the session's distilled block links it (skillLinks), so the provenance
 // is in the files and Obsidian draws the same graph the console does.
+const SJ = 'left join sessions s on s.session_key = coalesce(b.parent, b.session_key)'; // a unit's project is its session's
 function index(root: string) {
   const noted = all(`select b.note_path p, s.cwd, b.trivial from brain_sessions b join sessions s using (session_key) where b.note_path is not null`);
   const proj = new Map(noted.map((r) => [r.p, r.cwd?.split('/').pop()])), hidden = new Set(noted.filter((r) => r.trivial).map((r) => r.p)); // hidden: one-shot notes the user edited
+  for (const r of all('select note_path p from brain_sessions where parent is not null and note_path is not null')) hidden.add(r.p);           // …and unit notes: their session links them
   for (const k of stats().skills) {
-    const src = k.source_session ? one('select b.note_path p, s.cwd from brain_sessions b left join sessions s using (session_key) where session_key = ?', k.source_session) : null;
+    const src = k.source_session ? one(`select b.note_path p, s.cwd from brain_sessions b ${SJ} where b.session_key = ?`, k.source_session) : null;
+    const srcs = all(`select x.mode, x.note, b.note_path p from skill_sources x join brain_sessions b on b.session_key = x.unit_id where x.skill = ? and b.note_path is not null order by x.ts`, k.name);
     const project = fname(src?.cwd?.split('/').pop() ?? '');
     if (k.status !== 'promoted') hidden.add(`skills/${k.name}.md`); // index.md lists candidates under their own heading
     if (k.status !== 'promoted' && !src?.p) continue;               // an imported candidate has nothing to point back at
-    put(root, `skills/${k.name}.md`, [`# ${k.name}`, `Status: ${k.status}${k.promoted_ts ? ` since ${day(k.promoted_ts)}` : ''} · Source: ${k.source_session ? (src?.p ? link(src.p) : k.source_session) : k.source}${project ? ` · Project: [[${project}]]` : ''}`,
+    put(root, `skills/${k.name}.md`, [`# ${k.name}`, `Status: ${k.status}${k.promoted_ts ? ` since ${day(k.promoted_ts)}` : ''}${k.update ? ' (an update is waiting for review)' : ''} · Source: ${k.source_session ? (src?.p ? link(src.p) : k.source_session) : k.source}${project ? ` · Project: [[${project}]]` : ''}`,
       `Used ${k.uses} time${k.uses === 1 ? '' : 's'} in ${k.sessions} session${k.sessions === 1 ? '' : 's'} across ${k.projects} project${k.projects === 1 ? '' : 's'}${k.last_used ? `, last on ${day(k.last_used)}` : ''}.${k.source_usd ? ` Working it out the first time cost ${fmtUsd(k.source_usd)} at list price.` : ''}`,
       `Skill file: [[skills/candidates/${k.name}/SKILL|SKILL.md]]`,
-      k.status === 'promoted' ? `Installed copy: \`${skillsDir()}/${k.name}/SKILL.md\`` : 'Not installed. Promote it in the console to copy it to your Claude skills folder.'].join('\n\n'), { front: { skill: k.name, tags: ['skill'] } });
+      k.status === 'promoted' ? `Installed copy: \`${skillsDir()}/${k.name}/SKILL.md\`` : 'Not installed. Promote it in the console to copy it to your Claude skills folder.',
+      ...(srcs.length > 1 ? ['## Sources', li(srcs.map((x) => `${link(x.p)} · ${x.mode}${x.note ? ` · ${x.note}` : ''}`))] : [])].join('\n\n'), { front: { skill: k.name, tags: ['skill'] } });
   }
-  for (const r of all(`select distinct k.source_session sk, b.note_path p from brain_skills k join brain_sessions b on b.session_key = k.source_session where b.note_path is not null`)) skillLinks(root, r.sk, r.p);
+  for (const r of all(`select distinct x.unit_id sk, b.note_path p from skill_sources x join brain_sessions b on b.session_key = x.unit_id where b.note_path is not null`)) skillLinks(root, r.sk, r.p);
   const files = tree(root);
   const sec = (h: string, pre: string, f = (p: string) => `- ${link(p)}`) => { const xs = files.filter((p) => p.startsWith(pre) && !p.slice(pre.length).includes('/') && !hidden.has(p)).reverse(); return xs.length ? `## ${h}\n\n${xs.map(f).join('\n')}` : ''; };
   const cands = files.filter((p) => /^skills\/candidates\/[^/]+\/SKILL\.md$/.test(p));
@@ -285,15 +382,15 @@ export async function capture(o: { session?: string; idle?: boolean } = {}) {
   const rows = all(`select s.session_key sk from sessions s left join brain_sessions b using (session_key) where ${o.session ? 's.session_key = ?' : '1'}
     ${o.idle ? `and ((coalesce(s.last_ts, s.created_ts, 0) <= ${t - IDLE} and coalesce(s.last_ts, s.created_ts, 1) > coalesce(b.last_captured_ts, 0)) or (b.note_path is not null and b.trivial is null))` : ''}
     and not exists (select 1 from requests r where r.session_key = s.session_key and r.source is not null and r.source != 'warm')`, ...(o.session ? [o.session] : []));
-  let notes = 0, removed = 0;
+  let notes = 0, removed = 0, units = 0;
   for (const { sk } of rows) {
     const n = await captureOne(sk, root).catch((e) => void console.error(`brain: capture ${sk.slice(0, 8)} failed: ${e.message}`));
     if (!n) continue;
-    if (!('removed' in n)) notes++; else if (n.removed) removed++;
+    if (!('removed' in n)) { notes++; units += n.units; } else if (n.removed) removed++;
     days.add(n.day); if (n.project) projects.add(n.project);
   }
   if (days.size) { for (const d of days) dayNote(root, d); for (const p of projects) projectNote(root, p); index(root); }
-  return { sessions: rows.length, notes, removed, ms: Date.now() - t };
+  return { sessions: rows.length, notes, units, removed, ms: Date.now() - t };
 }
 
 // ---- gate: typed questions over the session note, two backends, one shape ----
@@ -339,19 +436,20 @@ const questions = (skills: string[][]): Q => ({
   reusable: { type: 'noul', instructions: REUSABLE },
   kind: { type: 'choice', instructions: 'What from this session is worth keeping?', criteria: { skill: 'A reusable multi-step procedure with concrete commands, useful outside this project',
     'project-knowledge': 'Decisions, learnings or gotchas that matter for this project only', nothing: 'Routine work, questions or exploration with nothing worth keeping' } },
-  ...(skills.length && { matches: { type: 'choice' as const, instructions: 'Which existing skill already covers the procedure in this session?',
-    criteria: { ...Object.fromEntries(skills.map(([n, d]) => [n, clip(d, 200)])), new: 'None of the existing skills covers it' } } }),
+  ...(skills.length && { matches: { type: 'choice' as const, instructions: 'Which existing skill already covers the procedure in this session? Answer with an existing skill only if this run performs the same procedure with the same main tools; similar topic is not enough. When unsure, answer new.',
+    criteria: { ...Object.fromEntries(skills.map(([n, d]) => [n, clip(d, 200)])), new: 'None of the existing skills is this same procedure with the same main tools' } } }),
 });
 
 // ---- distill: one writer call per gated session ----
 const WRITE = `You distill one finished Claude Code session into durable notes. The input is a structured extract (what the user asked, files written,
-commands that succeeded, tools, the closing assistant text), not the transcript. Return ONLY one JSON object, no prose, no code fences:
+commands that succeeded, tools, the closing assistant text), not the transcript. For one subagent run or one task segment of a session the same
+facts come as its note in "run" (Brief, Commands that worked, Files written, Tools, Final report). Return ONLY one JSON object, no prose, no code fences:
 {"summary": "2-4 sentences: what was asked and what was done",
  "decisions": ["a choice that was made and why, one sentence each"],
  "learnings": ["a fact or gotcha that was discovered and will matter again"],
  "open_threads": ["work that was left unfinished"],
  "tags": ["3 to 6 lowercase kebab-case topic tags"],
- "skill": null or {"name": "kebab-case, at most 64 characters", "description": "one or two sentences saying when to use this skill", "body": "Markdown with three headed parts: '## Prerequisites' (tools, accounts, files or access the steps assume), '## Steps' (imperative, numbered, with the exact commands from commands_run that worked), '## Pitfalls' (what failed or needed a second try in this session, and what fixed it)"}}
+ "skill": null or {"name": "kebab-case, at most 64 characters", "description": "one or two sentences saying when to use this skill", "body": "Markdown with four headed parts: '## Prerequisites' (tools, versions, accounts, files, keys or access the steps assume, by name only, never a value), '## Steps' (imperative, numbered, with the exact commands from the input that worked), '## Pitfalls' (what failed or needed a second try in this session, and what fixed it), '## Verify' (one short check that shows it worked)"}}
 Rules:
 - Use only what is in the input. Never invent a step, command, file name or fact that the input does not show. If it is not there, leave it out.
 - Empty arrays are fine. Do not pad.
@@ -364,7 +462,16 @@ supersedes, and keep each bullet's date, kind and trailing [[link]]. Use only wh
 {"bullets": ["YYYY-MM-DD · kind · text ([[link]])"]}`;
 // appended when the scan said kind = skill: the writer is asked for the skill outright, not left to decide whether one exists
 const ASK = `\n\nThe classifier found a repeatable skill in this session. Write it in "skill": a name, a description that says when to use it, and a body
-with the prerequisites, numbered steps with the exact commands that worked, and the pitfalls seen in the session.`;
+with the prerequisites, numbered steps with the exact commands that worked, and the pitfalls seen in the session. Name tools, versions and keys
+in the prerequisites, never their values. End with a short "## Verify" step. Never invent a step: use only what the input shows.`;
+// appended instead when the scan matched an existing skill: the writer improves that skill rather than writing a near copy
+// (the classifier sees only descriptions, so the writer, with the whole SKILL.md in front of it, has the last word on whether it is the same procedure)
+const REFINE = `\n\nThe classifier found that this run repeats the procedure of an existing skill; its SKILL.md is in "existing_skill". If this run really is
+that procedure with the same main tools, return in "skill" the improved skill under the same name: keep what is still right, replace steps that
+this run did better, add pitfalls this run hit, and never drop a prerequisite without evidence in the input; and return "changelog": one line
+saying what this run changed in the skill. If it is a different procedure or uses different main tools, leave the existing skill alone: write
+this run's own skill under a new name, as if no skill existed, and return "changelog": null. Either way keep the four headed parts and never
+invent a step: use only what the input and the existing skill show.`;
 const fit = (xs: string[], max: number) => { const out: string[] = []; let n = 0; for (const v of xs) { if ((n += v.length + 4) > max) break; out.push(v); } return out; };
 const upd = (sk: string, f: Record<string, any>) => db.prepare(`update brain_sessions set ${Object.keys(f).map((k) => `${k} = :${k}`).join(', ')} where session_key = :sk`).run({ ...f, sk });
 
@@ -374,9 +481,24 @@ function skillOf(text: string) {
   return !f ? 'no YAML frontmatter' : !NAME.test(f.name ?? '') || f.name.length > 64 ? 'frontmatter `name` must be kebab-case, at most 64 characters'
     : !f.description ? 'frontmatter has no `description`' : { name: f.name, description: f.description };
 }
+// Provenance: every unit that wrote ('create') or improved ('refine') a skill; a unit that does both stays its creator.
+const source = (skill: string, unit: string, mode: string, note: string | null = null) => db.prepare(`insert into skill_sources values (?, ?, ?, ?, ?)
+  on conflict (skill, unit_id) do update set ts = excluded.ts, note = coalesce(excluded.note, note)`).run(skill, unit, Date.now(), mode, note);
+// a skill as it stands: the vault's copy (which may hold a proposed update), else the installed one
+const skillText = (root: string, name: string) => { for (const d of [`${root}/skills/candidates`, skillsDir()]) try { return readFileSync(`${d}/${name}/SKILL.md`, 'utf8'); } catch {} return null; };
+// Refine: a later run of the same procedure rewrites the skill it matched. Only the vault's copy changes. For a promoted skill that copy
+// is then a proposed update (update_ts): the installed one stays as it is until the user applies it with Promote, or discards it with Reject.
+function refine(root: string, name: string, text: string, unit: string, note: string): [number, any] {
+  mkdirSync(`${root}/skills/candidates/${name}`, { recursive: true });
+  writeFileSync(`${root}/skills/candidates/${name}/SKILL.md`, text);
+  db.prepare(`update brain_skills set update_ts = coalesce(update_ts, ?) where name = ? and status = 'promoted'`).run(Date.now(), name);
+  source(name, unit, 'refine', note || null);
+  log(root, `skill ${name} refined from ${unit}${note ? `: ${note}` : ''}`);
+  return [201, { name }];
+}
 // Candidates only: nothing here reaches Claude Code until the user promotes it. A session may rewrite its own candidate, an import may
 // replace a rejected one; any other name clash is refused.
-function addCandidate(root: string, text: string, source: string, session: string | null): [number, any] {
+function addCandidate(root: string, text: string, from: string, session: string | null): [number, any] {
   const k = skillOf(text);
   if (typeof k === 'string') return [422, err('not_a_skill', k)];
   const have = one('select status, source_session ss from brain_skills where name = ?', k.name), d = `${root}/skills/candidates/${k.name}`;
@@ -384,9 +506,11 @@ function addCandidate(root: string, text: string, source: string, session: strin
   mkdirSync(d, { recursive: true });
   writeFileSync(`${d}/SKILL.md`, text);
   db.prepare(`insert into brain_skills (name, status, source, source_session, created_ts) values (?, 'candidate', ?, ?, ?)
-    on conflict (name) do update set status = 'candidate', source = excluded.source, source_session = excluded.source_session, created_ts = excluded.created_ts`).run(k.name, source, session, Date.now());
-  log(root, `skill candidate ${k.name} from ${source}`);
-  return [201, { ...k, status: 'candidate', source }];
+    on conflict (name) do update set status = 'candidate', source = excluded.source, source_session = excluded.source_session, created_ts = excluded.created_ts`).run(k.name, from, session, Date.now());
+  if (have?.status === 'rejected') db.prepare('delete from skill_sources where skill = ?').run(k.name); // the name starts over
+  if (session) source(k.name, session, 'create');
+  log(root, `skill candidate ${k.name} from ${from}`);
+  return [201, { ...k, status: 'candidate', source: from }];
 }
 
 // One model call at a time per session. distill: over the daily cap the session is queued for tomorrow's tick; a scan is not queued
@@ -403,21 +527,27 @@ export const scan = (sk: string) => locked(sk, () => gate1(sk));
 // ponytail: a window, not a per-call tag, so two brain calls running at once are both counted; tag the subprocess per session if that matters
 const spent = (t0: number) => spendOf(`source = 'brain' and ts >= ?`, t0).usd;
 type Loaded = NonNullable<Awaited<ReturnType<typeof load>>>;
+// `sk` is a unit: a session, or one of its subagent runs or task segments (whose note its session's capture wrote; it is read, not re-captured)
 async function load(sk: string) {
-  const root = vault();
-  await capture({ session: sk }); // the note is the classifier's state
-  const b = one('select b.*, s.cwd, s.last_ts from brain_sessions b left join sessions s using (session_key) where session_key = ?', sk), x = b?.note_path && await extract(sk);
-  return x ? { root, b, x, note: readFileSync(`${root}/${b.note_path}`, 'utf8'), skills: known(root), pre: { tool_calls: x.calls, files: x.files.length, commands: x.commands.length } } : null;
+  const root = vault(), kid = !!one('select parent from brain_sessions where session_key = ?', sk)?.parent;
+  if (!kid) await capture({ session: sk }); // the note is the classifier's state
+  const b = one(`select b.*, s.cwd, iif(b.parent is null, s.last_ts, null) last_ts from brain_sessions b ${SJ} where b.session_key = ?`, sk);
+  const x = b?.note_path && !kid ? await extract(sk) : null;
+  if (!(kid ? b.note_path && existsSync(`${root}/${b.note_path}`) : x)) return null;
+  const note = readFileSync(`${root}/${b.note_path}`, 'utf8'), { ok, ...pre } = preOf(note);
+  return { root, b, x, note, skills: known(root), pre: x ? { tool_calls: x.calls, files: x.files.length, commands: x.commands.length } : pre };
 }
 // scan = the gate alone: deterministic pre-filter, then the classifier. Stores the answers, the backend and what the call cost; never calls the writer.
 async function gate1(sk: string, s?: Loaded | null): Promise<Record<string, any>> {
   if (!(s ??= await load(sk))) return { error: 'no_note' };
   const { pre, note, skills } = s, conf = settings().brain_confidence, t0 = now();
-  const c = pre.tool_calls >= 8 && (pre.files || pre.commands) ? await classify((getBlock(note) ?? '').slice(0, 12_000), questions(skills)) : undefined;
+  // the state is the unit's own note: for a subagent run or a segment its brief, commands and final report, not the whole session's
+  const c = pre.tool_calls >= 8 && (pre.files || pre.commands) ? await classify((getBlock(note) ?? '').slice(0, s.b.parent ? 20_000 : 12_000), questions(skills)) : undefined;
   if (c === null) return { pre, gated: false, why: 'classifier_failed' };
   const a = c?.answers, gated = !!a && a.kind.value !== 'nothing' && a.kind.confidence >= conf;
-  const gate = { pre, ...(a ? { answers: a } : { why: 'prefilter' }), gated, backend: c?.backend ?? null,
-    want_skill: gated && a!.kind.value === 'skill' && a!.reusable.value && a!.reusable.confidence >= conf && (!a!.matches || a!.matches.value === 'new' || a!.matches.confidence < conf) };
+  // a skill is wanted for kind = skill and reusable at the confidence: a new one, or (`refine`) the existing one `matches` names at the confidence
+  const skill = gated && a!.kind.value === 'skill' && a!.reusable.value && a!.reusable.confidence >= conf, hit = !!a?.matches && a.matches.value !== 'new' && a.matches.confidence >= conf;
+  const gate = { pre, ...(a ? { answers: a } : { why: 'prefilter' }), gated, backend: c?.backend ?? null, want_skill: skill && !hit, ...(skill && hit && { refine: a!.matches.value as string }) };
   upd(sk, { gate_json: JSON.stringify(gate), gate_backend: gate.backend, gated_ts: Date.now(), queued: 0, scan_usd: c ? spent(t0) : null });
   return gate;
 }
@@ -426,18 +556,24 @@ async function distill1(sk: string, force: boolean): Promise<Record<string, any>
   if (!s) return { error: 'no_note' };
   const { root, b, x, note, skills, pre } = s;
   // `force` (Distill anyway) skips the gate. A scan no writer has used yet, made after the session's last turn, is the gate; otherwise scan now.
-  const fresh = b.gate_json && b.gated_ts > Math.max(b.distilled_ts ?? 0, b.last_ts ?? 0) ? JSON.parse(b.gate_json) : null;
+  let fresh = b.gate_json && b.gated_ts > Math.max(b.distilled_ts ?? 0, b.last_ts ?? 0) ? JSON.parse(b.gate_json) : null;
+  // A session's units are scanned in one go, before any of them has written a skill, so none could match a sibling's. One that asked for a
+  // new skill is scanned again if a skill has appeared since: later runs then refine the earlier one's skill instead of repeating it.
+  if (b.parent && (fresh?.want_skill || fresh?.refine) && one(`select 1 from brain_skills where status != 'rejected' and created_ts > ?`, b.gated_ts)) fresh = null;
   const gate: Record<string, any> = force ? { pre, gated: true, want_skill: true, forced: true } : fresh ?? await gate1(sk, s);
   if (!gate.gated) return gate;
-  const project = fname(b.cwd?.split('/').pop() ?? '') || null, t0 = now();
+  const project = fname(b.cwd?.split('/').pop() ?? '') || null, t0 = now(), cur = gate.refine ? skillText(root, gate.refine) : null;
   // ponytail: "near 8k tokens" by characters (4 per token): prompts 10k, the latest commands 14k, files 3k, closing text 2.4k
-  const out = json(await llm(`${WRITE}${gate.want_skill && !gate.forced ? ASK : ''}\n\n${JSON.stringify({ title: front(note)?.title, project, want_skill: gate.want_skill, existing_skills: skills.map(([n]) => n), asked: fit(x.prompts, 10_000),
-    files_touched: fit(x.files, 3_000), commands_run: fit([...x.commands].reverse(), 14_000).reverse(), tools: Object.fromEntries(x.tools.slice(0, 20)), closing_assistant_text: x.texts })}`, st.brain_writer_model, 180_000));
+  const out = json(await llm(`${WRITE}${cur ? REFINE : gate.want_skill && !gate.forced ? ASK : ''}\n\n${JSON.stringify({ title: front(note)?.title, project, want_skill: gate.want_skill || !!cur, existing_skills: skills.map(([n]) => n),
+    ...(x ? { asked: fit(x.prompts, 10_000), files_touched: fit(x.files, 3_000), commands_run: fit([...x.commands].reverse(), 14_000).reverse(), tools: Object.fromEntries(x.tools.slice(0, 20)), closing_assistant_text: x.texts }
+      : { run: (getBlock(note) ?? '').slice(0, 20_000) }), ...(cur && { existing_skill: cur }) })}`, st.brain_writer_model, 180_000));
   if (typeof out?.summary !== 'string') { console.log('brain: writer did not return the JSON asked for'); return { ...gate, distilled: false, why: 'writer_failed' }; }
   const arr = (v: any, n = 400): string[] => (Array.isArray(v) ? v.filter((s) => typeof s === 'string' && s.trim()).map((s) => clip(s, n)) : []);
   const parts: [string, string, string[]][] = [['Decisions', 'decision', arr(out.decisions)], ['Learnings', 'learning', arr(out.learnings)], ['Open threads', 'open', arr(out.open_threads)]];
-  const sk0 = out.skill, made = gate.want_skill && sk0 && [sk0.name, sk0.description, sk0.body].every((v) => typeof v === 'string' && v.trim())
-    ? addCandidate(root, `---\nname: ${sk0.name}\ndescription: ${yv(clip(sk0.description, 500))}\n---\n\n${scrub(sk0.body).trim()}\n`, 'session', sk) : null;
+  const sk0 = out.skill, text = (gate.want_skill || cur) && sk0 && [sk0.name, sk0.description, sk0.body].every((v) => typeof v === 'string' && v.trim())
+    ? `---\nname: ${sk0.name}\ndescription: ${yv(clip(sk0.description, 500))}\n---\n\n${scrub(sk0.body).trim()}\n` : null;
+  const same = !!cur && sk0?.name === gate.refine; // refine mode and the writer kept the name: it is the same procedure. A new name is a new skill
+  const made = !text ? null : same ? refine(root, gate.refine, text, sk, typeof out.changelog === 'string' ? clip(out.changelog, 200) : '') : addCandidate(root, text, 'session', sk);
   if (made && made[0] !== 201) console.log(`brain: skill candidate dropped (${made[1].error.type}: ${made[1].error.message})`);
   const skill: string | null = made?.[0] === 201 ? made[1].name : null;
   // the `Skill candidate: [[…]]` line is added by index() -> skillLinks, from the ledger
@@ -445,14 +581,14 @@ async function distill1(sk: string, force: boolean): Promise<Record<string, any>
     { name: 'distilled', front: { tags: arr(out.tags, 40).map(tag).filter(Boolean).slice(0, 8) } });
   if (project) { // dated bullets on the project note: this session's earlier bullets are replaced, a line already there is not added again
     projectNote(root, project);
-    const p = `wiki/projects/${project}.md`, d = day(x.t1 || Date.now()), from = ` (${link(b.note_path)})`;
+    const p = `wiki/projects/${project}.md`, d = day(x?.t1 || b.started || Date.now()), from = ` (${link(b.note_path)})`;
     const have = (getBlock(readFileSync(`${root}/${p}`, 'utf8'), 'knowledge') ?? '').split('\n').filter((l) => l && !l.endsWith(from));
     put(root, p, [...new Set([...have, ...parts.flatMap(([, k, v]) => v.map((s) => `- ${d} · ${k} · ${s}${from}`))])].join('\n'), { name: 'knowledge' });
   }
   upd(sk, { distilled_ts: Date.now(), skill_candidate: skill, queued: 0, extract_usd: spent(t0) });
-  log(root, `distill ${b.note_path}${skill ? ` -> skill candidate ${skill}` : ''}`);
+  log(root, `distill ${b.note_path}${skill ? ` -> skill candidate ${skill}${same ? ' (refined)' : ''}` : ''}`);
   index(root);
-  return { ...gate, distilled: true, skill };
+  return { ...gate, distilled: true, skill, ...(same && skill && { refined: true }) };
 }
 async function consolidate(root: string, project: string): Promise<[number, any]> {
   const p = `wiki/projects/${fname(project)}.md`, have = existsSync(`${root}/${p}`) && getBlock(readFileSync(`${root}/${p}`, 'utf8'), 'knowledge');
@@ -493,13 +629,13 @@ async function importSkill(root: string, raw: string): Promise<[number, any]> {
   if (res[0] === 201) index(root);
   return res;
 }
-// promote copies the candidate to <skills dir>/<name>/ with a marker; a directory there without the marker is somebody else's and is
-// never touched. demote removes only a directory carrying the marker (keeping a copy as the candidate). reject drops the candidate.
+// promote copies the candidate to <skills dir>/<name>/ with a marker (for a promoted skill with a proposed update, that applies it); a
+// directory there without the marker is somebody else's and is never touched. demote removes only a directory carrying the marker (keeping a copy as the candidate). reject drops the candidate.
 const drop = (p: string) => { if (existsSync(p) && onlyGenerated(readFileSync(p, 'utf8'))) rmSync(p); }; // a note the user wrote in stays
 function skillAct(root: string, name: string, act: string): [number, any] {
   const k = NAME.test(name) && one('select * from brain_skills where name = ?', name), cand = `${root}/skills/candidates/${name}`, dst = `${skillsDir()}/${name}`;
   if (!k) return [404, err('not_found')];
-  const ours = existsSync(`${dst}/${MARK}`), set = (status: string, ts: number | null) => db.prepare('update brain_skills set status = ?, promoted_ts = ? where name = ?').run(status, ts, name);
+  const ours = existsSync(`${dst}/${MARK}`), set = (status: string, ts: number | null) => db.prepare('update brain_skills set status = ?, promoted_ts = ?, update_ts = null where name = ?').run(status, ts, name);
   if (act !== 'reject' && existsSync(dst) && !ours) return [409, err('exists_unmanaged', `${dst} exists and was not installed by agent-router`)];
   if (act === 'promote') {
     if (!existsSync(`${cand}/SKILL.md`)) return [404, err('no_candidate')];
@@ -514,10 +650,13 @@ function skillAct(root: string, name: string, act: string): [number, any] {
     if (!k.source_session) drop(`${root}/skills/${name}.md`); // an imported skill has a note only while promoted; one from a session keeps it (index() rewrites the status)
     set('candidate', null);
   } else if (act === 'reject') {
-    if (k.status === 'promoted') return [409, err('promoted', 'demote it first')];
-    rmSync(cand, { recursive: true, force: true });
-    drop(`${root}/skills/${name}.md`); // the source session's link goes in index() -> skillLinks
-    set('rejected', null);
+    if (k.status === 'promoted' && !(k.update_ts && ours)) return [409, err('promoted', 'demote it first')];
+    if (k.status === 'promoted') { cpSync(`${dst}/SKILL.md`, `${cand}/SKILL.md`); set('promoted', k.promoted_ts); } // a proposed update is discarded: the vault's copy is the installed one again
+    else {
+      rmSync(cand, { recursive: true, force: true });
+      drop(`${root}/skills/${name}.md`); // the source session's link goes in index() -> skillLinks
+      set('rejected', null);
+    }
   } else return [404, err('not_found')];
   log(root, `${act} skill ${name}`);
   index(root);
@@ -545,40 +684,48 @@ function recall(root: string) {
 }
 
 // ---- views ----
+// what working a skill out cost: the source session's spend; for a subagent run or a segment, the `usd` its note recorded at capture
+function srcUsd(id: string) {
+  const b = one('select parent, note_path p from brain_sessions where session_key = ?', id);
+  if (!b?.parent) return spendOf(`session_key = ? and ${MSG()} and status < 400`, id).usd;
+  try { return Number(front(readFileSync(`${dir()}/${b.p}`, 'utf8'))?.usd) || null; } catch { return null; }
+}
 export function stats() {
-  const st = settings(), b = one(`select count(note_path) filter (where coalesce(trivial, 0) = 0) c, count(distilled_ts) d, coalesce(sum(queued), 0) q from brain_sessions`);
+  const st = settings(), b = one(`select count(note_path) filter (where coalesce(trivial, 0) = 0 and parent is null) c, count(distilled_ts) filter (where parent is null) d, coalesce(sum(queued), 0) q from brain_sessions`);
   const skills = all(`select * from brain_skills where status != 'rejected' order by status = 'promoted' desc, created_ts desc`).map((k) => ({ name: k.name as string, status: k.status as string,
     ...(one(`select count(*) uses, count(distinct r.session_key) sessions, count(distinct s.cwd) projects, max(r.ts) last_used from tool_uses t
       left join requests r on r.request_id = t.request_id left join sessions s on s.session_key = r.session_key where t.name = 'Skill' and t.arg = ?`, k.name) as { uses: number; sessions: number; projects: number; last_used: number | null }),
-    source: k.source as string, source_session: k.source_session as string | null, promoted_ts: k.promoted_ts as number | null,
-    source_usd: k.source_session ? spendOf(`session_key = ? and ${MSG()} and status < 400`, k.source_session).usd : null }));
+    source: k.source as string, source_session: k.source_session as string | null, promoted_ts: k.promoted_ts as number | null, ...(k.update_ts && { update: true }), // update: a proposed change to a promoted skill is waiting
+    source_usd: k.source_session ? srcUsd(k.source_session) : null }));
   return { enabled: !!st.brain_enabled, dir: dir(), sessions_captured: b.c, distilled: b.d, candidates: skills.filter((k) => k.status === 'candidate').length,
     promoted: skills.filter((k) => k.status === 'promoted').length, spend_today_usd: spend(), cap_usd: st.brain_daily_usd, queued: b.q, classifier_backend: backend(), obsidian: !!obsidian(), skills,
     facts_loaded: factsLoaded(), facts_line: factsLine(), facts_file: userMd() };
 }
 
-// ---- pipeline: every captured session and how far it got: captured -> scanned -> extracted -> candidate -> promoted ----
+// ---- pipeline: every captured unit and how far it got: captured -> scanned -> extracted -> candidate -> promoted ----
 const STAGES = ['captured', 'scanned', 'extracted', 'candidate', 'promoted'];
 const cap1 = (m: string) => m.replace(/^claude-/, '').replace(/^./, (c) => c.toUpperCase());
 // The gate's pre-filter (>= 8 tool calls, a file written or a command run) read off the captured note, so this view never opens a transcript.
 const bullets = (t: string, h: string) => (t.match(new RegExp(`^## ${h}\\n\\n([\\s\\S]*?)(?=\\n\\n## |\\n<!-- )`, 'm'))?.[1] ?? '').split('\n').filter((l) => l.startsWith('- ') && l !== '- none');
-const preOf = (t: string) => { const n = bullets(t, 'Tools').reduce((a, l) => a + Number(l.match(/× (\d+)$/)?.[1] ?? 0), 0); return { tool_calls: n, ok: n >= 8 && bullets(t, 'Files touched').length + bullets(t, 'Commands run').length > 0 }; };
+const preOf = (t: string) => { const n = bullets(t, 'Tools').reduce((a, l) => a + Number(l.match(/× (\d+)$/)?.[1] ?? 0), 0), files = bullets(t, 'Files (?:touched|written)').length, commands = bullets(t, 'Commands (?:run|that worked)').length;
+  return { tool_calls: n, files, commands, ok: n >= 8 && files + commands > 0 }; };
 // mean cost of the last 20 measured calls of one stage; null = no history yet
 const avgUsd = (kind: 'scan' | 'extract') => { const [col, ts] = kind === 'scan' ? ['scan_usd', 'gated_ts'] : ['extract_usd', 'distilled_ts'];
   return one(`select avg(u) a from (select ${col} u from brain_sessions where ${col} is not null order by ${ts} desc limit 20)`).a as number | null; };
 const estimate = (kind: 'scan' | 'extract', n: number, avg = avgUsd(kind)) => (avg == null ? null : n * avg); // count × recent average
 let running: { kind: 'scan' | 'extract'; done: number; total: number } | null = null; // the one scan-all / extract-all in flight
-// ponytail: reads every session note per call for the pre-filter (the console polls this while the Pipeline view is open); store it at capture if that shows up
+// ponytail: reads every unit's note per call for the pre-filter (the console polls this while the Pipeline view is open); store it at capture if that shows up
+// rows: one per session, newest first, each with `units`: its subagent runs and task segments, oldest first. Stage counts and todo are over all of them.
 export function pipeline() {
   const st = settings(), root = dir(), jev = backend() === 'jev';
-  const made = new Map(all(`select name, status, source_session ss from brain_skills where source_session is not null and status != 'rejected' order by status = 'promoted', created_ts`).map((k) => [k.ss as string, k]));
-  const rows = all(`select b.*, s.title, s.cwd, coalesce(s.last_ts, s.created_ts, b.last_captured_ts) last_ts,
+  const made = new Map(all(`select x.unit_id u, k.name, k.status from skill_sources x join brain_skills k on k.name = x.skill where k.status != 'rejected' order by k.status = 'promoted', x.ts`).map((k) => [k.u as string, k]));
+  const flat = all(`select b.*, coalesce(b.name, s.title) title, s.cwd, coalesce(b.started, s.last_ts, s.created_ts, b.last_captured_ts) last_ts,
       (select count(*) from requests r where r.session_key = b.session_key and ${MSG('r.')} and r.status < 400) turns
-    from brain_sessions b left join sessions s using (session_key) where b.note_path is not null and coalesce(b.trivial, 0) = 0 order by coalesce(s.last_ts, s.created_ts, b.last_captured_ts) desc`).map((r) => {
+    from brain_sessions b ${SJ} where b.note_path is not null and coalesce(b.trivial, 0) = 0 order by coalesce(b.started, s.last_ts, s.created_ts, b.last_captured_ts) desc`).map((r) => {
     const g = r.gate_json ? JSON.parse(r.gate_json) : null, a = g?.answers, k = made.get(r.session_key);
-    let pre: { tool_calls: number | null; ok: boolean } = { tool_calls: null, ok: false };
-    try { pre = preOf(readFileSync(`${root}/${r.note_path}`, 'utf8')); } catch {} // the note was moved or deleted by hand
-    return { session_key: r.session_key as string, title: (r.title ?? r.note_path.split('/').pop().slice(11, -3)) as string, project: fname(r.cwd?.split('/').pop() ?? '') || null, last_ts: r.last_ts as number, turns: r.turns as number,
+    let pre: { tool_calls: number | null; ok: boolean } = { tool_calls: null, ok: false }, turns = r.turns as number;
+    try { const t = readFileSync(`${root}/${r.note_path}`, 'utf8'); pre = preOf(t); if (r.parent) turns = Number(front(t)?.turns) || 0; } catch {} // the note was moved or deleted by hand
+    return { session_key: r.session_key as string, kind: r.kind as string, parent: r.parent as string | null, title: (r.title ?? r.note_path.split('/').pop().slice(11, -3)) as string, project: fname(r.cwd?.split('/').pop() ?? '') || null, last_ts: r.last_ts as number, turns,
       tool_calls: pre.tool_calls, pre: pre.ok, note_path: r.note_path as string,
       stage: k?.status === 'promoted' ? 'promoted' : k ? 'candidate' : r.distilled_ts ? 'extracted' : a ? 'scanned' : 'captured',
       scan: a ? { backend: g.backend, reusable: a.reusable.value, kind: a.kind.value, matches: a.matches?.value ?? null, confidence: a.kind.confidence, wanted: !!g.gated, ts: r.gated_ts, usd: r.scan_usd } : null,
@@ -586,21 +733,23 @@ export function pipeline() {
         : a && !g.gated ? { ts: null, usd: null, skipped_reason: a.kind.value === 'nothing' ? 'nothing' : 'low_confidence' } : !pre.ok ? { ts: null, usd: null, skipped_reason: 'prefilter' } : null,
       skill: k ? { name: k.name as string, status: k.status as string } : null, queued: !!r.queued };
   });
+  const rows = flat.filter((r) => !r.parent).map((r) => ({ ...r, units: flat.filter((u) => u.parent === r.session_key).reverse() })), every = rows.flatMap((r) => [r, ...r.units]);
   const todo = (kind: 'scan' | 'extract', n: number) => ({ count: n, estimate_usd: estimate(kind, n) });
   return {
     stages: ([['captured', 'Captured · no model', null], ['scanned', `Scanned · ${jev ? 'Jev' : cap1(st.brain_classifier_model)}`, jev ? 'jev' : st.brain_classifier_model],
       ['extracted', `Extracted · ${cap1(st.brain_writer_model)}`, st.brain_writer_model], ['candidate', 'Skill candidate · you review', null], ['promoted', 'Promoted · you decide', null]] as [string, string, string | null][])
-      .map(([id, label, model], i) => ({ id, label, model, count: rows.filter((r) => STAGES.indexOf(r.stage) >= i).length })), // cumulative: reads as a funnel
-    rows, cap: { spent_usd: spend(), cap_usd: st.brain_daily_usd as number }, running: running && { ...running },
-    todo: { scan: todo('scan', rows.filter(toScan).length), extract: todo('extract', rows.filter(toExtract).length) },
+      .map(([id, label, model], i) => ({ id, label, model, count: every.filter((r) => STAGES.indexOf(r.stage) >= i).length })), // cumulative: reads as a funnel
+    rows, cap: { spent_usd: spend(), cap_usd: st.brain_daily_usd as number }, running: running && { ...running }, avg: { scan: avgUsd('scan'), extract: avgUsd('extract') },
+    todo: { scan: todo('scan', every.filter(toScan).length), extract: todo('extract', every.filter(toExtract).length) },
   };
 }
 const toScan = (r: { stage: string; pre: boolean }) => r.stage === 'captured' && r.pre;            // captured, big enough, never scanned
 const toExtract = (r: { scan: { wanted: boolean } | null; extract: { ts: number | null } | null }) => !!r.scan?.wanted && !r.extract?.ts; // the scan said keep something (kind != nothing at the confidence), no writer yet
 // scan-all / extract-all: sequential, in the background, one at a time; stops at the daily cap or when the brain is turned off.
-function batch(kind: 'scan' | 'extract', limit: unknown): [number, any] {
+// Every unit, or with `session` only that session's subagent runs and segments; a session's units go oldest first, so later runs refine earlier ones.
+function batch(kind: 'scan' | 'extract', limit: unknown, session?: string): [number, any] {
   if (running) return [409, err('brain_busy', `${running.kind} is running: ${running.done} of ${running.total}`)];
-  const p = pipeline(), sks = p.rows.filter(kind === 'scan' ? toScan : toExtract).map((r) => r.session_key).slice(0, Number(limit) > 0 ? Number(limit) : undefined);
+  const p = pipeline(), sks = p.rows.flatMap((r) => (session ? r.session_key === session ? r.units : [] : [r, ...r.units])).filter(kind === 'scan' ? toScan : toExtract).map((r) => r.session_key).slice(0, Number(limit) > 0 ? Number(limit) : undefined);
   if (p.cap.spent_usd >= p.cap.cap_usd) return [409, err('brain_over_cap')];
   const run = (running = { kind, done: 0, total: sks.length });
   void (async () => {
@@ -625,12 +774,12 @@ export function graph() {
   };
   for (const p of files) {
     if (!byBase.has(base(p))) byBase.set(base(p), p);
-    const type = /^wiki\/logs\/[^/]+\.md$/.test(p) ? 'session' : /^wiki\/projects\/[^/]+\.md$/.test(p) ? 'project' : /^wiki\/daily\/[^/]+\.md$/.test(p) ? 'day' : null;
-    if (!type) continue; // index.md, the manual and the log link to everything; notes in folders the router does not write are left out
-    const t = read(p), f = front(t) ?? {}, project = f.project && f.project !== 'null' ? f.project : null;
+    const kind = /^wiki\/logs\/[^/]+\.md$/.test(p) ? 'session' : /^wiki\/projects\/[^/]+\.md$/.test(p) ? 'project' : /^wiki\/daily\/[^/]+\.md$/.test(p) ? 'day' : null;
+    if (!kind) continue; // index.md, the manual and the log link to everything; notes in folders the router does not write are left out
+    const t = read(p), f = front(t) ?? {}, project = f.project && f.project !== 'null' ? f.project : null, type = kind === 'session' && f.unit ? 'unit' : kind; // unit: a subagent run or a segment
     texts.push([p, t]);
-    node(p, p, type === 'session' ? f.title || base(p).slice(11) : base(p), type, type === 'session' ? { session: f.session ?? null, project } : {});
-    if (type === 'session' && f.session) sess.set(f.session, p);
+    node(p, p, kind === 'session' ? f.title || base(p).slice(11) : base(p), type, type === 'unit' ? { unit: f.unit, kind: f.kind, parent: f.parent ?? null, project } : type === 'session' ? { session: f.session ?? null, project } : {});
+    if (kind === 'session' && (f.unit ?? f.session)) sess.set(f.unit ?? f.session, p);
   }
   // a skill is one node, whichever of its two files a link names: skills/<name>.md (the note) or skills/candidates/<name>/SKILL.md
   const skills = all(`select name, status, source, source_session ss from brain_skills where status != 'rejected' order by name`), sid = (n: string) => `skills/${n}.md`;
@@ -640,10 +789,12 @@ export function graph() {
     for (const p of mine) texts.push([sid(k.name), read(p)]);
   }
   const projectOf = (id?: string) => (id && nodes.get(id)!.meta.project ? `wiki/projects/${nodes.get(id)!.meta.project}.md` : undefined);
-  for (const k of skills) { edge(sid(k.name), sess.get(k.ss), 'source'); edge(sid(k.name), projectOf(sess.get(k.ss)), 'project'); }
+  for (const x of all('select skill, unit_id u from skill_sources')) edge(sid(x.skill), sess.get(x.u), 'source'); // every unit that wrote or refined it
+  for (const k of skills) edge(sid(k.name), projectOf(sess.get(k.ss)), 'project');
   for (const u of all(`select distinct t.arg name, r.session_key sk from tool_uses t join requests r on r.request_id = t.request_id where t.name = 'Skill' and t.arg is not null`)) edge(sid(u.name), sess.get(u.sk), 'used');
   for (const [id, n] of nodes) if (n.type === 'session') { edge(id, projectOf(id), 'project'); edge(id, `wiki/daily/${base(id).slice(0, 10)}.md`, 'day'); }
-  const TYPE_TAGS = new Set(['session', 'project', 'daily', 'skill']); // one per note type: the node's colour already says it
+    else if (n.type === 'unit') edge(id, sess.get(n.meta.parent), n.meta.kind); // 'subagent' | 'segment'
+  const TYPE_TAGS = new Set(['session', 'project', 'daily', 'skill', 'unit', 'subagent', 'segment']); // one per note type: the node's colour already says it
   for (const [id, t] of texts) for (const g of tagsOf(t)) if (!TYPE_TAGS.has(g) && g !== tag(nodes.get(id)!.meta.project ?? '')) { node(`tag:${g}`, null, `#${g}`, 'tag'); edge(id, `tag:${g}`, 'tag'); }
   const resolve = (to: string) => { // like the console's reader: a vault path, else the note with that name
     const w = to.replace(/[|#].*$/, '').replace(/\.md$/, '').trim(), p = have.has(`${w}.md`) || nodes.has(`${w}.md`) ? `${w}.md` : byBase.get(w.split('/').pop()!), m = p?.match(/^skills\/candidates\/([^/]+)\/SKILL\.md$/);
@@ -687,12 +838,18 @@ export async function brainApi(m: string, [what = '', a, b]: string[], q: URLSea
       if (what === 'stats') return [200, stats()];
       if (what === 'pipeline') return [200, pipeline()];
       if (what === 'graph') return [200, graph()];
-      if (what === 'tree') return [200, { dir: dir(), files: tree() }];
+      if (what === 'tree') { // units: unit note -> its session's note
+        const units = all(`select b.note_path p, s.note_path sp from brain_sessions b join brain_sessions s on s.session_key = b.parent where b.note_path is not null and s.note_path is not null`);
+        return [200, { dir: dir(), files: tree(), ...(units.length && { units: Object.fromEntries(units.map((r) => [r.p, r.sp])) }) }];
+      }
       if (what === 'search') return [200, search(q.get('q') ?? '')];
       if (what !== 'note') return [404, err('not_found')];
       const p = safe(q.get('path') ?? ''), rel = p.slice(dir().length + 1);
       if (!existsSync(p) || !statSync(p).isFile() || statSync(p).size > 1 << 20) return [404, err('not_found')];
-      return [200, { path: rel, abs: p, text: readFileSync(p, 'utf8'), session: one('select * from brain_sessions where note_path = ?', rel) ?? null }];
+      const upd = rel.match(/^skills\/candidates\/([^/]+)\/SKILL\.md$/), name = upd && one('select name from brain_skills where name = ? and update_ts is not null', upd[1])?.name;
+      let installed = ''; // a proposed update to a promoted skill is shown against the installed copy
+      if (name) try { installed = readFileSync(`${skillsDir()}/${name}/SKILL.md`, 'utf8'); } catch {}
+      return [200, { path: rel, abs: p, text: readFileSync(p, 'utf8'), session: one('select * from brain_sessions where note_path = ?', rel) ?? null, ...(name && { installed }) }];
     }
     if (!settings().brain_enabled) return [409, err('brain_disabled')];
     const root = vault();
@@ -702,7 +859,7 @@ export async function brainApi(m: string, [what = '', a, b]: string[], q: URLSea
       const r = await (what === 'scan' ? scan(input.session) : distill(input.session, input.force === true));
       return [r.error === 'busy' ? 409 : r.error ? 404 : 200, r.error ? err(r.error) : r];
     }
-    if (m === 'POST' && (what === 'scan-all' || what === 'extract-all')) return batch(what === 'scan-all' ? 'scan' : 'extract', input.limit);
+    if (m === 'POST' && (what === 'scan-all' || what === 'extract-all')) return batch(what === 'scan-all' ? 'scan' : 'extract', input.limit, typeof input.session === 'string' ? input.session : undefined);
     if (m === 'POST' && what === 'open') return open(root, input.target);
     if (m === 'POST' && what === 'consolidate') return await consolidate(root, String(input.project ?? ''));
     if (m === 'POST' && what === 'skills' && a === 'import' && !b) return await importSkill(root, String(input.url ?? ''));
@@ -731,7 +888,7 @@ async function tick() {
   ticking = true;
   try {
     await capture({ idle: true });
-    const todo = spend() >= st.brain_daily_usd ? [] : all(`select b.session_key sk from brain_sessions b join sessions s using (session_key) where b.note_path is not null and (b.queued = 1
+    const todo = spend() >= st.brain_daily_usd ? [] : all(`select b.session_key sk from brain_sessions b left join sessions s using (session_key) where b.note_path is not null and (b.queued = 1
       ${st.brain_distill === 'on_idle' ? `or (s.last_ts > ${t - 864e5} and s.last_ts <= ${t - IDLE} and coalesce(b.gated_ts, 0) < s.last_ts)` : ''}) limit 5`);
     for (const { sk } of todo) if ((await distill(sk)).queued) break;
   } catch (e: any) { console.error('brain:', e.message); } finally { ticking = false; }

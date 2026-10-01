@@ -45,6 +45,10 @@ addCol('requests', 'source text');
 addCol('tool_uses', 'arg text');
 addCol('brain_sessions', 'trivial integer'); // 1 = a probe one-shot the brain keeps no note for; null = a note from before that test, judged on the next capture pass
 addCol('brain_sessions', 'scan_usd real'); addCol('brain_sessions', 'extract_usd real');
+// units (docs/BRAIN.md): rows from before them are sessions and keep their scan/extract state; a skill's first source is the session it came from
+for (const c of ["kind text default 'session'", 'parent text', 'agent_id text', 'seg_index integer', 'name text', 'started integer']) addCol('brain_sessions', c);
+addCol('brain_skills', 'update_ts integer');
+db.exec(`insert or ignore into skill_sources (skill, unit_id, ts, mode) select name, source_session, created_ts, 'create' from brain_skills where source_session is not null`);
 db.exec('create index if not exists tool_uses_arg on tool_uses(arg)');
 db.exec(`insert or ignore into accounts (id, kind) values ('home', 'home')`);
 // Clock: Date.now() plus a skew only the DRILLS hook `POST /router/clock {skew_ms}` sets (tests roll a budget period with it).

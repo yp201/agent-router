@@ -233,6 +233,10 @@ skills/          one note per skill (status, the session and project it came fro
   (Sonnet) → skill candidate → promoted — with one row per session showing how far it got and what each step cost. *Scan* runs
   only the classifier; *Scan backlog* and *Extract scanned* work through the rest in the background after a confirm that states
   the count, an estimate and what is left of the daily cap.
+- **Subagents and long sessions.** A subagent run of 8 tool calls or more, and each task segment of a main thread past 150
+  tool calls, gets its own note and its own row under its session, and is scanned and extracted on its own, so the work a
+  session delegated can become a skill too. A run that repeats the procedure of a skill you already have improves that skill
+  instead of adding a near copy; for a promoted skill the improvement waits as a diff until you apply it.
 - **Graph.** An Obsidian-style graph of the vault drawn in the console (no Obsidian needed): sessions, projects, days, skills and
   tags, with a skill tied to the session it came from and the sessions that used it. The same links are written into the notes,
   so Obsidian shows the same picture; *Open in Obsidian* appears when the app is installed, *Reveal folder* otherwise.

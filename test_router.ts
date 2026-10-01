@@ -1551,6 +1551,215 @@ test('ui.html: Brain has the Pipeline, Notes and Graph views; the layout runs to
   assert.ok(ms < 3000, `200 notes laid out in ${ms.toFixed(0)} ms`);
 });
 
+// ---- brain units: subagent runs and task segments are scanned for skills on their own (docs/BRAIN.md "Units") ----
+const okcmds = (sk: string, rid: string, id: string, n: number, cmd = (i: number) => `ffmpeg -i in.mp4 step-${i}`) =>
+  Array.from({ length: n }, (_, i) => tuse(sk, rid, `${id}-${i}`, 'Bash', { command: cmd(i) }) + tres(sk, `${id}-${i}`)).join('');
+// a subagent run: <session>/subagents/agent-<id>.jsonl as the CLI writes it (every row isSidechain), the desktop's label in .meta.json
+async function subrun(b: { proj: string }, sk: string, id: string, name: string, rows: string) {
+  const f = `${b.proj}/-tmp-proj-x/${sk}/subagents/agent-${id}`;
+  mkdirSync(dirname(f), { recursive: true });
+  writeFileSync(`${f}.meta.json`, JSON.stringify({ agentType: 'general-purpose', description: name }));
+  writeFileSync(`${f}.jsonl`, (jrow(sk, { type: 'user', message: { role: 'user', content: `Brief ${id}: render the video` } }) + rows).replace(/^\{/gm, '{"isSidechain":true,'));
+  await new Promise((ok) => setTimeout(ok, 5)); // the next run starts later
+}
+const matchJson = (name: string, conf: number) => JSON.stringify({ answers: { reusable: { value: true, confidence: 0.9 }, kind: { value: 'skill', confidence: 0.85 }, matches: { value: name, confidence: conf } } });
+
+test('brain units: a subagent run of 8+ tool calls and each segment of a 160-call main thread get a note of their own; a small run stays a name; secret redacted, failed command absent, links both ways, user text kept', async (t) => {
+  const b = await brainSetup(t), day = new Date().toLocaleDateString('sv'), SECRET = 'sk-ant-api03-SECRETSECRETSECRET', P = `${day} cut the trailer from the script`;
+  // main thread: three typed prompts over 60 + 50 + 50 tool calls; "ok" is too short to start a segment
+  await b.session('u1', (rid) => ['cut the trailer from the script', 'now add the voice track please', 'export it for the web as mp4'].map((q, j) => jrow('u1', { type: 'user', message: { role: 'user', content: q } })
+    + okcmds('u1', rid, `m${j}`, j ? 50 : 60, (i) => `ffmpeg -i part${j}.mp4 step-${i} ${'-vf scale=1280:720 '.repeat(15)}`)
+    + arow(rid, { in: 10, read: 0, create: 100 }, [{ type: 'text', text: `part ${j} is done` }], 'u1') + (j ? '' : jrow('u1', { type: 'user', message: { role: 'user', content: 'ok' } }))).join(''));
+  b.s.usage = B_USAGE; // the big subagent's one request: $0.825 on Haiku 4.5
+  await b.msg('u1', { model: 'claude-haiku-4-5' });
+  b.s.usage = null;
+  const rid = `req_${b.s.n}`;
+  // 12 tool calls: 8 that worked, one that failed, one with a secret, a file, and the handback that ends the run
+  await subrun(b, 'u1', 'big', 'Build trailer v3', okcmds('u1', rid, 'big', 8) + tuse('u1', rid, 'big-f', 'Bash', { command: 'ffmpeg -i in.mp4 -depoly' }) + tres('u1', 'big-f', true)
+    + tuse('u1', rid, 'big-s', 'Bash', { command: `curl -H "Authorization: Bearer ${SECRET}" https://tts.example.com/speak` }) + tres('u1', 'big-s')
+    + tuse('u1', rid, 'big-w', 'Write', { file_path: '/tmp/proj-x/render.js', content: 'x' }) + tres('u1', 'big-w')
+    + tuse('u1', rid, 'big-h', 'SubagentHandback', { message: 'Trailer v3 rendered to out/trailer.mp4' }) + tres('u1', 'big-h') + arow(rid, { in: 10, read: 0, create: 100 }, [{ type: 'text', text: 'Handed back.' }], 'u1'));
+  await subrun(b, 'u1', 'small', 'Check fonts', okcmds('u1', 'req_none', 'small', 3, (i) => `fc-list step-${i}`));
+  await until(async () => (await b.rows('select agent_id a from requests where request_id = ?', rid))[0]?.a === 'big', 'subagent request joined');
+
+  const r = (await b.call('POST', 'capture', {}))[1];
+  assert.deepEqual([r.notes, r.units], [1, 4]);
+  assert.deepEqual(readdirSync(`${b.vault}/wiki/logs`).sort(), [`${P} — Build trailer v3.md`, `${P} — part 1.md`, `${P} — part 2.md`, `${P} — part 3.md`, `${P}.md`].sort(), 'no note for the 3-call subagent');
+  let big = b.read(`wiki/logs/${P} — Build trailer v3.md`);
+  assert.match(big, /^---\nunit: u1\/big\nkind: subagent\nparent: u1\nagent: big\ntitle: Build trailer v3\nproject: proj-x\nstarted: "\d{4}-.*"\nended: ".*"\nturns: 1\nmodel: claude-haiku-4\ntool_calls: 12\nusd: 0\.825\ntags: \[unit, subagent, proj-x\]\n---\n<!-- agent-router:begin -->\n# Build trailer v3\n/);
+  assert.ok(big.includes(`\n\nSession: [[${P}]] · Project: [[proj-x]]\n\n## Brief\n\n- Brief big: render the video\n\n## Commands that worked\n\n- \`ffmpeg -i in.mp4 step-0\`\n`), big);
+  assert.match(big, /- `ffmpeg -i in\.mp4 step-7`\n- `curl -H "Authorization: \[redacted\]" https:\/\/tts\.example\.com\/speak`\n\n## Files written\n\n- `render\.js`\n\n## Tools\n\n- Bash × 10\n- Write × 1\n- SubagentHandback × 1\n\n## Final report\n\nTrailer v3 rendered to out\/trailer\.mp4\n<!-- agent-router:end -->/);
+  for (const x of [SECRET, 'depoly', 'TOOL-OUTPUT', 'Handed back']) assert.ok(!big.includes(x), `${x} in the unit note`);
+  // segments: cut at the three long prompts; over the ~3,000-token cap a segment lists the first of each command family and its final third
+  const p1 = b.read(`wiki/logs/${P} — part 1.md`), p2 = b.read(`wiki/logs/${P} — part 2.md`);
+  assert.match(p1, /^---\nunit: u1\/seg-1\nkind: segment\nparent: u1\ntitle: "part 1 — cut the trailer from the script"\nproject: proj-x\n[\s\S]*\ntool_calls: 60\n[\s\S]*tags: \[unit, segment, proj-x\]\n---\n/);
+  assert.match(p1, /## Brief\n\n- cut the trailer from the script\n- ok\n\n## Commands that worked\n\n- `ffmpeg -i part0\.mp4 step-0 [^\n]*\n- `ffmpeg -i part0\.mp4 step-40 /);
+  assert.match(p1, /step-59 [^\n]*\n- … and 39 more \(listed: the first of each kind and the final third\)\n\n## Files written\n\n- none\n\n## Tools\n\n- Bash × 60\n\n## Final report\n\npart 0 is done\n/);
+  assert.match(p2, /# part 2 — now add the voice track please\n[\s\S]*## Brief\n\n- now add the voice track please\n\n[\s\S]*## Tools\n\n- Bash × 50\n\n## Final report\n\npart 1 is done\n/);
+  // the session's note keeps its overview (the last 80 commands) and links every unit; the small run is only a name
+  const main = b.read(`wiki/logs/${P}.md`);
+  assert.ok(main.includes(`\n- … and 80 earlier ones\n\n## Tools\n\n- Bash × 160\n\n## Subagents\n\n- [[${P} — Build trailer v3|Build trailer v3]]\n- Check fonts\n\n## Task segments\n\n- [[${P} — part 1|part 1 — cut the trailer from the script]]\n- [[${P} — part 2|part 2 — now add the voice track please]]\n- [[${P} — part 3|part 3 — export it for the web as mp4]]\n\n## Account switches`), main);
+  assert.deepEqual((await b.rows('select session_key k, kind, parent from brain_sessions order by 1')).map((x) => [x.k, x.kind, x.parent]),
+    [['u1', 'session', null], ['u1/big', 'subagent', 'u1'], ['u1/seg-1', 'segment', 'u1'], ['u1/seg-2', 'segment', 'u1'], ['u1/seg-3', 'segment', 'u1']]);
+  for (const f of ['index.md', `wiki/daily/${day}.md`, 'wiki/projects/proj-x.md']) assert.ok(b.read(f).includes(`[[${P}]]`) && !b.read(f).includes(' — part 1') && !b.read(f).includes('Build trailer'), `${f} lists the session, not its units`);
+  assert.deepEqual((await b.call('GET', 'tree'))[1].units[`wiki/logs/${P} — part 1.md`], `wiki/logs/${P}.md`);
+  // recapture: the user's own lines outside the markers stay, the block is rewritten in place
+  appendFileSync(`${b.vault}/wiki/logs/${P} — Build trailer v3.md`, '\nMY UNIT NOTE\n');
+  assert.deepEqual((await b.call('POST', 'capture', { session: 'u1' }))[1].units, 4);
+  big = b.read(`wiki/logs/${P} — Build trailer v3.md`);
+  assert.ok(big.endsWith('<!-- agent-router:end -->\n\nMY UNIT NOTE\n') && big.split('agent-router:begin').length === 2, big.slice(-200));
+  assert.equal(readdirSync(`${b.vault}/wiki/logs`).length, 5);
+  assert.equal((await b.call('GET', 'stats'))[1].sessions_captured, 1, 'units are not sessions');
+  assert.deepEqual(b.calls(), [], 'capture never calls a model');
+  b.noLeak();
+});
+
+test('brain units: scan and extract run per unit on its own note; a run that matches an existing skill refines it, below the confidence it writes a new one; refining a promoted skill waits as an update until Promote', async (t) => {
+  const b = await brainSetup(t), day = new Date().toLocaleDateString('sv'), TAG = 'x-agent-router-source: brain', N = (id: string) => `${day} deploy the worker u2 — Render video ${id}`;
+  await b.session('u2', (rid) => worked('u2', rid, 2));
+  for (const id of ['a', 'b', 'c', 'd']) await subrun(b, 'u2', id, `Render video ${id}`, okcmds('u2', 'req_none', id, 10));
+  assert.deepEqual((await b.call('POST', 'capture', {}))[1].units, 4);
+  const skill = () => b.read('skills/candidates/deploy-worker/SKILL.md'), sources = async () => (await b.rows('select skill, unit_id u, mode, note from skill_sources order by ts')).map((x) => [x.skill, x.u, x.mode, x.note]);
+  const writer = (name: string, body: string, changelog?: string) => writeFileSync(`${b.tmp}/writer.json`, JSON.stringify({ ...WRITER, skill: { name, description: `Use when deploying a worker, ${body}.`, body: `1. Run \`npx wrangler deploy --${body}\`` }, changelog }));
+  const md = (body: string) => `---\nname: deploy-worker\ndescription: "Use when deploying a worker, ${body}."\n---\n\n1. Run \`npx wrangler deploy --${body}\`\n`;
+
+  // unit a: nothing matches yet -> a new candidate. The classifier and the writer see the unit's note, not the session's
+  let r = (await b.call('POST', 'distill', { session: 'u2/a' }))[1];
+  assert.deepEqual([r.gated, r.want_skill, r.refine, r.skill, r.pre], [true, true, undefined, 'deploy-worker', { tool_calls: 10, files: 0, commands: 10 }]);
+  assert.deepEqual(b.calls(), [`classifier haiku ${TAG}`, `writer sonnet ${TAG}`]);
+  const state = readFileSync(`${b.tmp}/prompt.classifier`, 'utf8').split('Session note:\n')[1];
+  assert.ok(state.startsWith('# Render video a\n') && state.includes('## Brief\n\n- Brief a: render the video\n\n## Commands that worked\n\n- `ffmpeg -i in.mp4 step-0`') && !state.includes('wrangler'), state);
+  assert.match(readFileSync(`${b.tmp}/prompt.writer`, 'utf8'), /The classifier found a repeatable skill[\s\S]*End with a short "## Verify" step\. Never invent a step[\s\S]*"want_skill":true,"existing_skills":\[\],"run":"# Render video a\\n/);
+  assert.match(b.read(`wiki/logs/${N('a')}.md`), /## Distilled\n\nDeployed the worker\.[\s\S]*Skill candidate: \[\[skills\/deploy-worker\|deploy-worker\]\]\n<!-- agent-router:end distilled -->/);
+
+  // unit b: `matches` names that skill at the confidence -> the writer gets the existing SKILL.md; keeping its name, the answer replaces it
+  const v1 = skill();
+  writeFileSync(`${b.tmp}/classifier.json`, matchJson('deploy-worker', 0.9));
+  writer('deploy-worker', 'minify', 'Run b added --minify');
+  r = (await b.call('POST', 'distill', { session: 'u2/b' }))[1];
+  assert.deepEqual([r.want_skill, r.refine, r.skill, r.refined], [false, 'deploy-worker', 'deploy-worker', true]);
+  const asked = readFileSync(`${b.tmp}/prompt.writer`, 'utf8');
+  assert.ok(readFileSync(`${b.tmp}/prompt.classifier`, 'utf8').includes('Answer with an existing skill only if this run performs the same procedure with the same main tools; similar topic is not enough.'));
+  assert.ok(asked.includes('this run repeats the procedure of an existing skill') && !asked.includes('The classifier found a repeatable skill') && asked.includes(`"existing_skill":${JSON.stringify(v1)}`), 'refine mode: the existing SKILL.md is in the input');
+  assert.equal(skill(), md('minify'));
+  assert.deepEqual(await sources(), [['deploy-worker', 'u2/a', 'create', null], ['deploy-worker', 'u2/b', 'refine', 'Run b added --minify']]);
+  assert.ok(b.read('skills/deploy-worker.md').includes(`\n\n## Sources\n\n- [[${N('a')}]] · create\n- [[${N('b')}]] · refine · Run b added --minify\n`), b.read('skills/deploy-worker.md'));
+  assert.match(b.read(`wiki/logs/${N('b')}.md`), /Skill candidate: \[\[skills\/deploy-worker\|deploy-worker\]\]\n<!-- agent-router:end distilled -->/);
+  assert.deepEqual((await b.rows(`select skill_candidate s from brain_sessions where session_key = 'u2/b'`))[0].s, 'deploy-worker');
+
+  // unit c: a match below the confidence is no match -> a new skill
+  writeFileSync(`${b.tmp}/classifier.json`, matchJson('deploy-worker', 0.5));
+  writer('render-video', 'webm');
+  r = (await b.call('POST', 'distill', { session: 'u2/c' }))[1];
+  assert.deepEqual([r.want_skill, r.refine, r.skill, r.refined], [true, undefined, 'render-video', undefined]);
+  // a writer that copies a shell escape JSON does not know (ffmpeg's `\:`) into the body is still read, and the backslash kept
+  writeFileSync(`${b.tmp}/writer.json`, JSON.stringify({ ...WRITER, skill: { name: 'render-video', description: 'Use when rendering.', body: '1. Run `ffmpeg -vf drawtext=text=aCOLONb`' } }).replace('COLON', '\\:'));
+  assert.equal((await b.call('POST', 'distill', { session: 'u2/c' }))[1].skill, 'render-video');
+  assert.ok(b.read('skills/candidates/render-video/SKILL.md').endsWith('1. Run `ffmpeg -vf drawtext=text=a\\:b`\n'));
+  assert.ok(!readFileSync(`${b.tmp}/prompt.writer`, 'utf8').includes('"existing_skill":'), 'create mode');
+  assert.deepEqual([skill(), (await sources()).slice(2)], [md('minify'), [['render-video', 'u2/c', 'create', null]]]);
+  // …and so is a match the writer does not agree with: in refine mode it answers under a new name, and the matched skill is left alone
+  writeFileSync(`${b.tmp}/classifier.json`, matchJson('deploy-worker', 0.9));
+  writer('encode-audio', 'opus', undefined);
+  r = (await b.call('POST', 'distill', { session: 'u2/c' }))[1];
+  assert.deepEqual([r.refine, r.skill, r.refined, skill()], ['deploy-worker', 'encode-audio', undefined, md('minify')]);
+  assert.deepEqual((await sources()).slice(2).map((x) => x.slice(0, 3)), [['render-video', 'u2/c', 'create'], ['encode-audio', 'u2/c', 'create']]);
+
+  // a promoted skill is never rewritten where it is installed: the refinement waits in the vault as an update
+  assert.equal((await b.call('POST', 'skills/deploy-worker/promote'))[0], 200);
+  const installed = () => readFileSync(`${b.skills}/deploy-worker/SKILL.md`, 'utf8'), st = async () => (await b.call('GET', 'stats'))[1].skills.find((k: any) => k.name === 'deploy-worker');
+  writeFileSync(`${b.tmp}/classifier.json`, matchJson('deploy-worker', 0.9));
+  writer('deploy-worker', 'dry-run', 'Run d checks with --dry-run first');
+  assert.deepEqual((await b.call('POST', 'distill', { session: 'u2/d' }))[1].refined, true);
+  assert.deepEqual([installed(), skill(), (await st()).status, (await st()).update], [md('minify'), md('dry-run'), 'promoted', true], 'the installed copy is untouched');
+  const note = (await b.call('GET', `note?path=${encodeURIComponent('skills/candidates/deploy-worker/SKILL.md')}`))[1];
+  assert.deepEqual([note.installed, note.text], [md('minify'), md('dry-run')], 'the console diffs the two');
+  assert.match(b.read('skills/deploy-worker.md'), /Status: promoted since \d{4}-\d\d-\d\d \(an update is waiting for review\) · Source: /);
+  // Discard: the vault's copy is the installed one again. Refine once more, then Apply (= promote): the installed copy takes the update
+  assert.deepEqual(await b.call('POST', 'skills/deploy-worker/reject'), [200, { ok: true, name: 'deploy-worker', status: 'promoted' }]);
+  assert.deepEqual([skill(), (await st()).update, (await b.call('POST', 'skills/deploy-worker/reject'))[0]], [md('minify'), undefined, 409]);
+  assert.deepEqual((await b.call('POST', 'distill', { session: 'u2/d' }))[1].refined, true);
+  assert.deepEqual([installed(), (await st()).update], [md('minify'), true]);
+  assert.equal((await b.call('POST', 'skills/deploy-worker/promote'))[0], 200);
+  assert.deepEqual([installed(), skill(), (await st()).status, (await st()).update], [md('dry-run'), md('dry-run'), 'promoted', undefined]);
+  assert.deepEqual((await sources()).map((x) => x.slice(0, 3)), [['deploy-worker', 'u2/a', 'create'], ['deploy-worker', 'u2/b', 'refine'], ['render-video', 'u2/c', 'create'], ['encode-audio', 'u2/c', 'create'], ['deploy-worker', 'u2/d', 'refine']]);
+  assert.equal(b.calls().length, 14, 'one classifier and one writer call per extract');
+  b.noLeak();
+});
+
+test('brain units: scan-all and extract-all with {session} touch only that session\'s units, oldest first, and stop at the cap; pipeline rows nest units and the funnel counts them; the graph has unit nodes and skill-to-source-unit edges', async (t) => {
+  const b = await brainSetup(t), day = new Date().toLocaleDateString('sv'), TAG = 'x-agent-router-source: brain', pipe = async () => (await b.call('GET', 'pipeline'))[1];
+  const done = () => until(async () => { const x = await pipe(); return !x.running && x; }, 'batch finished');
+  await b.session('s1', (rid) => worked('s1', rid, 2));
+  for (const id of ['a', 'b']) await subrun(b, 's1', id, `Render ${id}`, okcmds('s1', 'req_none', id, 10));
+  await b.session('s2', (rid) => worked('s2', rid, 2));
+  await subrun(b, 's2', 'c', 'Render c', okcmds('s2', 'req_none', 'c', 10));
+  await b.call('POST', 'capture', {});
+  let p = await pipe();
+  const shape = (x: any) => x.rows.map((r: any) => [r.session_key, r.kind, r.stage, r.units.map((u: any) => [u.session_key, u.kind, u.parent, u.title, u.project, u.tool_calls, u.pre, u.stage, u.skill?.name ?? null])]);
+  assert.deepEqual(shape(p), [['s2', 'session', 'captured', [['s2/c', 'subagent', 's2', 'Render c', 'proj-x', 10, true, 'captured', null]]],
+    ['s1', 'session', 'captured', [['s1/a', 'subagent', 's1', 'Render a', 'proj-x', 10, true, 'captured', null], ['s1/b', 'subagent', 's1', 'Render b', 'proj-x', 10, true, 'captured', null]]]]);
+  assert.deepEqual([p.stages.map((s: any) => s.count), p.todo.scan.count, p.avg], [[5, 0, 0, 0, 0], 3, { scan: null, extract: null }], 'the funnel counts units: 2 sessions (too small to scan) and 3 subagent runs');
+
+  // scan this session's subagents: two classifier calls, s2's run is not touched
+  const [s1, r1] = await b.call('POST', 'scan-all', { session: 's1' });
+  assert.deepEqual([s1, r1.kind, r1.total], [202, 'scan', 2]);
+  p = await done();
+  assert.deepEqual(b.calls(), [`classifier haiku ${TAG}`, `classifier haiku ${TAG}`]);
+  assert.deepEqual([p.stages.map((s: any) => s.count), shape(p).map((r: any) => r[3].map((u: any) => u[7])), p.todo], [[5, 2, 0, 0, 0], [['captured'], ['scanned', 'scanned']], { scan: { count: 1, estimate_usd: 0 }, extract: { count: 2, estimate_usd: null } }]);
+  // extract them, oldest first: a writes the skill; b was scanned before that skill existed, so it is asked again, matches it and refines it
+  writeFileSync(`${b.tmp}/classifier.json`, matchJson('deploy-worker', 0.9));
+  assert.deepEqual((await b.call('POST', 'extract-all', { session: 's1' }))[1].total, 2);
+  p = await done();
+  assert.deepEqual(b.calls().slice(2), [`writer sonnet ${TAG}`, `classifier haiku ${TAG}`, `writer sonnet ${TAG}`]);
+  assert.deepEqual((await b.rows('select unit_id u, mode from skill_sources order by ts')).map((x) => [x.u, x.mode]), [['s1/a', 'create'], ['s1/b', 'refine']]);
+  assert.deepEqual([p.stages.map((s: any) => s.count), shape(p)[1][3].map((u: any) => [u[7], u[8]]), shape(p)[0][3][0][7]], [[5, 2, 2, 2, 0], [['candidate', 'deploy-worker'], ['candidate', 'deploy-worker']], 'captured']);
+
+  // graph: a unit is a node tied to its session; the skill is tied to both units it came from
+  const g = (await b.call('GET', 'graph'))[1], U = (id: string, n: string) => `wiki/logs/${day} deploy the worker ${id} — Render ${n}.md`, K = 'skills/deploy-worker.md';
+  const pairs = (kind: string) => g.edges.filter((e: any) => e.kind === kind).map((e: any) => [e.a, e.b].sort().join(' ~ ')).sort();
+  assert.deepEqual(g.nodes.filter((n: any) => n.type === 'unit').map((n: any) => [n.id, n.title, n.meta]).sort(), [[U('s1', 'a'), 'Render a', { unit: 's1/a', kind: 'subagent', parent: 's1', project: 'proj-x' }],
+    [U('s1', 'b'), 'Render b', { unit: 's1/b', kind: 'subagent', parent: 's1', project: 'proj-x' }], [U('s2', 'c'), 'Render c', { unit: 's2/c', kind: 'subagent', parent: 's2', project: 'proj-x' }]]);
+  assert.deepEqual(g.nodes.filter((n: any) => n.type === 'session').length, 2);
+  assert.deepEqual(pairs('subagent'), [`${U('s1', 'a')} ~ wiki/logs/${day} deploy the worker s1.md`, `${U('s1', 'b')} ~ wiki/logs/${day} deploy the worker s1.md`, `${U('s2', 'c')} ~ wiki/logs/${day} deploy the worker s2.md`].sort());
+  assert.deepEqual(pairs('source'), [`${K} ~ ${U('s1', 'a')}`, `${K} ~ ${U('s1', 'b')}`].sort());
+  assert.deepEqual(pairs('project').filter((x: string) => x.includes(K)), [`${K} ~ wiki/projects/proj-x.md`]);
+
+  // over the daily cap nothing starts
+  await b.put({ brain_daily_usd: 0.5 });
+  b.s.usage = B_USAGE;
+  await b.msg('own', { model: 'claude-haiku-4-5' }, { 'x-agent-router-source': 'brain' });
+  await until(async () => (await pipe()).cap.spent_usd > 0.5, 'brain spend logged');
+  assert.deepEqual(await b.call('POST', 'scan-all', { session: 's2' }), [409, { error: { type: 'brain_over_cap' } }]);
+  assert.equal(b.calls().length, 5);
+  b.noLeak();
+});
+
+test('brain units: a ledger from before units keeps each session\'s scan and extract state, and its skills get their source', () => {
+  const f = `${mkdtempSync(`${tmpdir()}/router-mig-`)}/ledger.sqlite`, old = new DatabaseSync(f);
+  old.exec(`create table brain_sessions (session_key text primary key, last_captured_ts integer, note_path text, gate_json text, gate_backend text, gated_ts integer, distilled_ts integer, skill_candidate text, queued integer default 0, trivial integer, scan_usd real, extract_usd real);
+    create table brain_skills (name text primary key, status text, source text, source_session text, created_ts integer, promoted_ts integer);
+    insert into brain_sessions values ('old', 1, 'wiki/logs/2026-09-30 old.md', '{"gated":true}', 'model', 2, 3, 'old-skill', 0, 0, 0.004, 0.03);
+    insert into brain_skills values ('old-skill', 'promoted', 'session', 'old', 4, 5), ('imported', 'candidate', 'https://example.com/SKILL.md', null, 6, null);`);
+  old.close();
+  execFileSync(process.execPath, [`${import.meta.dirname}/ledger.ts`], { env: { ...process.env, LEDGER_PATH: f } }); // opening the ledger is the upgrade
+  const db = new DatabaseSync(f);
+  assert.deepEqual({ ...db.prepare('select * from brain_sessions').get() }, { session_key: 'old', last_captured_ts: 1, note_path: 'wiki/logs/2026-09-30 old.md', gate_json: '{"gated":true}', gate_backend: 'model', gated_ts: 2, distilled_ts: 3,
+    skill_candidate: 'old-skill', queued: 0, trivial: 0, scan_usd: 0.004, extract_usd: 0.03, kind: 'session', parent: null, agent_id: null, seg_index: null, name: null, started: null });
+  assert.deepEqual(db.prepare('select * from skill_sources').all().map((x: any) => ({ ...x })), [{ skill: 'old-skill', unit_id: 'old', ts: 4, mode: 'create', note: null }]);
+  assert.deepEqual(db.prepare('select name, update_ts from brain_skills order by 1').all().map((x: any) => [x.name, x.update_ts]), [['imported', null], ['old-skill', null]]);
+  db.close();
+});
+
+test('ui.html: the Pipeline nests a session\'s units, the Graph has a Subagents chip, a proposed skill update is shown as a line diff', () => {
+  const page = readFileSync(new URL('./ui.html', import.meta.url), 'utf8');
+  for (const x of ["['unit', 'Subagents', 'muted']", 'unit: true', 'data-session="${esc(r.session_key)}"', "Scan this session's ${segs ? 'units' : 'subagents'} (${n(toScan)})", 'Extract (${n(toExtract)})', 'data-k="pu-${sk}"', "'Apply update'", "'Discard update'", 'ldiff(note.installed, note.text)', 't.units ?? {}'])
+    assert.ok(page.includes(x), `ui.html lacks ${x}`);
+  const ldiff = new Function(`${page.slice(page.indexOf('// diff:begin'), page.indexOf('// diff:end'))}; return ldiff;`)() as (a: string, b: string) => [string, string][];
+  assert.deepEqual(ldiff('a\nb\nc\nd', 'a\nc\nx\nd').map(([m, l]) => m + l), ['  a', '- b', '  c', '+ x', '  d']);
+  assert.deepEqual([ldiff('same', 'same'), ldiff('old', 'new').map(([m]) => m).sort()], [[['  ', 'same']], ['+ ', '- ']]);
+});
+
 // ---- limits as the unit, keep warm, tool loading advisor, facts switch (docs/COST-INSIGHTS.md "Next") ----
 // rows written straight into the arith ledger (console.ts is imported in-process): one priced /v1/messages row per call
 const RLH = 'anthropic-ratelimit-unified-';

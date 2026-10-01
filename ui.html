@@ -72,7 +72,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .chip.dash { background: none; border: 1px dashed var(--teal); color: var(--teal); }
 #graph { width: 100%; height: 68vh; min-height: 420px; display: block; border-radius: 8px; background: var(--bg); border: 1px solid var(--line); touch-action: none; user-select: none; cursor: grab; }
 #graph .e { stroke: var(--gray); stroke-width: 1; vector-effect: non-scaling-stroke; } #graph .e.source, #graph .e.used { stroke: var(--teal); stroke-opacity: .55; } #graph .e.hi { stroke: var(--muted); stroke-opacity: 1; }
-#graph .n { cursor: pointer; } #graph .n circle { fill: var(--muted); stroke: var(--bg); stroke-width: 1; } #graph .n.project circle { fill: var(--clay); } #graph .n.day circle { fill: var(--gray); }
+#graph .n { cursor: pointer; } #graph .n circle { fill: var(--muted); stroke: var(--bg); stroke-width: 1; } #graph .n.unit circle { fill-opacity: .6; } #graph .n.project circle { fill: var(--clay); } #graph .n.day circle { fill: var(--gray); }
 #graph .n.skill circle { fill: var(--teal); } #graph .n.candidate circle { fill: var(--teal); fill-opacity: .3; stroke: var(--teal); stroke-width: 1.5; stroke-dasharray: 3 2; } #graph .n.tag circle { fill: var(--amber); }
 #graph .n.pin circle { stroke: var(--fg); } #graph .n.match circle { stroke: var(--amber); stroke-width: 2.5; }
 #graph text { font: 11px var(--sans); font-size: calc(11px / var(--k, 1)); fill: var(--muted); pointer-events: none; display: none; } /* --k = zoom: labels keep their size on screen */
@@ -223,14 +223,31 @@ const md = (src) => {
 const PC = 'grid-template-columns:minmax(0,1.2fr) minmax(0,.6fr) minmax(0,2.3fr) 250px'; // Pipeline table
 const SKIP = { nothing: 'The scan found nothing worth keeping', low_confidence: 'The scan was not sure enough to spend a writer call', prefilter: 'Fewer than 8 tool calls, or no file written and no command run: not worth a model call' };
 const chip = (cls, text, title = '') => `<span class="chip ${cls}"${title ? ` title="${esc(title)}"` : ''}>${text}</span>`;
+// diff:begin (test_router.ts loads this block)
+// Line diff (longest common subsequence) of two texts: [['  ' | '- ' | '+ ', line]]. For a proposed skill update against the installed copy.
+const ldiff = (a, b) => {
+  const A = a.split('\n'), B = b.split('\n'), n = A.length, m = B.length, L = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1)), out = [];
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = A[i] === B[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  for (let i = 0, j = 0; i < n || j < m;) {
+    if (i < n && j < m && A[i] === B[j]) { out.push(['  ', A[i]]); i++; j++; }
+    else if (j < m && (i === n || L[i][j + 1] >= L[i + 1][j])) out.push(['+ ', B[j++]]);
+    else out.push(['- ', A[i++]]);
+  }
+  return out;
+};
+// diff:end
+const toScan = (r) => r.stage === 'captured' && r.pre, toExtract = (r) => !!r.scan?.wanted && !r.extract?.ts; // as brain.ts
 const brainPipeline = (p) => {
-  const at = (id) => p.stages.findIndex((s) => s.id === id), rows = ui.pstage ? p.rows.filter((r) => at(r.stage) >= at(ui.pstage)) : p.rows;
+  const at = (id) => p.stages.findIndex((s) => s.id === id), reached = (r) => !ui.pstage || at(r.stage) >= at(ui.pstage), rows = p.rows.filter((r) => reached(r) || r.units.some(reached));
   const left = Math.max(0, p.cap.cap_usd - p.cap.spent_usd), run = p.running, off = ui.busy.brain || run ? 'disabled' : '', by = (i) => p.stages[i].label.split(' · ')[1];
   const all = (kind, label, i) => `<button class="sm" data-bact="${kind}-all" data-n="${p.todo[kind].count}" data-est="${p.todo[kind].estimate_usd ?? ''}" data-left="${left}" data-by="${esc(by(i))}" ${off || (p.todo[kind].count ? '' : 'disabled')}>${label} (${p.todo[kind].count})</button>`;
   const arrow = '<span class="muted" aria-hidden="true">→</span>';
-  const tr = (r) => { const sc = r.scan, ex = r.extract, sk = esc(r.session_key), busy = ui.busy.brain === r.session_key, anyway = !ex?.ts && (sc ? !sc.wanted : !r.pre); // the gate would say no: skip it
+  // a session's own batch: its subagent runs and segments, oldest first
+  const own = (r, kind, n, label) => `<button class="sm" data-bact="${kind}-all" data-session="${esc(r.session_key)}" data-n="${n}" data-est="${p.avg[kind] == null ? '' : n * p.avg[kind]}" data-left="${left}" data-by="${esc(by(kind === 'scan' ? 1 : 2))}" ${off || (n ? '' : 'disabled')}>${label}${kind === 'scan' && n && p.avg.scan != null ? ` — about $${(n * p.avg.scan).toFixed(2)}` : ''}</button>`;
+  const tr = (r, kid) => { const sc = r.scan, ex = r.extract, sk = esc(r.session_key), busy = ui.busy.brain === r.session_key, anyway = !ex?.ts && (sc ? !sc.wanted : !r.pre); // the gate would say no: skip it
+    const u = r.units ?? [], n = (f) => u.filter(f).length, segs = n((x) => x.kind === 'segment');
     return `<div class="tr" style="${PC}">
-      <div class="col" style="gap:0;min-width:0"><span class="nm" title="${sk}">${esc(r.title)}</span><span class="small muted" style="font-family:var(--sans)">${new Date(r.last_ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} · ${r.turns} turns · ${r.tool_calls ?? '—'} tool calls</span></div>
+      <div class="col" style="gap:0;min-width:0${kid ? ';padding-left:22px' : ''}"><span class="nm" title="${sk}">${kid ? `${chip('', esc(r.kind))} ` : ''}${esc(r.title)}</span><span class="small muted" style="font-family:var(--sans)">${new Date(r.last_ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} · ${r.turns} turns · ${r.tool_calls ?? '—'} tool calls</span></div>
       <span class="nm muted">${esc(r.project ?? '—')}</span>
       <div class="steps">${chip('ok', 'Captured ✓')}${arrow}
         ${sc ? chip(sc.kind === 'skill' ? 'ok' : sc.kind === 'nothing' ? '' : 'warn', `Scan: ${sc.kind === 'nothing' ? 'nothing' : `${sc.kind === 'skill' ? 'skill' : 'knowledge'} ${sc.confidence.toFixed(2)}`}`, `${sc.backend} · repeatable procedure: ${sc.reusable ? 'yes' : 'no'}${sc.matches && sc.matches !== 'new' ? ` · an existing skill may cover it: ${sc.matches}` : ''}${sc.usd == null ? '' : ` · cost $${sc.usd.toFixed(3)}`}`)
@@ -240,7 +257,10 @@ const brainPipeline = (p) => {
         ${r.skill ? `<button class="plain" data-note="skills/${esc(r.skill.name)}.md" title="${esc(r.skill.status)}">${chip(r.skill.status === 'promoted' ? 'ok' : 'dash', `Skill: ${esc(r.skill.name)}`)}</button>` : chip('', 'Skill: —')}</div>
       <div class="row" style="flex-wrap:wrap;gap:4px">${r.pre ? `<button class="sm" data-bact="scan" data-sk="${sk}" ${off}>${busy ? '…' : sc ? 'Rescan' : 'Scan'}</button>` : ''}
         <button class="sm" data-bact="${anyway ? 'force' : 'distill'}" data-sk="${sk}" ${off}>${busy ? '…' : ex?.ts ? 'Extract again' : anyway ? 'Extract anyway' : 'Extract'}</button>
-        <button class="sm" data-note="${esc(r.note_path)}">Open note</button></div></div>`; };
+        <button class="sm" data-note="${esc(r.note_path)}">Open note</button>
+        ${u.length ? own(r, 'scan', n(toScan), `Scan this session's ${segs ? 'units' : 'subagents'} (${n(toScan)})`) + own(r, 'extract', n(toExtract), `Extract (${n(toExtract)})`) : ''}</div></div>
+      ${u.length ? `<details data-k="pu-${sk}" ${ui.open[`pu-${r.session_key}`] ? 'open' : ''}><summary style="padding:2px 10px 6px 22px">${[[u.length - segs, 'subagent'], [segs, 'segment']].filter(([c]) => c).map(([c, l]) => `${c} ${l}${c === 1 ? '' : 's'}`).join(' · ')} · ${n((x) => x.scan)} scanned · ${n((x) => x.skill)} skill${n((x) => x.skill) === 1 ? '' : 's'}</summary>
+        <div class="table">${u.filter(reached).map((x) => tr(x, true)).join('')}</div></details>` : ''}`; };
   return `<section class="panel">
       <div class="funnel" role="group" aria-label="Pipeline stages; click one to filter the table">${p.stages.map((s, i) => { const [l, m] = s.label.split(' · ');
         return `${i ? '<span class="arrow" aria-hidden="true">→</span>' : ''}<button class="stage" data-stage="${s.id}" aria-pressed="${ui.pstage === s.id}"><span class="big">${s.count}</span><b>${esc(l)}</b><span class="small muted">${esc(m ?? '')}</span></button>`; }).join('')}</div>
@@ -248,17 +268,17 @@ const brainPipeline = (p) => {
         ${run ? `<span class="row small" aria-live="polite" style="min-width:220px"><span class="dot"></span>${run.kind === 'scan' ? 'Scanning' : 'Extracting'} ${Math.min(run.done + 1, run.total)} of ${run.total}…${bar([[run.total ? run.done / run.total : 0, 'var(--teal)']])}</span>` : ''}</div>
         <span class="small muted">Brain spend today <span class="mono ${left ? '' : 'clay'}">${usd(p.cap.spent_usd)}</span> of ${usd(p.cap.cap_usd)} at list price · scanning and extracting stop at the cap</span></div>
       <div class="table">
-        <div class="tr th" style="${PC}"><span>session${ui.pstage ? ` · reached “${esc(p.stages[at(ui.pstage)].label.split(' · ')[0])}”` : ''}</span><span>project</span><span>steps</span><span>actions</span></div>
-        ${rows.map(tr).join('') || `<div class="note">${p.rows.length ? 'No session has reached this stage yet.' : 'No sessions captured yet. A session gets its note once it has been idle for 15 minutes; “Capture now” in Notes writes them all.'}</div>`}
+        <div class="tr th" style="${PC}"><span>session, and its subagent runs and segments${ui.pstage ? ` · reached “${esc(p.stages[at(ui.pstage)].label.split(' · ')[0])}”` : ''}</span><span>project</span><span>steps</span><span>actions</span></div>
+        ${rows.map((r) => tr(r)).join('') || `<div class="note">${p.rows.length ? 'No session has reached this stage yet.' : 'No sessions captured yet. A session gets its note once it has been idle for 15 minutes; “Capture now” in Notes writes them all.'}</div>`}
       </div>
-      <div class="note">Capturing is free. A scan is one small call that looks for a repeatable skill; extracting is one larger call that writes the summary, the project's bullets and, when the scan found one, the skill candidate. A candidate reaches Claude only when you promote it.</div>
+      <div class="note">Capturing is free. A scan is one small call that looks for a repeatable skill; extracting is one larger call that writes the summary, the project's bullets and, when the scan found one, the skill candidate. A candidate reaches Claude only when you promote it. A subagent run of 8 tool calls or more, and each task segment of a main thread past 150, is a row of its own under its session: a run that repeats an existing skill's procedure improves that skill instead of adding another.</div>
     </section>`;
 };
 
 // ---------- Brain: graph (force-directed, plain JS, inline SVG) ----------
 // Laid out only when the set of visible notes or links changes; positions, pins, pan and zoom live in G and survive every re-render.
-const GT = [['session', 'Sessions', 'muted'], ['project', 'Projects', 'clay'], ['day', 'Days', 'gray'], ['skill', 'Skills', 'teal'], ['tag', 'Tags', 'amber']];
-const G = { key: '', N: [], E: [], adj: [], pos: {}, k: 1, tx: 0, ty: 0, moved: false, hover: null, drag: null, ptrs: new Map(), pinch: 0, ms: 0, on: { session: true, project: true, day: true, skill: true, tag: false } };
+const GT = [['session', 'Sessions', 'muted'], ['unit', 'Subagents', 'muted'], ['project', 'Projects', 'clay'], ['day', 'Days', 'gray'], ['skill', 'Skills', 'teal'], ['tag', 'Tags', 'amber']];
+const G = { key: '', N: [], E: [], adj: [], pos: {}, k: 1, tx: 0, ty: 0, moved: false, hover: null, drag: null, ptrs: new Map(), pinch: 0, ms: 0, on: { session: true, unit: true, project: true, day: true, skill: true, tag: false } }; // unit: subagent runs and task segments
 // graph:begin (test_router.ts loads this block)
 // Repulsion between every pair closer than 200, a spring along every link, a pull to the centre (stronger in y: the panel is wide);
 // each step is capped and the cap cools to zero, so it runs to rest and stops (no animation loop). Pinned notes do not move.
@@ -306,7 +326,7 @@ function gsync(g) {
 const gxf = () => `translate(${G.tx.toFixed(1)} ${G.ty.toFixed(1)}) scale(${G.k.toFixed(3)})`;
 const gbody = (found = G.found ?? new Set()) => { const f = (v) => v.toFixed(1), q = ui.bq.toLowerCase();
   return G.E.map((e) => `<line class="e ${e.kind}" x1="${f(G.N[e.a].x)}" y1="${f(G.N[e.a].y)}" x2="${f(G.N[e.b].x)}" y2="${f(G.N[e.b].y)}"/>`).join('')
-    + G.N.map((n, i) => { const r = Math.min(16, 3.5 + 1.7 * Math.sqrt(n.deg));
+    + G.N.map((n, i) => { const r = n.type === 'unit' ? 3 : Math.min(16, 3.5 + 1.7 * Math.sqrt(n.deg));
       return `<g class="n ${esc(n.type)}${n.pin ? ' pin' : ''}${q && (n.title.toLowerCase().includes(q) || found.has(n.path)) ? ' match' : ''}" data-n="${i}" transform="translate(${f(n.x)} ${f(n.y)})"><title>${esc(n.title)} · ${esc(n.type)} · ${n.deg} link${n.deg === 1 ? '' : 's'}</title><circle r="${f(r)}"/><text x="${f(r + 3)}" dy=".32em">${esc(n.title.length > 30 ? `${n.title.slice(0, 29)}…` : n.title)}</text></g>`; }).join(''); };
 const brainGraph = (g, hits) => {
   const count = (t) => g.nodes.filter((n) => (n.type === 'candidate' ? 'skill' : n.type) === t).length;
@@ -739,9 +759,11 @@ const views = {
     const f = t.files, base = (p) => p.split('/').pop().replace(/\.md$/, ''), path = note.path ?? '';
     const item = (p, label = base(p)) => `<button class="plain nm small${p === ui.note ? ' clay' : ''}" data-note="${esc(p)}" title="${esc(p)}">${esc(label)}</button>`;
     const grp = (label, k, items, n = items.length) => n ? `<details data-k="bt-${k}" ${ui.open[`bt-${k}`] ?? k !== 'daily' ? 'open' : ''}><summary>${label} <span class="muted">${n}</span></summary><div class="col" style="margin:6px 0 10px;gap:3px">${items.join('')}</div></details>` : '';
-    const logs = f.filter((p) => p.startsWith('wiki/logs/')).reverse();
+    const up = t.units ?? {}, logs = f.filter((p) => p.startsWith('wiki/logs/') && !up[p]).reverse(); // up: unit note -> its session's note
     let last = '';
-    const sess = logs.slice(0, 300).map((p) => { const d = base(p).slice(0, 10), h = d === last ? '' : `<span class="label" style="margin-top:6px">${esc(d)}</span>`; last = d; return h + item(p, base(p).slice(11) || base(p)); });
+    const sess = logs.slice(0, 300).map((p) => { const d = base(p).slice(0, 10), h = d === last ? '' : `<span class="label" style="margin-top:6px">${esc(d)}</span>`, u = f.filter((q) => up[q] === p); last = d;
+      return h + item(p, base(p).slice(11) || base(p)) + (u.length ? `<details data-k="bu-${esc(p)}" ${ui.open[`bu-${p}`] || u.includes(ui.note) ? 'open' : ''} style="margin-left:12px"><summary class="small">${u.length} subagent run${u.length === 1 ? '' : 's'} and segments</summary>
+        <div class="col" style="gap:3px;margin:4px 0">${u.map((q) => item(q, base(q).slice(base(p).length + 3) || base(q))).join('')}</div></details>` : ''); });
     const cand = f.filter((p) => /^skills\/candidates\/[^/]+\/SKILL\.md$/.test(p)), st = (p) => b.skills.find((k) => k.name === p.split('/')[2])?.status;
     const tree = ui.bq ? `<div class="between"><span class="small muted">${hits.length} match${hits.length === 1 ? '' : 'es'} for “${esc(ui.bq)}”</span><button class="sm" data-bact="clear">Clear</button></div>
         ${hits.map((h) => `<button class="plain small" data-note="${esc(h.path)}"><span class="${h.path === ui.note ? 'clay' : ''}">${esc(base(h.path))}</span><br><span class="muted">${esc(h.snippet)}</span></button>`).join('') || '<div class="note">Nothing found.</div>'}`
@@ -756,7 +778,7 @@ const views = {
     const btn = (act, label, extra = '') => `<button class="sm" data-bact="${act}" ${extra} ${ui.busy.brain ? 'disabled' : ''}>${label}</button>`;
     const acts = kind === 'session' && s ? btn('distill', ui.busy.brain ? 'Distilling…' : s.distilled_ts ? 'Distill again' : 'Distill', `data-sk="${esc(s.session_key)}"`) + (g && !g.gated ? btn('force', 'Distill anyway', `data-sk="${esc(s.session_key)}"`) : '')
       : kind === 'project' ? btn('consolidate', ui.busy.brain ? 'Consolidating…' : 'Consolidate', `data-name="${esc(base(path))}"`)
-      : sk?.status === 'promoted' ? btn('demote', 'Demote', `data-name="${esc(name)}"`)
+      : sk?.status === 'promoted' ? (sk.update ? btn('promote', 'Apply update', `data-name="${esc(name)}" data-upd="1"`) + btn('reject', 'Discard update', `data-name="${esc(name)}" data-upd="1"`) : '') + btn('demote', 'Demote', `data-name="${esc(name)}"`)
       : (kind === 'candidate' || kind === 'skill') && sk ? btn('promote', 'Promote', `data-name="${esc(name)}"`) + btn('reject', 'Reject', `data-name="${esc(name)}"`)
       : kind === 'facts' && !ui.bedit ? btn('edit', 'Edit') : '';
     const gate = !s ? '' : `<div class="small muted">${s.queued ? '<span class="chip warn">queued: the daily cap is spent</span> ' : ''}${!g ? 'Not gated yet.' : g.forced ? 'Distilled without the gate.'
@@ -764,6 +786,8 @@ const views = {
       : `Gate: too little hands-on work (${g.pre.tool_calls} tool calls) → not distilled`}${s.distilled_ts ? ` · distilled ${ago(s.distilled_ts)}` : ''}</div>`;
     const body = !path ? '<div class="note">Pick a note on the left.</div>'
       : kind === 'facts' && ui.bedit ? `<form id="brain-facts" class="col" style="gap:8px"><textarea name="text" rows="12" class="mono" style="width:100%">${esc(note.text)}</textarea><div class="row"><button class="sm primary">Save</button><button type="button" class="sm" data-bact="clear">Cancel</button></div></form>`
+      : kind === 'candidate' && note.installed != null ? `<div class="inset warnbox"><span class="small">A later run of the same procedure proposes this update to the installed skill. Lines marked <span class="clay">-</span> go, lines marked <span class="teal">+</span> are new. Your Claude skills folder is not touched until you apply it.</span></div>
+          <pre>${ldiff(note.installed, note.text).map(([m, l]) => `<span class="${m === '+ ' ? 'teal' : m === '- ' ? 'clay' : 'muted'}">${esc(m + l)}</span>`).join('\n')}</pre>`
       : kind === 'candidate' ? `${sk && sk.source !== 'session' && sk.source !== 'builtin' ? `<div class="inset warnbox"><span class="small">Imported from <span class="mono">${esc(sk.source)}</span>. These are someone else's instructions: read all of it before promoting. Shown as raw text, nothing hidden.</span></div>` : ''}<pre>${esc(note.text)}</pre>`
       : `<div class="md">${md(note.text)}</div>`;
     const BC = 'grid-template-columns:minmax(0,1.2fr) 150px 50px 70px 70px 100px minmax(0,1.2fr) 90px';
@@ -793,7 +817,7 @@ const views = {
       <div class="table">
         <div class="tr th" style="${BC}"><span>skill</span><span>status</span><span>uses</span><span>sessions</span><span>projects</span><span>last used</span><span>source</span><span>cost to find</span></div>
         ${b.skills.map((k) => `<div class="tr" style="${BC}"><span class="nm">${item(`skills/candidates/${k.name}/SKILL.md`, k.name)}</span>
-          <span><span class="chip ${k.status === 'promoted' ? 'ok' : ''}">${esc(k.status)}</span>${k.status === 'promoted' && (k.last_used ?? k.promoted_ts) < Date.now() - 30 * 864e5 ? ' <span class="chip warn" title="Its description costs prefix tokens in every session">unused 30d</span>' : ''}</span>
+          <span><span class="chip ${k.status === 'promoted' ? 'ok' : ''}">${esc(k.status)}</span>${k.update ? ' <span class="chip warn" title="A later run improved it: open it to see the diff and apply or discard">update waiting</span>' : ''}${k.status === 'promoted' && (k.last_used ?? k.promoted_ts) < Date.now() - 30 * 864e5 ? ' <span class="chip warn" title="Its description costs prefix tokens in every session">unused 30d</span>' : ''}</span>
           <span>${k.uses}</span><span>${k.sessions}</span><span>${k.projects}</span><span>${k.last_used ? ago(k.last_used) : NA}</span><span class="nm" title="${esc(k.source)}">${esc(k.source)}</span><span>${k.source_usd ? usd(k.source_usd) : NA}</span></div>`).join('')
           || '<div class="note">No skills yet. Distilling a session that worked out a reusable procedure proposes one; you can also import a SKILL.md by URL.</div>'}
       </div>
@@ -852,12 +876,12 @@ async function brainAct(d) {
   if (a === 'greset') { Object.assign(G, { pos: {}, key: '', moved: false }); refresh(true); }
   if (a === 'scan-all' || a === 'extract-all') { // background run on the server: confirm with the count, the estimate and what is left of the cap
     const scan = a === 'scan-all', n = Number(d.n);
-    if (confirm(`${scan ? 'Scan' : 'Extract'} ${n} session${n === 1 ? '' : 's'} with ${d.by}, one after the other?\n\n${d.est === '' ? 'No cost history yet, so no estimate: the first calls set it.' : `About $${Number(d.est).toFixed(2)} at list price (${n} × the recent average per call).`}\n$${Number(d.left).toFixed(2)} of today's cap is left; it stops there.`)) act(`brain/${a}`);
+    if (confirm(`${scan ? 'Scan' : 'Extract'} ${n} ${d.session ? 'of this session\'s subagent runs and segments' : `unit${n === 1 ? '' : 's'} (sessions, subagent runs, segments)`} with ${d.by}, one after the other, oldest first?\n\n${d.est === '' ? 'No cost history yet, so no estimate: the first calls set it.' : `About $${Number(d.est).toFixed(2)} at list price (${n} × the recent average per call).`}\n$${Number(d.left).toFixed(2)} of today's cap is left; it stops there.`)) act(`brain/${a}`, d.session ? { session: d.session } : undefined);
   }
   if (a === 'disable' && confirm('Turn the brain off? Notes stay where they are; nothing new is written.')) putSettings({ brain_enabled: false });
-  if (a === 'promote' && confirm(`Promote ${d.name}? It is copied to your Claude skills folder and every new session loads its description.`)) act(skill);
+  if (a === 'promote' && confirm(d.upd ? `Apply the update to ${d.name}? The installed skill is replaced by this version.` : `Promote ${d.name}? It is copied to your Claude skills folder and every new session loads its description.`)) act(skill);
   if (a === 'demote') act(skill);
-  if (a === 'reject' && confirm(`Reject ${d.name}? The candidate is deleted.`)) act(skill).then(() => { ui.note = 'index.md'; refresh(true); });
+  if (a === 'reject' && confirm(d.upd ? `Discard the proposed update to ${d.name}? The installed skill stays as it is.` : `Reject ${d.name}? The candidate is deleted.`)) act(skill).then(() => { if (!d.upd) ui.note = 'index.md'; refresh(true); });
   if (a === 'scan' || a === 'distill' || a === 'force' || a === 'consolidate') { // model calls: seconds to minutes
     ui.busy.brain = d.sk ?? true; refresh(true);
     const r = await send('POST', a === 'consolidate' ? 'brain/consolidate' : a === 'scan' ? 'brain/scan' : 'brain/distill', a === 'consolidate' ? { project: d.name } : { session: d.sk, force: a === 'force' }).catch((e) => ({ error: { type: e.message } }));

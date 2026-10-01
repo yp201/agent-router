@@ -16,11 +16,11 @@ _CLAUDE.md            operating manual + Folder Map (generated once, then user-o
 index.md              catalogue of every note, regenerated; Claude reads this first
 CRITICAL_FACTS.md     <= ~120 tokens, user-written, never overwritten by the router
 log.md                append-only: what the router wrote and why
-wiki/logs/            one note per session (what happened)            generated, free
+wiki/logs/            one note per session (what happened), plus one per unit of it: `<session note> — <name>.md`   generated, free
 wiki/projects/        one note per project (what is true): decisions, learnings, gotchas, each dated
 wiki/daily/           one note per day: sessions, spend
-skills/               one note per skill that is promoted or came out of a session: status, source session, project, uses, cost
-skills/candidates/    <name>/SKILL.md extracted from sessions or imported, awaiting review
+skills/               one note per skill that is promoted or came out of a session: status, source units, project, uses, cost
+skills/candidates/    <name>/SKILL.md extracted from sessions or imported, awaiting review; for a promoted skill, a proposed update
 ```
 
 Generated content sits between `<!-- agent-router:begin -->` and `<!-- agent-router:end -->`. Anything outside
@@ -32,6 +32,34 @@ A note can hold more than one generated block, so each is rewritten on its own: 
 and the session's distilled block ends with `Skill candidate: [[skills/<name>|<name>]]` (kept in step with the ledger on every index pass, so a
 later extract that returns no skill does not drop it; a reject removes it). An imported skill's note is removed on demote; a skill note the user
 wrote in is never deleted.
+
+## Units
+
+A pipeline row is a **unit**, not only a session. A unit is one of:
+
+- a **session's main thread** (as before; a session with no other units is one unit);
+- a **subagent run**: one `<session>/subagents/agent-<id>.jsonl` with 8 tool calls or more. Smaller runs stay a name in the
+  session note's Subagents list;
+- a **task segment** of a main thread with more than 150 tool calls: the thread is cut at typed prompts of 15 characters or more
+  (reminder blocks stripped, tool-result turns ignored), a cut is made only once the segment so far holds 25 tool calls, and a
+  short tail joins the segment before it.
+
+Why: a session that delegates its work shows none of it in its own note. Measured on a real one ("Google Docs link"): 29 subagents
+with 1,608 tool calls, 814 more on the main thread of which the note kept the last 80 commands, scanned `reusable = false`.
+
+Each subagent or segment unit has its own note next to the session's, `wiki/logs/<date> <session title> — <name>.md` (a segment is
+`— part N`), written by the session's capture: frontmatter (`unit`, `kind`, `parent`, `agent`, project, started, ended, turns, model,
+tool calls, usd at list price from the ledger rows of that `agent_id`, or of that time window for a segment) and sections **Brief**
+(a subagent's first message, 1,500 characters; a segment's prompts), **Commands that worked** (every distinct Bash command whose
+result was not an error, 300 characters each; no cap of 80, but past ~3,000 tokens only the first of each command family and the
+final third of the run are listed), **Files written**, **Tools**, **Final report** (a `SubagentHandback` message if the run ended
+with one, else the last assistant text, 2,000 characters). Everything is scrubbed like the session note. The session note's
+Subagents and Task segments sections link each unit note; the unit note links its session and project. The session note keeps
+its own overview (the last 80 commands); `index.md`, the day note and the project note list sessions only.
+
+As built: units are rows of `brain_sessions` (`kind` `session` | `subagent` | `segment`, `parent` = the session, `agent_id`,
+`seg_index`, `name`, `started`; the key is `<session>/<agent id>` or `<session>/seg-<n>`), so rows from before units are sessions
+and keep their scan and extract state. A command family is the first two words after leading `cd … &&` and `VAR=…`.
 
 ## Pipeline
 
@@ -66,6 +94,12 @@ wrote in is never deleted.
    A model answer that is not the JSON asked for is no gate at all. "Distill anyway" skips the gate.
    `POST scan {session}` runs this step alone and stores the answer; the writer is not called. A distill then uses a stored scan that no
    writer has used yet and that is newer than the session's last turn; otherwise it scans first. A scan over the cap is refused (409), not queued.
+   **Per unit.** `session` in `scan` / `distill` is a unit key. A subagent or segment unit is gated on its own note (Brief, Commands
+   that worked, Final report; up to 20k characters), not the session's, with the same questions and the same pre-filter.
+   **Matching.** `matches` lists every existing skill and candidate with its one-line description and asks: "Answer with an existing
+   skill only if this run performs the same procedure with the same main tools; similar topic is not enough. When unsure, answer new."
+   For `kind = skill` and `reusable` at the confidence, `matches = new` (or an unsure match) asks the writer for a new skill;
+   `matches = <skill>` at the confidence is **refine mode** (`gate.refine`).
 3. **Distill (one Sonnet call per gated session).** The writer is a separate, stronger model than the
    classifier: `brain_writer_model`, default the CLI alias `sonnet` (resolves to the newest Sonnet the account has). Structured input, capped near 8k tokens, never the raw
    transcript. Output JSON: `summary`, `decisions[]`, `learnings[]`, `open_threads[]`, `tags[]`, and
@@ -73,8 +107,24 @@ wrote in is never deleted.
    to the project note (exact-duplicate lines dropped; distilling a session again replaces that session's bullets),
    and writes a skill candidate when present and the gate asked for one. When the scan said `kind = skill` (and asked for one) the prompt
    asks for the skill outright: a name, a when-to-use description, and a body with `## Prerequisites`, `## Steps` (numbered, the exact
-   commands that worked) and `## Pitfalls` (seen in the session).
-   What each scan and extract cost is stored per session (`brain_sessions.scan_usd`, `extract_usd`): the brain-tagged spend logged while
+   commands that worked), `## Pitfalls` (seen in the session) and a short `## Verify` step; prerequisites name tools, versions and
+   keys, never their values; inventing a step is forbidden.
+   A subagent or segment unit sends its note as `run` instead of the session extract; its summary goes into that unit note's
+   distilled block and its bullets onto the project note.
+   **Refine mode** (the gate matched an existing skill): the input also carries that skill's current `SKILL.md`, and the writer
+   returns the improved skill under the same name (keep what is still right, replace steps this run did better, add pitfalls this
+   run hit, never drop a prerequisite without evidence) plus a one-line `changelog`. The classifier sees only descriptions, so the
+   writer has the last word: if it finds a different procedure it answers under a new name, which is a new candidate, and the
+   matched skill is left alone (measured: Haiku matched JS/ffmpeg trailer builds to a yt-dlp/Python prototype skill at 0.85).
+   A refined **candidate** is rewritten in place. A refined **promoted** skill is never touched where it is installed: the new text
+   goes to `skills/candidates/<name>/SKILL.md` as a proposed update (`brain_skills.update_ts`; the console shows it against the
+   installed copy as a line diff). **Promote** applies it, **Reject** discards it (the vault copy becomes the installed one again).
+   Every unit that wrote or refined a skill is in `skill_sources(skill, unit_id, ts, mode 'create'|'refine', note)`; the skill note
+   lists them with the changelog lines, and each of those units' notes links the skill.
+   **Order.** A session's units are processed oldest first. They are usually scanned in one go, before any has written a skill, so
+   none could match a sibling's: a unit whose stored scan asked for a skill is scanned again at extract time if a skill has appeared
+   since, so later runs refine the earlier one's skill instead of repeating it.
+   What each scan and extract cost is stored per unit (`brain_sessions.scan_usd`, `extract_usd`): the brain-tagged spend logged while
    the call ran.
    A "Consolidate" button runs one further writer call to merge and rewrite a project note.
 4. **Skills.** Candidates never reach Claude Code on their own. **Promote** copies
@@ -110,22 +160,26 @@ wrote in is never deleted.
 Three views, chosen with a segmented control and kept in the hash (`#brain?view=pipeline|notes|graph`).
 
 - **Pipeline** (default). A funnel strip of five stages, each naming who does the work: Captured · no model → Scanned · Haiku (or Jev) →
-  Extracted · Sonnet → Skill candidate → Promoted. Counts are cumulative (a session counts in every stage it passed); clicking a stage
-  filters the table to the sessions that reached it. One row per captured session: title, project, step chips (Captured ✓ → Scan:
+  Extracted · Sonnet → Skill candidate → Promoted. Counts are over units and cumulative (a unit counts in every stage it passed); clicking
+  a stage filters the table to the units that reached it. A session with subagent or segment units is a parent row with a collapsible
+  list beneath ("28 subagents · 22 segments · 4 scanned · 2 skills"), each unit a row with a kind chip and the same actions, plus
+  "Scan this session's subagents (N) — about $X" and "Extract (M)" for that session alone. One row per captured session: title, project, step chips (Captured ✓ → Scan:
   `skill 0.92` / `knowledge 0.90` / `nothing` / `too small` → Extract: `$0.03` / `skipped` / `queued` → Skill: name or —) and actions
-  (Scan, Extract, Open note). **Scan backlog (N)** scans every captured, unscanned session that passes the pre-filter; **Extract scanned
-  (M)** runs the writer for every session whose scan said to keep something and that has no extract yet. Both run sequentially in the
+  (Scan, Extract, Open note). **Scan backlog (N)** scans every captured, unscanned unit that passes the pre-filter; **Extract scanned
+  (M)** runs the writer for every unit whose scan said to keep something and that has no extract yet. Both run sequentially in the
   background, one run at a time (a second is 409), stop at the daily cap or when the brain is turned off, and show progress inline. The
   confirm states the count, an estimate (count × the mean of the last 20 measured calls; none until there is history) and what is left
   of the cap.
-- **Notes.** Tree on the left (Sessions by date, Projects, Skills promoted / candidates, Daily, Index, Facts), rendered
+- **Notes.** Tree on the left (Sessions by date with their unit notes nested beneath, Projects, Skills promoted / candidates, Daily, Index, Facts), rendered
   Markdown in the middle (small built-in renderer; `[[wikilinks]]` navigate in place), search across the vault
-  with snippets. Actions: Distill, Consolidate, Promote / Reject / Demote, Import skill from URL, edit
+  with snippets. A candidate that is an update to a promoted skill is shown as a line diff against the installed copy, with Apply update
+  and Discard update. Actions: Distill, Consolidate, Promote / Reject / Demote, Import skill from URL, edit
   `CRITICAL_FACTS.md`, install the recall skill. Header: spend today against the cap, sessions captured, skills promoted, candidates waiting.
 - **Graph.** The vault as a force-directed graph, inline SVG, plain JS (repulsion between notes closer than 200 units, a spring per link,
   a pull to the centre; run to rest in one go, no animation loop; O(n²) per iteration: 200 notes lay out in 20–45 ms). Nodes: sessions
-  (muted), projects (clay), days (dim), skills (teal; a candidate has a dashed ring), tags (amber, off by default); size by degree. Edges:
-  session→project, session→day, skill→the session it came from (`brain_skills.source_session`) and that session's project, skill→sessions
+  (muted), units (small, muted; chip "Subagents", on by default), projects (clay), days (dim), skills (teal; a candidate has a dashed
+  ring), tags (amber, off by default); size by degree. Edges: session→project, session→day, unit→its session (`subagent` / `segment`),
+  skill→every unit that wrote or refined it (`source`, from `skill_sources`) and its first source's project, skill→sessions
   that invoked it (`tool_uses`), note→tag, and any other `[[wikilink]]` between notes; one edge per pair. A skill is one node whichever of
   its two files a link names. `index.md`, the manual, the log and notes outside the folders the router writes are left out. Drag to pan,
   wheel or pinch to zoom, drag a note to pin it, hover to light a note and its neighbours, click to open it in Notes; type chips filter,
@@ -137,9 +191,11 @@ folder** (`open <vault>` / `xdg-open`). The directory is always the configured v
 
 ## API (all under `/router/brain/`)
 
-`GET stats` (incl. `obsidian`) · `GET tree` · `GET note?path=` · `GET search?q=` · `GET pipeline` (`stages`, `rows`, `cap`, `running`, `todo`) ·
-`GET graph` (`nodes`, `edges`) · `POST capture {session?}` · `POST scan {session}` · `POST distill {session, force?}` ·
-`POST scan-all {limit?}` · `POST extract-all` (202 `{total, estimate_usd, cap}`; 409 `brain_busy` while one runs) · `POST open {target: obsidian|folder}` ·
+`GET stats` (incl. `obsidian`) · `GET tree` (`files`, `units`: unit note → session note) · `GET note?path=` (`installed` for a proposed
+update) · `GET search?q=` · `GET pipeline` (`stages`, `rows` each with `units`, `cap`, `running`, `todo`, `avg`) ·
+`GET graph` (`nodes`, `edges`) · `POST capture {session?}` · `POST scan {session}` · `POST distill {session, force?}` (`session` = a unit key) ·
+`POST scan-all {limit?, session?}` · `POST extract-all {limit?, session?}` (`session`: only that session's subagent and segment units, oldest
+first; 202 `{total, estimate_usd, cap}`; 409 `brain_busy` while one runs) · `POST open {target: obsidian|folder}` ·
 `POST consolidate {project}` · `POST skills/import {url}` · `POST skills/<name>/promote|demote|reject` · `POST recall` ·
 `PUT facts {text}` · `POST facts-load {on}` (adds or removes the one line `@<vault>/CRITICAL_FACTS.md` in `<CLAUDE_HOME or ~/.claude>/CLAUDE.md`;
 `stats.facts_loaded` reads it back). Reads always answer; every write is `409 brain_disabled` until `brain_enabled`. Enabling is
