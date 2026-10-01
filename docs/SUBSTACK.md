@@ -14,29 +14,41 @@ Claude Code — the desktop app and the CLI — talks to `api.anthropic.com`. ag
 
 ## 1. Almost everything is cache. The bill is the part that isn't.
 
-Every turn of a Claude Code session re-sends the whole conversation. What's already cached is read at a tenth of the price; what isn't gets written at a premium. My cache hit rate over a week was 96%. That sounds like a solved problem. It isn't, because the 4% is exactly where the cost lives, and I had no idea what was in it.
+Every turn of a Claude Code session re-sends the whole conversation. What's already cached is read at a small
+fraction of the input price; what isn't gets written at a premium. Over one week my sessions read 914 million tokens
+from cache and wrote 29 million. Priced at list rates, those 29 million written tokens were about half the total.
+Output, the thing I assumed I was paying for, was 6 to 16 percent.
 
-So I fingerprinted every request — a hash of the system prompt, a hash of the tool list, the message count — and compared each turn to the one before it. When the cache gets rewritten, one of a handful of things happened:
+So the question that matters is: when does the cache get rewritten? The router fingerprints every request and
+compares each turn to the one before. In my own week the causes were:
 
-- **The MCP tool list changed.** A server reconnected, its tools moved in the list, and everything after them in the prefix was invalidated. This was my most common avoidable burst.
-- **I edited CLAUDE.md mid-session.** A 200-byte change to the system prompt re-wrote 130k tokens of context.
-- **The session sat idle past the one-hour cache TTL.** Lunch. Every time.
-- **The session moved accounts.** Expected, and the one I chose.
+- **A session sat idle past the one-hour cache lifetime.** One five-hour gap re-wrote 468,000 tokens on the next turn.
+- **A session moved to another account.** Caches are per account.
+- **A few rewrites my fingerprints could not explain.** I'm saying so because a tool that always has an answer is lying.
 
-The console now labels each burst with its cause and whether I could have avoided it. Two of the four causes are habits.
+Claude Code's own docs list what else does it: switching model mid-session, turning on fast mode, changing effort on
+most models, and a tool list that changes when tools are loaded upfront. One thing I had wrong: editing CLAUDE.md
+mid-session does not rewrite the cache. It doesn't apply until the next session at all.
 
-## 2. 74 of my 115 MCP tools had never been called once
+## 2. Pointing the CLI at a proxy quietly turned off tool search
 
-Tool definitions sit at the front of every request. I had 115 of them loaded across projects; 41 had ever been used in any session. The other 74 were pure prefix — cached, so cheap per turn, but they're also what gets invalidated when a server reconnects, which is cause number one above. I turned off the servers I don't use per project. Bursts dropped.
+Claude Code defers MCP tool definitions by default: only names enter the context until a tool is used. With a custom
+`ANTHROPIC_BASE_URL`, that is off unless you set `ENABLE_TOOL_SEARCH=true`. My desktop sessions, captured
+transparently, had tool search on. My terminal sessions, pointed at the proxy the documented way, were sending all 68
+tool definitions in full on every request. The fix is one environment variable, and my own README didn't mention it.
 
-## 3. Switching accounts is expensive exactly once
+## 3. Switching is not automatically cheaper
 
-I assumed every switch cost a full cache re-write. The ledger measured the real number on each move, and it split cleanly in two:
+Three things I assumed would save money, checked against my own week:
 
-- First time a session lands on an account: **~50,000 tokens** written. That's the whole context, cold.
-- Moving *back* to an account that served this session within the last hour: **~200 tokens.** The cache was still warm there.
-
-Prompt caches are per account, not per session. So the cheap fallback isn't a random spare account — it's the one that served this exact kind of session most recently. That's now a routing rule, not a guess.
+- **Switching accounts.** The first time a session lands on an account it re-writes its context: about 23,000 tokens
+  in the case I measured. Moving back within the hour cost about 200, because the cache was still warm there.
+- **A shorter cache lifetime.** Five-minute cache writes are cheaper than one-hour writes. Replaying my week with
+  five-minute caching would have cost 60 percent more, because 58 turns came after a pause of five to sixty minutes
+  and each would have re-written everything.
+- **A cheaper model.** The same tokens on Sonnet 5.5 instead of Opus 5.5 come to 29 percent less, not half. Cache
+  reads cost the same on both, and reads are most of the tokens. And switching mid-session re-writes the whole
+  context on the new model first.
 
 ## 4. Long sessions cost four times more per turn, and the tool can't tell you
 

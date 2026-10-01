@@ -24,11 +24,11 @@ If you try it and it helps, tell me what you'd want next — that decides what I
 **URL:** https://github.com/yp201/agent-router
 
 **First comment (post it yourself right after submitting):**
-Author here. I kept hitting Claude Code's limits mid-task, so this sits in front of it (desktop app and CLI) and routes each session to whichever of my subscriptions has headroom, moving it before it hits the wall. Sessions stay intact — the switch is a header swap; the cost is a cache re-write on the new account, which the ledger measures (first move ~50k tokens, moving back within the hour ~200).
+Author here. I kept hitting Claude Code's limits mid-task, so this sits in front of it (desktop app and CLI) and routes each session to whichever of my subscriptions has headroom, moving it before it hits the wall. Sessions stay intact — the switch is a header swap; the cost is a cache re-write on the new account, which the ledger measures (first move ~23k tokens in the case I measured, moving back within the hour ~200).
 
 Things worth knowing before you install: the desktop app hard-codes api.anthropic.com and ignores every config option, so capturing it means a locally generated CA plus a hosts entry — the README says so up front and `uninstall` reverses it. The CLI path needs neither. Zero dependencies (Node 24 + SQLite), ~1,800 lines, MIT. It's for accounts you own; shared pools are out of scope on purpose.
 
-The part I didn't expect to be useful: joining every request to the session transcript by request-id. That's how it explains cache bursts (tool list changed, CLAUDE.md edited mid-session, idle past the 1h TTL, account switch) instead of just counting tokens.
+The part I didn't expect to be useful: joining every request to the session transcript by request-id. That's how it explains cache bursts (idle past the 1h TTL, account switch, model or fast-mode change, tool list changed) instead of just counting tokens.
 
 Happy to answer anything about the routing or the transparent mode.
 

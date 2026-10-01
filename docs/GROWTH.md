@@ -41,7 +41,7 @@ Answer every comment for 24 hours.
 not competitors. Ask the Claude Code DevRel folks for a look; the cache doctor is genuinely useful to them.
 
 **Ongoing — findings as content.** Every real burst cause is a 300-word post: "Why an MCP reconnect costs you 24k
-tokens", "The lunch-break cache cliff", "Your CLAUDE.md edit just invalidated 130k tokens." Weekly. Each links the card.
+tokens", "The lunch-break cache cliff", "A proxy turned off my tool search: 68 tool definitions on every request." Weekly. Each links the card.
 
 ## What we measure
 Stars · brew installs (no telemetry in the app, ever — count tap downloads) · report cards shared (search the card's
