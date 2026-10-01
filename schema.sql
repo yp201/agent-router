@@ -47,9 +47,10 @@ create table if not exists requests (
   first_user_tok integer,             -- its length / 4
   context_est integer,                -- decoded body bytes / 4
   tool_names_json text,               -- tool names only (no schemas), stored the first time a tools_hash is seen
+  tool_servers_json text,             -- {server: {loaded, deferred, def_tokens}} per MCP server ('' = built-in tools), stored when a thread's tool list changes
   ua_kind text,                       -- 'desktop' | 'cli' from the inbound user-agent
   agent_id text,                      -- subagent that made it (from <session>/subagents/agent-<id>.jsonl); null = the session itself
-  source text                         -- inbound x-agent-router-source ('brain' | 'advisor'): the router's own model calls; null = a client
+  source text                         -- inbound x-agent-router-source ('brain' | 'advisor'): the router's own model calls; 'warm' = a keep-warm ping; null = a client
 );
 create table if not exists migrations (
   ts integer, session_key text, from_account text, to_account text,
@@ -76,3 +77,6 @@ create table if not exists brain_sessions (session_key text primary key, last_ca
   scan_usd real, extract_usd real); -- what the classifier / writer call for this session cost (brain-tagged spend while it ran); null = not measured
 create table if not exists brain_skills (name text primary key, status text, -- 'candidate' | 'promoted' | 'rejected'
   source text, source_session text, created_ts integer, promoted_ts integer);
+-- keep warm: a per-session one-off (until_ts > 0), or the user's Stop (until_ts = 0, reason 'stopped by you': no warming until the session's
+-- next request). reason on a one-off = why the scheduler is not pinging it right now; null while it runs
+create table if not exists warm_sessions (session_key text primary key, until_ts integer, created_ts integer, reason text);

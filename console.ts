@@ -1,8 +1,9 @@
 // Read-only views for the console UI: pure SQL + JS over the ledger (plus tool-result sizes from transcripts for carrying cost).
 // Nothing here writes, and nothing here calls a model: every number is arithmetic.
-import { statSync } from 'node:fs';
+import { statSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { db, settings, now } from './ledger.ts';
-import { windowOf, title, carrying } from './advisor.ts';
+import { windowOf, title, carrying, claudeHome } from './advisor.ts';
 
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
@@ -55,6 +56,75 @@ export function spendOf(where: string, ...a: any[]) {
   return { usd, unpriced, n };
 }
 const ctx = (r: any) => (r.cache_create != null ? (r.in_tok ?? 0) + (r.cache_read ?? 0) + r.cache_create : r.context_est);
+
+// ---- limits as the unit (docs/COST-INSIGHTS.md "Limits as the unit") ----
+// On a subscription the scarce thing is the 5-hour and weekly window. Every response carries the account's utilization, so the exchange
+// rate is measured from the router's own traffic: per account and window, over the last 14 days, the account's requests are grouped by
+// the window's reset value; in a group usd = cost() of every request after the first reading, moved = last - first utilization in
+// percentage points. usd_per_pct = sum(usd) / sum(moved) over the groups that moved at least 3 points on more than $0.
+// confidence 'ok' needs $20 and 10 points; it is 'low' below that, and when the latest window moved more than 3x as far per dollar as
+// the account's own median (the account is being used somewhere the router does not see).
+// ponytail: recomputed (one indexed scan of 14 days, JSON read by SQLite) whenever a request was logged since the last call; keep
+// running sums per account and reset if that scan ever shows up in a profile.
+const WINS = ['5h', '7d'] as const;
+let limMemo: { key: string; by: Map<string, any> } | null = null;
+export function limits(): Map<string, any> {
+  const rc = settings().rate_card ?? {}, key = `${one('select max(id) m from requests').m}|${JSON.stringify(rc)}`;
+  if (limMemo?.key === key) return limMemo.by;
+  const g = (k: string) => `json_extract(ratelimit_json, '$."${RL}${k}"')`, acc = new Map<string, any>();
+  for (const r of all(`select account_id a, model, speed, in_tok, out_tok, cache_read, cache_create, cache_1h, cache_5m,
+      ${g('5h-reset')} r5h, ${g('5h-utilization')} u5h, ${g('7d-reset')} r7d, ${g('7d-utilization')} u7d
+    from requests where ts >= ? and ratelimit_json like '%utilization%' order by ts, id`, now() - 14 * 864e5)) {
+    const usd = cost(r, rc) ?? 0, a = acc.get(r.a) ?? { requests: 0, '5h': new Map(), '7d': new Map() };
+    acc.set(r.a, a); a.requests++;
+    for (const w of WINS) {
+      const reset = r[`r${w}`], u = Number(r[`u${w}`]), x = a[w].get(reset);
+      if (reset == null || r[`u${w}`] == null) continue;
+      if (x) { x.usd += usd; x.last = u; } else a[w].set(reset, { reset: Number(reset), usd: 0, first: u, last: u });
+    }
+  }
+  const est = (groups: Map<any, any>) => {
+    const gs = [...groups.values()].map((x) => ({ ...x, moved: Math.round((x.last - x.first) * 1e4) / 100 })).sort((x, y) => y.reset - x.reset);
+    const q = gs.filter((x) => x.moved >= 3 && x.usd > 0), usd = sum(q, (x) => x.usd), moved = sum(q, (x) => x.moved);
+    if (!q.length) return null;
+    const per = q.map((x) => x.moved / x.usd).sort((x, y) => x - y), med = (per[(per.length - 1) >> 1] + per[per.length >> 1]) / 2;
+    const outside = gs[0].moved >= 3 && gs[0].moved / Math.max(gs[0].usd, 1e-9) > 3 * med, thin = usd < 20 || moved < 10;
+    return { usd_per_pct: usd / moved, usd, moved, windows: q.length, confidence: outside || thin ? 'low' : 'ok',
+      reason: outside ? 'used outside the router' : thin ? 'not enough traffic through the router yet' : null };
+  };
+  const by = new Map<string, any>();
+  for (const [id, a] of acc) { const e = { requests: a.requests, '5h': est(a['5h']), '7d': est(a['7d']) };
+    by.set(id, { ...e, confidence: WINS.every((w) => e[w]?.confidence === 'ok') ? 'ok' : 'low', reason: e['5h']?.reason ?? e['7d']?.reason ?? (e['5h'] && e['7d'] ? null : 'not enough traffic through the router yet') }); }
+  limMemo = { key, by };
+  return by;
+}
+// What `usd` at list price is in percentage points of that account's windows; null until the estimator has a value for the account.
+export function asLimits(usd: number | null | undefined, account_id: string | null | undefined): { pct_5h: number | null; pct_7d: number | null; confidence: 'ok' | 'low' } | null {
+  const e = usd == null || account_id == null ? null : limits().get(account_id);
+  if (!e || (!e['5h'] && !e['7d'])) return null;
+  return { pct_5h: e['5h'] ? usd! / e['5h'].usd_per_pct : null, pct_7d: e['7d'] ? usd! / e['7d'].usd_per_pct : null, confidence: e.confidence };
+}
+export const fmtPct = (x: number) => (x < 0.1 ? '<0.1%' : `${x < 10 ? x.toFixed(1) : Math.round(x)}%`);
+// The phrase that follows a dollar figure: "≈ 1.2% of your 5-hour window · 0.3% of your week", "(rough)" when low confidence, '' when unknown.
+export function limText(usd: number | null | undefined, account_id: string | null | undefined) {
+  const l = usd ? asLimits(usd, account_id) : null;
+  return !l ? '' : `≈ ${[l.pct_5h != null && `${fmtPct(l.pct_5h)} of your 5-hour window`, l.pct_7d != null && `${fmtPct(l.pct_7d)} of your week`].filter(Boolean).join(' · ')}${l.confidence === 'low' ? ' (rough)' : ''}`;
+}
+// the account that paid most of `rows` (a figure spanning accounts is converted at that account's rate)
+const payer = (rows: any[], f: (r: any) => number = (r) => r.usd) => {
+  const m = new Map<string, number>();
+  for (const r of rows) if (r.account_id) m.set(r.account_id, (m.get(r.account_id) ?? 0) + (f(r) || 0));
+  return [...m].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+};
+// GET /router/limits
+function limitsView() {
+  const L = limits();
+  return all(`select id, last_ratelimit_json j from accounts order by kind = 'home' desc, id`).map((a) => { const e = L.get(a.id), w = (k: '5h' | '7d') => e?.[k]?.usd_per_pct ?? null;
+    return { account: a.id, usd_per_pct_5h: w('5h'), usd_per_pct_7d: w('7d'), window_usd_5h: w('5h') && w('5h') * 100, window_usd_7d: w('7d') && w('7d') * 100,
+      basis: { requests: e?.requests ?? 0, ...Object.fromEntries(WINS.flatMap((k) => [[`windows_${k}`, e?.[k]?.windows ?? 0], [`usd_${k}`, e?.[k]?.usd ?? 0], [`moved_${k}`, e?.[k]?.moved ?? 0]])) },
+      confidence: e && (e['5h'] || e['7d']) ? e.confidence : null, reason: e ? e.reason : 'not enough traffic through the router yet',
+      util_5h: util(a.j, '5h'), util_7d: util(a.j, '7d'), reset_5h: util(a.j, '5h', 'reset'), reset_7d: util(a.j, '7d', 'reset') }; });
+}
 
 // ---- A1: why a turn re-wrote its prefix. kind -> [avoidable, the one-line fix]. The cache key per the Claude Code prompt-caching doc:
 // model, effort (some models), fast mode, the loaded tool set, the system prompt, images; compaction and clearing rebuild by design.
@@ -187,15 +257,18 @@ export const advice = (sk?: string) => (sk ? all('select * from advice where ses
   : all(`select a.*, s.title from advice a left join sessions s using (session_key) where a.id in (select max(id) from advice where level != 'handoff' group by session_key) order by a.id desc`)).map(parse);
 
 // A2: where each session's main-thread cache stands, from its last main turn since `since`. Main thread = no subagent id and a tool
-// list (the desktop's side requests send none). cold_at = that turn + the lifetime of the session's last cache write; rebuild_usd = the
-// cached context at the model's write price for that lifetime; read_usd = the same context read from a warm cache.
+// list (the desktop's side requests send none). cold_at = that turn (or the last keep-warm ping that got a 2xx after it) + the lifetime of
+// the session's last cache write; rebuild_usd = the cached context at the model's write price for that lifetime; read_usd = the same
+// context read from a warm cache (what a message, or a ping, costs). thread = the key router.ts keeps that conversation's last request under.
 export function warmth(since: number) {
   const main = `x.agent_id is null and x.tools_count > 0 and x.cache_create is not null and x.status < 400 and x.source is null and ${MSG('x.')}`, rc = settings().rate_card ?? {};
-  return all(`select r.session_key sk, r.ts, r.model, r.in_tok + r.cache_read + r.cache_create ctx,
-      (select x.cache_1h > 0 from requests x where x.session_key = r.session_key and ${main} and coalesce(x.cache_1h, 0) + coalesce(x.cache_5m, 0) > 0 order by x.ts desc limit 1) h1
+  return all(`select r.session_key sk, r.ts, r.model, r.first_user_hash fuh, r.in_tok + r.cache_read + r.cache_create ctx,
+      (select x.cache_1h > 0 from requests x where x.session_key = r.session_key and ${main} and coalesce(x.cache_1h, 0) + coalesce(x.cache_5m, 0) > 0 order by x.ts desc limit 1) h1,
+      (select max(p.ts) from requests p where p.session_key = r.session_key and p.source = 'warm' and p.status < 300 and p.ts > r.ts) wts
     from requests r where r.id in (select max(x.id) from requests x where ${main} and x.session_key is not null and x.ts >= ? group by x.session_key)`, since).map((r) => {
     const p = rates(r.model, rc), ttl_1h = r.h1 === 1;
-    return { sk: r.sk as string, ts: r.ts as number, ctx: r.ctx as number, ttl_1h, cold_at: r.h1 == null ? null : r.ts + (ttl_1h ? 3600_000 : 300_000),
+    return { sk: r.sk as string, ts: r.ts as number, ctx: r.ctx as number, ttl_1h, model: r.model as string | null, thread: `${r.sk}\0${r.fuh ?? r.model}`,
+      cold_at: r.h1 == null ? null : Math.max(r.ts, r.wts ?? 0) + (ttl_1h ? 3600_000 : 300_000),
       rebuild_usd: p && r.h1 != null ? r.ctx * (ttl_1h ? p.write_1h : p.write_5m) / 1e6 : null, read_usd: p ? r.ctx * p.read / 1e6 : null };
   });
 }
@@ -206,8 +279,8 @@ function sessions() {
         where r.session_key = s.session_key and r.context_est is not null order by r.ts desc limit 1) context_est,
       (select actual_cost_tokens from migrations m where m.session_key = s.session_key and actual_cost_tokens is not null order by ts desc limit 1) last_switch_cost_actual,
       (select ua_kind from requests r where r.session_key = s.session_key and ua_kind is not null order by r.ts desc limit 1) source
-    from sessions s where account_id is not null and not exists (select 1 from requests r where r.session_key = s.session_key and r.source is not null)
-    order by last_ts desc limit 100`) // transcript-only rows (a title, never routed) have no pin; source = the router's own advisor/brain calls
+    from sessions s where account_id is not null and not exists (select 1 from requests r where r.session_key = s.session_key and r.source is not null and r.source != 'warm')
+    order by last_ts desc limit 100`) // transcript-only rows (a title, never routed) have no pin; source = the router's own advisor/brain calls ('warm' = a ping for a real session)
     .map((s) => {
       // context meter: the main thread's last joined turn (the context that auto-compacts), same basis as the advisor
       const m = one(`select in_tok + cache_read + cache_create ctx, model from requests where session_key = ? and agent_id is null
@@ -216,6 +289,7 @@ function sessions() {
       switch_cost_est: s.context_est == null ? null : Math.round(s.context_est * 1.25),
       context_main: m?.ctx ?? null, context_pct: m ? m.ctx / windowOf(m.model, m.ctx) : null, warn_pct: st.context_warn_pct, urgent_pct: st.context_urgent_pct,
       cold_at: warm.get(s.session_key)?.cold_at ?? null, rebuild_usd: warm.get(s.session_key)?.rebuild_usd ?? null,
+      rebuild_limits: limText(warm.get(s.session_key)?.rebuild_usd, s.account_id), warm: st.warm_enabled && warm.has(s.session_key) ? warmPlan(warm.get(s.session_key)!, st) : null,
       advice: parse(one(`select * from advice where session_key = ? and level != 'handoff' order by id desc limit 1`, s.session_key)),
       handoff: one(`select text, ts from advice where session_key = ? and level = 'handoff' order by id desc limit 1`, s.session_key) ?? null,
       agents: all(`select a.agent_id, coalesce(a.name, a.agent_id) name, count(r.id) requests, sum(r.cache_read) cache_read, sum(r.cache_create) cache_create, a.last_ts
@@ -223,11 +297,160 @@ function sessions() {
     });
 }
 
+// ---- keep warm (docs/COST-INSIGHTS.md "Keep-warm scheduler") ----
+// router.ts holds the kept requests in memory; this module only ever learns which threads it has, never a request.
+export const warmMem = { has: (_thread: string) => false, stats: () => ({ entries: 0, bytes: 0 }) };
+export const BY_USER = 'stopped by you';
+const RESUME = 'warming resumes when the session next sends a request';
+// End (epoch ms) of a rule's local-time window if `t` is inside it, else null. from > to is a window across midnight; `days` name the
+// weekday the window starts on.
+export function ruleEnd(r: any, t: number): number | null {
+  const d = new Date(t), m = d.getHours() * 60 + d.getMinutes(), [f, e] = [r.from, r.to].map((x: string) => Number(x.slice(0, 2)) * 60 + Number(x.slice(3)));
+  const at = (plus: number) => { const x = new Date(t); x.setDate(x.getDate() + plus); return x.setHours(0, e, 0, 0); };
+  if (f <= e) return r.days.includes(d.getDay()) && m >= f && m < e ? at(0) : null;
+  return m >= f && r.days.includes(d.getDay()) ? at(1) : m < e && r.days.includes((d.getDay() + 6) % 7) ? at(0) : null;
+}
+// What the scheduler does with one session right now: a function of the ledger, the settings and what the router holds, so the tick,
+// the Sessions row and GET /router/warm all read the same answer. by = what covers the session (a one-off, a rule, "after you stop");
+// until = when that cover ends (never past warm_max_hours after the session's last request); stop = why no ping is being sent
+// (null = it is pinged); next = when the next ping is due; pings / usd = pings sent since the session's last real request.
+export function warmPlan(w: ReturnType<typeof warmth>[number], st = settings(), t = now()) {
+  const row = one('select * from warm_sessions where session_key = ?', w.sk), s = one('select account_id a, cwd from sessions where session_key = ?', w.sk);
+  const a = s?.a ? one('select * from accounts where id = ?', s.a) : null, proj = s?.cwd?.split('/').pop() ?? null, h = 3600_000;
+  const p = one(`select count(*) n, (select status from requests where session_key = ?1 and source = 'warm' and ts > ?2 order by id desc limit 1) last
+    from requests where session_key = ?1 and source = 'warm' and ts > ?2`, w.sk, w.ts);
+  const blocked = row?.reason === BY_USER && row.created_ts >= w.ts, big = (w.rebuild_usd ?? 0) >= st.warm_min_usd;
+  const rule = big ? (st.warm_rules as any[]).map((r) => ({ name: r.name, end: r.scope === 'all' || r.match === proj ? ruleEnd(r, t) : null })).find((x) => x.end) : null;
+  const [by, end] = blocked ? [null, null] : row?.until_ts > t ? ['one-off', row.until_ts as number] : rule ? [`rule ‘${rule.name}’`, rule.end!]
+    : big && t < w.ts + st.warm_after_stop_hours * h ? ['after you stop', w.ts + st.warm_after_stop_hours * h] : [null, null];
+  const cap = w.ts + Math.min(24, st.warm_max_hours) * h, until = by ? Math.min(end!, cap) : null;
+  const ttl = w.ttl_1h ? h : 300_000, lead = Math.min(st.warm_lead_min * 60_000, ttl / 2);
+  const u = (['5h', '7d'] as const).map((k) => ({ k, v: util(a?.last_ratelimit_json, k) ?? 0 })).sort((x, y) => y.v - x.v)[0];
+  const stop = blocked ? BY_USER
+    : !by ? (p.n || row?.until_ts > w.ts ? 'the keep-warm duration or rule window ended' : null)
+    : p.last >= 300 ? `${p.last === 401 && a?.kind === 'home' ? 'the desktop app’s login expired' : `a ping failed (HTTP ${p.last})`}; ${RESUME}`
+    : t >= cap ? `it was kept warm for the maximum of ${st.warm_max_hours} h after its last request`
+    : !w.ttl_1h && !st.warm_allow_5m ? 'it is on the 5-minute cache lifetime, where a ping never pays back'
+    : w.cold_at == null || w.cold_at <= t ? `its cache is already cold; ${RESUME}`
+    : !warmMem.has(w.thread) ? `its last request is not in memory (router restart or eviction); ${RESUME}`
+    : !a || a.disabled || a.needs_login || a.cooling_until > Date.now() ? `account ${s?.a ?? '—'} is ${!a ? 'removed' : a.disabled ? 'disabled' : a.needs_login ? 'waiting for a login' : 'cooling'}`
+    : u.v >= st.warn_pct ? `${s.a} is at ${Math.round(u.v * 100)}% of its ${u.k === '5h' ? '5-hour' : 'weekly'} window (warn threshold ${Math.round(st.warn_pct * 100)}%)`
+    : spendOf(`source = 'warm' and ts >= ?`, new Date(t).setHours(0, 0, 0, 0)).usd >= st.warm_daily_usd ? `today’s keep-warm budget of ${fmtUsd(st.warm_daily_usd)} is spent`
+    : null;
+  return { by, until, stop, next: by && !stop && w.cold_at! - lead < until! ? Math.max(t, w.cold_at! - lead) : null, pings: p.n as number,
+    usd: p.n ? spendOf(`session_key = ? and source = 'warm' and ts > ?`, w.sk, w.ts).usd : 0, account: (s?.a ?? null) as string | null };
+}
+// GET /router/sessions/:key/warm?hours= — what keeping this session warm would cost, shown before it is switched on. A ping is one
+// cache read of the context; pings come every (lifetime - lead); the break-even is how many pings one rebuild pays for.
+export function warmQuote(sk: string, hours: number, st = settings(), t = now()) {
+  const w = warmth(t - 25 * 3600_000).find((x) => x.sk === sk);
+  if (!w || w.cold_at == null || !w.read_usd || !w.rebuild_usd) return null;
+  const account = one('select account_id a from sessions where session_key = ?', sk)?.a ?? null, hrs = Math.min(hours > 0 ? hours : st.warm_max_hours, st.warm_max_hours, 24);
+  const ttl = w.ttl_1h ? 3600_000 : 300_000, lead = Math.min(st.warm_lead_min * 60_000, ttl / 2), step = ttl - lead, until = t + hrs * 3600_000, first = Math.max(t, w.cold_at - lead);
+  const pings = until > first ? Math.ceil((until - first) / step) : 0, n = w.rebuild_usd / w.read_usd, L = (x: number) => limText(x, account), line = (x: number) => `${fmtUsd(x)}${L(x) ? ` (${L(x)})` : ''}`;
+  return { session_key: sk, title: title(sk), account, hours: hrs, until_ts: until, context: w.ctx, lifetime: w.ttl_1h ? '1h' : '5m', ping_usd: w.read_usd, rebuild_usd: w.rebuild_usd, pings, total_usd: pings * w.read_usd,
+    ping_limits: L(w.read_usd), rebuild_limits: L(w.rebuild_usd), total_limits: L(pings * w.read_usd), breakeven_pings: n, breakeven_hours: n * step / 3600_000,
+    text: [`Keep ‘${title(sk)}’ warm for ${hrs} h?`, '', `One ping (a cache read of ${kt(w.ctx)} tokens): ${line(w.read_usd)}`, `A rebuild once it has gone cold: ${line(w.rebuild_usd)}`,
+      `Pings needed: ${pings} — ${line(pings * w.read_usd)} in total`, `Break-even: a rebuild costs as much as ${Math.round(n)} pings ≈ ${Math.round(n * step / 3600_000)} hours of keeping it warm.`,
+      ...(w.ttl_1h ? [] : ['This session is on the 5-minute cache lifetime: it is not pinged.']), '', 'Pings are requests the router sends on its own with your login; they count toward your limits.'].join('\n') };
+}
+// GET /router/warm
+function warmView() {
+  const st = settings(), t = now();
+  return { enabled: st.warm_enabled as boolean, settings: Object.fromEntries(Object.entries(st).filter(([k]) => k.startsWith('warm_'))),
+    spent_today_usd: spendOf(`source = 'warm' and ts >= ?`, new Date(t).setHours(0, 0, 0, 0)).usd, memory: warmMem.stats(),
+    sessions: !st.warm_enabled ? [] : warmth(t - 25 * 3600_000).map((w) => ({ session_key: w.sk, title: title(w.sk), cold_at: w.cold_at, ping_usd: w.read_usd, rebuild_usd: w.rebuild_usd, ...warmPlan(w, st, t) })).filter((x) => x.by || x.stop),
+    pings: all(`select ts, session_key, account_id, model, speed, status, in_tok, out_tok, cache_read, cache_create, cache_1h, cache_5m from requests where source = 'warm' order by id desc limit 20`)
+      .map((r) => ({ ts: r.ts, session_key: r.session_key, title: title(r.session_key), account: r.account_id, status: r.status, cache_read: r.cache_read, cache_create: r.cache_create, usd: cost(r) })) };
+}
+
+// ---- tool loading advisor (docs/COST-INSIGHTS.md "Tool loading advisor") ----
+// An MCP tool is named mcp__<server>__<tool>; '' = the client's built-in tools (listed for information, not configurable).
+export const serverOf = (name: string) => /^mcp__(.+?)__/.exec(name)?.[1] ?? '';
+const tilde = (p: string) => (p.startsWith(`${homedir()}/`) ? `~${p.slice(homedir().length)}` : p);
+// Where a server is defined, in the files the user owns: ~/.claude.json (local scope under projects[cwd], user scope at the top) and the
+// project's .mcp.json, in Claude Code's order of precedence. Only the names under `mcpServers` are read: never a command, an env value
+// or a header. Tool names carry the server name with everything outside [A-Za-z0-9_-] turned into '_'.
+function mcpOwned(cwds: string[]) {
+  const out = new Map<string, { name: string; file: string; at: string; scope: string }>(), f = `${claudeHome()}.json`;
+  const add = (file: string, scope: string, at: (n: string) => string, servers: any) => { for (const n of Object.keys(servers && typeof servers === 'object' ? servers : {})) {
+    const k = n.replace(/[^a-zA-Z0-9_-]/g, '_'); if (!out.has(k)) out.set(k, { name: n, file: tilde(file), at: at(n), scope }); } };
+  const read = (file: string) => { try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return {}; } }, j = read(f);
+  for (const c of cwds) add(f, 'local', (n) => `projects["${c}"].mcpServers["${n}"]`, j.projects?.[c]?.mcpServers);
+  for (const c of cwds) add(`${c}/.mcp.json`, 'project', (n) => `mcpServers["${n}"]`, read(`${c}/.mcp.json`).mcpServers);
+  add(f, 'user', (n) => `mcpServers["${n}"]`, j.mcpServers);
+  return out;
+}
+const TOOL_LABEL: Record<string, string> = { always_load: 'Always load', leave_deferred: 'Leave deferred', disable: 'Disable', loaded: 'Loaded upfront', builtin: 'Built-in' };
+// GET /router/tools?days=30&project= — per server, in one project or overall (window: `days`):
+//   always load     called in at least half of the scope's sessions (4 or more) and deferred now, and the search round trips that would be
+//                   avoided cost more than carrying its definitions: benefit = ToolSearch calls that led to a call of the server's tools ×
+//                   that session's average per-request cache-read cost; cost = its definition tokens × the scope's turns × the read price
+//   disable         not called in the window (a deferred server still costs its tool names in every request, a loaded one its definitions:
+//                   dollars = definition tokens × the turns of the sessions whose recorded tool list had it loaded × the read price)
+//   leave deferred  everything else that is deferred; loaded = loaded upfront and used
+// and for the scope: tool search off, when its newest tool list has no tool-search tool (the ENABLE_TOOL_SEARCH fix).
+// "Now" = the newest tool list recorded for a main conversation in the scope (requests.tool_servers_json, kept from this version on).
+// ponytail: a ToolSearch call is credited to the first MCP call that follows it in the same thread within 5 requests (the ledger has no
+// user-turn boundaries and never sees the query); read the search query from the transcript if that ever credits the wrong server.
+export function toolsView(q: URLSearchParams) {
+  const days = Math.max(1, Number(q.get('days')) || 30), since = now() - days * 864e5, pq = q.get('project'), project = pq && pq !== 'all' ? pq : null, rc = settings().rate_card ?? {};
+  const cwd = new Map<string, string | null>(all('select session_key k, cwd from sessions').map((x) => [x.k, x.cwd]));
+  const projOf = (sk: string) => cwd.get(sk)?.split('/').pop() ?? null, inScope = (sk: string) => !project || projOf(sk) === project;
+  const every = turns(since), rows = every.filter((r) => inScope(r.session_key)), turnOf = new Map(rows.map((r) => [r.id, r])), sess = new Map<string, { n: number; read: number; tok: number }>();
+  let perTok = 0; // dollars one definition token costs when every turn of the scope re-reads it (per session: tok)
+  for (const r of rows) { const p = (rates(r.model, rc)?.read ?? 0) / 1e6, x = sess.get(r.session_key) ?? { n: 0, read: 0, tok: 0 }; perTok += p; x.n++; x.tok += p; x.read += (r.cache_read ?? 0) * p; sess.set(r.session_key, x); }
+  const S = new Map<string, any>(), T = new Map<string, any>();
+  const srv = (k: string) => S.get(k) ?? S.set(k, { server: k, calls: 0, sessions: new Set<string>(), projects: new Set<string>(), last_used: null, searches: 0, benefit_usd: 0, loaded: null, deferred: null, def_tokens: null }).get(k);
+  const states = new Map<string, any>(); // session -> its newest recorded tool list; the newest of all is "now"
+  let state: any = null;
+  for (const r of all(`select session_key sk, tools_hash h, tool_servers_json j from requests where tool_servers_json is not null and ts >= ? and source is null and agent_id is null order by ts desc`, since))
+    if (inScope(r.sk) && !states.has(r.sk)) { states.set(r.sk, JSON.parse(r.j)); state ??= r; }
+  for (const [k, v] of Object.entries(state ? states.get(state.sk) : {})) Object.assign(srv(k), v);
+  const names = state && one('select tool_names_json j from requests where tools_hash = ? and tool_names_json is not null', state.h)?.j, searchOff = names ? !/tool.?search/i.test(names) : false;
+  const pend = new Map<string, number[]>(), searched = new Set<string>();
+  let searches = 0;
+  for (const c of all(`select t.name, r.id, r.session_key sk, r.ts, r.agent_id ag from tool_uses t join requests r on r.request_id = t.request_id where r.ts >= ? order by r.ts, r.id`, since)) {
+    const r = turnOf.get(c.id), k = serverOf(c.name), th = `${c.sk}\0${c.ag ?? ''}`;
+    if (!r) continue; // another project, or not a counted turn
+    for (const x of [srv(k), T.get(c.name) ?? T.set(c.name, { name: c.name, server: k, calls: 0, sessions: new Set<string>(), last_used: null }).get(c.name)]) { x.calls++; x.sessions.add(c.sk); x.last_used = c.ts; }
+    if (projOf(c.sk)) srv(k).projects.add(projOf(c.sk));
+    if (c.name === 'ToolSearch') { searches++; searched.add(c.sk); pend.set(th, [...(pend.get(th) ?? []), r.i]); }
+    else if (k && pend.get(th)?.length) { const n = pend.get(th)!.filter((i) => r.i - i <= 5).length, se = sess.get(c.sk)!; srv(k).searches += n; srv(k).benefit_usd += n * se.read / se.n; pend.set(th, []); }
+  }
+  const own = mcpOwned([...new Set(rows.map((r) => cwd.get(r.session_key)).filter(Boolean) as string[])]), n = sess.size, account = payer(rows);
+  for (const k of own.keys()) srv(k); // defined in a file the user owns but never seen in a request or a call
+  const servers = [...S.values()].map((x) => {
+    const o = own.get(x.server), origin = !x.server ? 'builtin' : o ? o.scope : /^plugin_/.test(x.server) ? 'plugin' : /^claude_ai_|^[0-9a-f]{8}-[0-9a-f]{4}-/.test(x.server) ? 'connector' : 'app';
+    const from = ({ plugin: 'a plugin', connector: 'a claude.ai connector', app: 'the app, or a config this router does not read' } as Record<string, string>)[origin], share = n ? x.sessions.size / n : 0;
+    const cost_usd = x.def_tokens == null ? null : x.def_tokens * perTok, deferred = x.deferred > 0 && !x.loaded, often = n >= 4 && share >= 0.5;
+    // what its definitions really cost: only the turns of sessions whose recorded tool list had it loaded (older sessions have no record: a floor)
+    const held = [...states].filter(([sk, j]) => j[x.server]?.loaded > 0 && sess.has(sk)), held_usd = sum(held, ([sk, j]) => j[x.server].def_tokens * sess.get(sk)!.tok);
+    const cls = !x.server ? 'builtin' : !x.calls ? 'disable' : deferred && !searchOff && often && x.benefit_usd > cost_usd! ? 'always_load' : x.loaded ? 'loaded' : 'leave_deferred';
+    const usd = cls === 'always_load' ? x.benefit_usd - cost_usd! : cls === 'disable' ? held_usd : 0;
+    const used = `called ${plural(x.calls, 'time')} in ${x.sessions.size} of ${plural(n, 'session')} (${Math.round(share * 100)}%)`, carry = `${kt(x.def_tokens ?? 0)} tokens of definitions × ${plural(rows.length, 'turn')} × the read price = ${fmtUsd(cost_usd)}`;
+    const carried = `${kt(x.def_tokens ?? 0)} tokens of definitions × the ${plural(sum(held, ([sk]) => sess.get(sk)!.n), 'turn')} that carried them × the read price = ${fmtUsd(held_usd)}`;
+    const trips = `${plural(x.searches, 'search round trip')} × the session's average prefix read = ${fmtUsd(x.benefit_usd)}`;
+    return { server: x.server || '(built-in tools)', class: cls, label: TOOL_LABEL[cls], origin, loaded: x.loaded, deferred: x.deferred, def_tokens: x.def_tokens, calls: x.calls, sessions: x.sessions.size, share,
+      projects: [...x.projects].sort(), last_used: x.last_used, searches: x.searches, benefit_usd: x.benefit_usd, cost_usd, usd, limits: limText(usd, account), where: o ? { file: o.file, at: o.at, scope: o.scope } : null,
+      evidence: cls === 'always_load' ? [used, trips, carry]
+        : cls === 'disable' ? [`not called in ${days} days`, x.loaded ? `loaded upfront: ${carried}` : x.deferred ? `deferred: it still costs its ${plural(x.deferred, 'tool name')} in the deferred list of every request` : 'its load state is recorded from the next request on']
+        : cls === 'builtin' ? [used, `${x.loaded ?? '—'} loaded · ${x.deferred ?? '—'} deferred`, 'not configurable']
+        : [used, ...(x.loaded == null ? ['its load state is recorded from the next request on'] : x.loaded ? [searchOff ? 'loaded upfront because tool search is off' : 'loaded upfront', carried]
+          : [trips, carry, often ? 'the round trips cost less than carrying the definitions' : 'used in fewer than half of the sessions (or fewer than 4 sessions)'])],
+      change: cls === 'always_load' ? (o ? `Add \`"alwaysLoad": true\` to ${o.at} in ${o.file} (applies from the next session).` : `Informational: this server comes from ${from}, where \`alwaysLoad\` cannot be set.`)
+        : cls === 'disable' ? (o ? `\`claude mcp remove "${o.name}" -s ${o.scope}\` (defined in ${o.file}), or switch it off in \`/mcp\`.` : `Switch it off in \`/mcp\`: it comes from ${from}, so \`claude mcp remove\` does not apply.`) : null };
+  }).sort((a, b) => Number(a.class === 'builtin') - Number(b.class === 'builtin') || b.usd - a.usd || b.calls - a.calls);
+  return { days, project: project ?? 'all', projects: [...new Set(every.map((r) => projOf(r.session_key)).filter(Boolean))].sort(), sessions: n, turns: rows.length, account,
+    tool_search: { on: names ? !searchOff : null, calls: searches, sessions: searched.size, class: searchOff ? 'tool_search_off' : null, fix: searchOff ? SEARCH_FIX : null }, servers,
+    tools: [...T.values()].sort((a, b) => b.calls - a.calls).slice(0, 15).map((x) => ({ name: x.name, server: x.server || null, calls: x.calls, sessions: x.sessions.size, last_used: x.last_used })) };
+}
+
 function cache(q: URLSearchParams) {
   const days = Math.max(1, Number(q.get('days')) || 7), s = q.get('session');
   const session = s && s !== 'all' ? s : null;
   const rows = turns(Date.now() - days * 864e5, session), j = rows.filter((r) => r.cache_create != null);
-  const bursts = rows.filter((r) => r.burst).map((r) => ({ i: r.i, ts: r.ts, session_key: r.session_key, account: r.account_id, ...r.burst }));
+  const bursts = rows.filter((r) => r.burst).map((r) => ({ i: r.i, ts: r.ts, session_key: r.session_key, account: r.account_id, ...r.burst, limits: limText(r.burst.usd, r.account_id) }));
   const avoid = bursts.filter((b) => b.avoidable), saved = sum(avoid, (b) => b.delta);
   const kinds = new Map<string, { kind: string; count: number; tokens: number; usd: number }>();
   for (const b of bursts) { const k = kinds.get(b.kind) ?? { kind: b.kind, count: 0, tokens: 0, usd: 0 }; k.count++; k.tokens += b.delta; k.usd += b.usd ?? 0; kinds.set(b.kind, k); }
@@ -303,6 +526,7 @@ const NEWER: Record<string, string> = { 'opus-5': 'opus-5-5', 'sonnet-5': 'sonne
 const STEP_DOWN: Record<string, string> = { 'fable-5-1': 'opus-5-5', 'opus-5-5': 'sonnet-5-5', 'sonnet-5-5': 'haiku-4-5', 'sonnet-5': 'haiku-4-5' }; // the B1 finding per model
 // B2b: tools that only read; the last three are bookkeeping. A subagent run that called nothing else is a "simple subagent task".
 const READ_ONLY = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead', 'WebFetch', 'WebSearch', 'ToolSearch', 'TodoWrite', 'SubagentHandback']);
+const SEARCH_FIX = 'Add "ENABLE_TOOL_SEARCH": "true" beside ANTHROPIC_BASE_URL in the "env" block of ~/.claude/settings.json (a custom base URL turns tool search off).';
 const MANY_TOOLS = 20; // A7: with tool search on, the CLI keeps about a dozen definitions loaded (11 observed)
 const nice = (k: string) => k.replace(/^([a-z])([a-z]+)-(\d+)(?:-(\d+))?$/, (_, a, b, x, y) => `${a.toUpperCase()}${b} ${x}${y ? `.${y}` : ''}`);
 const kt = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
@@ -313,7 +537,7 @@ const sums = (rs: any[]) => ({ in_tok: sum(rs, (r) => r.in_tok), out_tok: sum(rs
 function whatIf(rows: any[], rc: Record<string, any>) {
   const by = new Map<string, any[]>();
   for (const r of rows) if (r.usd != null) { const k = rates(r.model, rc)!.key; if (!by.has(k)) by.set(k, []); by.get(k)!.push(r); }
-  return [...by].map(([from, rs]) => ({ from, turns: rs.length, usd: sum(rs, (r) => r.usd) as number,
+  return [...by].map(([from, rs]) => ({ from, turns: rs.length, usd: sum(rs, (r) => r.usd) as number, account: payer(rs), limits: limText(sum(rs, (r) => r.usd), payer(rs)),
     on: Object.fromEntries(Object.keys(PRICES).filter((k) => k !== from).map((k) => [k, cost({ ...sums(rs), model: k }, rc)])) as Record<string, number> })).sort((a, b) => b.usd - a.usd);
 }
 // "Switch now" for one session: the one-time re-write of its current context at the target model's write price, and how many turns of
@@ -324,7 +548,7 @@ function switchNow(rows: any[], rc: Record<string, any>) {
   const from = rates(cur.model, rc)!.key, t = sums(main), n = main.length, per = sum(main, (r) => r.usd) / n, context = ctx(cur), h1 = ttlOf(cur) === 3600_000;
   return { from, context, per_turn_usd: per, turns_sampled: n, to: Object.keys(PRICES).filter((k) => k !== from).map((k) => {
     const w = rates(k, rc)!, rewrite = context * (h1 ? w.write_1h : w.write_5m) / 1e6, then = cost({ ...t, model: k }, rc)! / n;
-    return { model: k, rewrite_usd: rewrite, per_turn_usd: then, breakeven_turns: per > then ? Math.ceil(rewrite / (per - then)) : null };
+    return { model: k, rewrite_usd: rewrite, limits: limText(rewrite, cur.account_id), per_turn_usd: then, breakeven_turns: per > then ? Math.ceil(rewrite / (per - then)) : null };
   }) };
 }
 
@@ -340,12 +564,12 @@ function costView(q: URLSearchParams) {
   for (const r of rows) if (!oneShot(r)) { const k = r.session_key ?? '-'; if (!by.has(k)) by.set(k, []); by.get(k)!.push(r); }
   const per_session = [...by].map(([session_key, rs]) => {
     const j = rs.filter((r) => r.cache_create != null);
-    return { session_key, turns: rs.length, joined: j.length, usd: sum(rs, (r) => r.usd), unpriced: rs.filter((r) => r.usd == null).length, cache_read: sum(j, (r) => r.cache_read),
+    return { session_key, turns: rs.length, joined: j.length, usd: sum(rs, (r) => r.usd), limits: limText(sum(rs, (r) => r.usd), payer(rs)), unpriced: rs.filter((r) => r.usd == null).length, cache_read: sum(j, (r) => r.cache_read),
       cache_create: sum(j, (r) => r.cache_create), out_tok: sum(j, (r) => r.out_tok), switch_overhead: sum(j.filter((r) => r.switched), (r) => r.cache_create), share: total ? sum(j, W) / total : null };
   }).sort((a, b) => (b.share ?? 0) - (a.share ?? 0));
   const os = rows.filter(oneShot), wide = turns(Date.now() - days * 864e5), scope = session ? wide.filter((r) => r.session_key === session) : wide;
   return { windows, per_session, one_shots: { count: os.length, out_tok: sum(os, (r) => r.out_tok), share: total ? sum(os.filter((r) => r.cache_create != null), W) / total : null },
-    settings: st, usd: sum(rows, (r) => r.usd), unpriced: rows.filter((r) => r.usd == null).length, prices_as_of: PRICES_AS_OF, prices: PRICES, days,
+    settings: st, usd: sum(rows, (r) => r.usd), limits: limText(sum(rows, (r) => r.usd), payer(rows)), exchange: limitsView(), unpriced: rows.filter((r) => r.usd == null).length, prices_as_of: PRICES_AS_OF, prices: PRICES, days,
     ttl_fit: ttlFit(wide, days, rc),
     model_whatif: { session: session ?? 'all', label: 'saving if quality holds — unverified', usd: sum(scope, (r) => r.usd), unpriced: scope.filter((r) => r.usd == null).length,
       rows: whatIf(scope, rc), switch_now: session ? switchNow(scope, rc) : null } };
@@ -390,16 +614,17 @@ async function insights(q: URLSearchParams) {
   for (const r of bursts) if (r.burst.kind in A1 && (r.burst.kind !== 'expired' || r.burst.ttl === '1h')) { const k = `${r.burst.kind}:${r.session_key}`; if (!g.has(k)) g.set(k, []); g.get(k)!.push(r); }
   for (const [k, rs] of g) { const b = rs.at(-1).burst, sk = rs[0].session_key;
     F.push({ id: `a1:${k}`, tier: 'A', title: `${A1[b.kind]} ${rs.length === 1 ? 'once' : `${rs.length} times`} in ‘${title(sk)}’`, usd: sum(rs, (r) => r.burst.usd),
-      evidence: [`${kt(sum(rs, (r) => r.burst.delta))} tokens re-written`, b.cause], fix: b.fix, quality: 'none', session_key: sk }); }
+      evidence: [`${kt(sum(rs, (r) => r.burst.delta))} tokens re-written`, b.cause], fix: b.fix, quality: 'none', session_key: sk, account: payer(rs, (r) => r.burst.usd) }); }
   // A3: a lifetime that would have been cheaper
   for (const f of ttlFit(rows, days, rc)) if (f.switch_to) F.push({ id: `a3:${f.bucket}`, tier: 'A', title: `A ${f.switch_to} cache lifetime fits ${f.bucket === 'main' ? 'the main conversation' : 'subagents'} better`,
     usd: f.saving_usd, evidence: [`${f.turns_5_60} of ${plural(f.turns, 'turn')} came 5–60 min after the one before`, `${fmtUsd(f.actual_usd)} at ${f.current} → ${fmtUsd(f.actual_usd - f.saving_usd)} at ${f.switch_to}`],
-    fix: `"${f.setting}": "${f.switch_to}" in ~/.claude/settings.json`, quality: 'none' });
+    fix: `"${f.setting}": "${f.switch_to}" in ~/.claude/settings.json`, quality: 'none', account: payer(rows.filter((r) => (f.bucket === 'main') === !r.agent_id)) });
   // A4: the ten costliest tool results to carry. ponytail: looks at the 20 sessions that read the most cache in the window, whole transcript
   const heavy = all(`select session_key sk from requests where ts >= ? and agent_id is null and jsonl_path is not null and source is null group by 1 order by sum(cache_read) desc limit 20`, since);
   const carry = (await Promise.all(heavy.map(async ({ sk }) => (await carried(sk)).map((c) => ({ ...c, session_key: sk }))))).flat().sort((a, b) => b.usd - a.usd).slice(0, 10);
   carry.forEach((c, i) => F.push({ id: `a4:${i}:${c.session_key}`, tier: 'A', title: `${c.tool}${c.target && c.target !== c.tool ? ` ${c.target}` : ''}: one result re-read on ${plural(c.turns, 'turn')} in ‘${title(c.session_key)}’`,
-    usd: c.usd, evidence: [`${kt(c.tokens)} tokens`, `carried for ${plural(c.turns, 'turn')}`], fix: c.suggestion, quality: 'none', session_key: c.session_key }));
+    usd: c.usd, evidence: [`${kt(c.tokens)} tokens`, `carried for ${plural(c.turns, 'turn')}`], fix: c.suggestion, quality: 'none', session_key: c.session_key,
+    account: one('select account_id a from sessions where session_key = ?', c.session_key)?.a }));
   // A7: many loaded definitions and no tool-search tool (what a custom ANTHROPIC_BASE_URL does to the terminal CLI)
   const search = new Map<string, boolean>(all('select tools_hash h, tool_names_json j from requests where tool_names_json is not null').map((r) => [r.h, /tool.?search/i.test(r.j)]));
   const nt = (r: any) => r.tools_loaded ?? r.tools_count ?? 0, gw = rows.filter((r) => nt(r) >= MANY_TOOLS && search.get(r.tools_hash) === false);
@@ -408,16 +633,16 @@ async function insights(q: URLSearchParams) {
       usd: sized.length ? sum(sized, (r) => r.tools_tok * rates(r.model, rc)!.read / 1e6) : null,
       evidence: [`${plural(gw.length, 'request')} with no tool-search tool`, sized.length ? `about ${kt(Math.max(...sized.map((r) => r.tools_tok)))} tokens of definitions re-read per request (upper bound: about a dozen core tools stay loaded)`
         : 'definition sizes are recorded from this version on'],
-      fix: 'Add "ENABLE_TOOL_SEARCH": "true" beside ANTHROPIC_BASE_URL in the "env" block of ~/.claude/settings.json (a custom base URL turns tool search off).', quality: 'none' }); }
+      fix: SEARCH_FIX, quality: 'none', account: payer(gw) }); }
   // B2a / B1: the same tokens on a newer sibling, and one step down
   for (const w of whatIf(rows, rc)) {
     const to = NEWER[w.from], down = STEP_DOWN[w.from];
     if (to && w.on[to] < w.usd) F.push({ id: `b2:${w.from}`, tier: 'B', title: `${nice(w.from)} → ${nice(to)}: same family, newer and cheaper`, usd: w.usd - w.on[to],
       evidence: [plural(w.turns, 'turn'), `${fmtUsd(w.usd)} → ${fmtUsd(w.on[to])} for the same tokens`, 'no quality change expected'],
-      fix: `Start new sessions with \`claude --model claude-${to}\`, or set "model": "claude-${to}" in settings.json.`, quality: 'none' });
+      fix: `Start new sessions with \`claude --model claude-${to}\`, or set "model": "claude-${to}" in settings.json.`, quality: 'none', account: w.account });
     if (down && w.on[down] < w.usd) F.push({ id: `b1:${w.from}`, tier: 'B', title: `The same tokens on ${nice(down)} instead of ${nice(w.from)}`, usd: w.usd - w.on[down],
       evidence: [plural(w.turns, 'turn'), `${fmtUsd(w.usd)} → ${fmtUsd(w.on[down])} (−${Math.round((1 - w.on[down] / w.usd) * 100)}%)`, 'saving if quality holds — unverified'],
-      fix: `Start suitable sessions with \`claude --model claude-${down}\`. A switch mid-session re-writes the cache first: Cost → model what-if shows the break-even.`, quality: 'unverified' });
+      fix: `Start suitable sessions with \`claude --model claude-${down}\`. A switch mid-session re-writes the cache first: Cost → model what-if shows the break-even.`, quality: 'unverified', account: w.account });
   }
   // B2b: subagent runs that only read, on a model above Haiku
   const usedBy = new Map<string, Set<string>>();
@@ -429,7 +654,11 @@ async function insights(q: URLSearchParams) {
       evidence: [`${fmtUsd(usd)} → ${fmtUsd(haiku)} on Haiku 4.5`, `tools called: ${[...new Set(ids.flatMap((a) => [...usedBy.get(a)!]))].sort().join(', ')}`,
         ...ids.slice(0, 3).map((a) => String(one('select coalesce(name, agent_id) n from agents where agent_id = ?', a)?.n ?? a).slice(0, 60))],
       fix: 'Put `model: haiku` in the subagent definition (.claude/agents/<name>.md), or pass model "haiku" on the Agent call, for read-only exploration. The Claude Code costs doc recommends Haiku for simple subagent tasks.',
-      quality: 'docs-recommended' }); }
+      quality: 'docs-recommended', account: payer(ro) }); }
+  // the tool loading advisor's top recommendation that carries dollars (30 days, every project)
+  const tv = toolsView(new URLSearchParams()), top = tv.servers.find((x: any) => x.usd > 0 && x.class !== 'builtin');
+  if (top) F.push({ id: `tools:${top.server}`, tier: 'A', title: `${top.label}: MCP server ‘${top.server}’`, usd: top.usd, evidence: top.evidence, fix: top.change, quality: 'none', account: tv.account });
+  for (const f of F) f.limits = limText(f.usd, f.account);
   F.sort((a, b) => (b.usd ?? 0) - (a.usd ?? 0));
   const tier = (t: string) => sum(F.filter((f) => f.tier === t), (f) => f.usd);
   return {
@@ -450,6 +679,8 @@ async function insights(q: URLSearchParams) {
 // filter, summed per session, model and speed. Requests on unpriced models are counted in `unpriced`, never in `spent`.
 // day = since local midnight; week = rolling last 7×24 h; session = per session, whole life: `sk` names the session (a request's),
 // without it the view shows the biggest session active in the last 24 h.
+// unit 'pct_7d' | 'pct_5h': the limit is percentage points of one account's window (scope 'account', or 'all' with a single account);
+// the dollars are converted through asLimits(). Until the estimator has a value for that account the budget is 'waiting' and never fires.
 // ponytail: a SUM over the window per budget, per request and per poll (uses requests_ts / requests_session_ts); keep a running
 // total per budget and period if the ledger gets large.
 export function budgetStatus(b: any, sk?: string | null) {
@@ -461,17 +692,22 @@ export function budgetStatus(b: any, sk?: string | null) {
   if (b.scope === 'session' && b.match) { w.push('r.session_key = ?'); a.push(b.match); }
   if (per && sk) { w.push('r.session_key = ?'); a.push(sk); }
   else if (per) { w.push('r.session_key in (select session_key from sessions where last_ts >= ?)'); a.push(t - 864e5); }
-  const rows = all(`select r.session_key sk, r.model, r.speed, ${SUMS('r.')} from requests r where ${w.join(' and ')} group by 1, 2, 3`, ...a);
+  const rows = all(`select r.session_key sk, r.account_id, r.model, r.speed, ${SUMS('r.')} from requests r where ${w.join(' and ')} group by 1, 2, 3, 4`, ...a);
   const by = new Map<string | null, number>();
   for (const r of rows) { r.usd = cost(r, rc); if (r.usd != null) by.set(r.sk, (by.get(r.sk) ?? 0) + r.usd); }
   const top = [...by].sort((x, y) => y[1] - x[1]).slice(0, 3);
-  const mine = per ? rows.filter((r) => r.sk === (sk ?? top[0]?.[0])) : rows, spent = sum(mine, (r) => r.usd), pct = spent / b.limit;
-  return { ...b, spent, pct, state: pct >= 1 ? 'over' : pct >= 0.8 ? 'warn' : 'ok', period_start: start, unpriced: sum(mine.filter((r) => r.usd == null), (r) => r.n),
+  const mine = per ? rows.filter((r) => r.sk === (sk ?? top[0]?.[0])) : rows, usd = sum(mine, (r) => r.usd), unit = b.unit ?? 'usd', ids = all('select id from accounts');
+  const account = b.scope === 'account' ? b.match : unit === 'usd' ? payer(mine) : ids.length === 1 ? ids[0].id : null;
+  const spent = unit === 'usd' ? usd : asLimits(usd, account)?.[unit as 'pct_7d' | 'pct_5h'] ?? null, pct = spent == null ? 0 : spent / b.limit;
+  return { ...b, unit, account, spent, spent_usd: usd, limits: limText(usd, account), pct, state: spent == null ? 'waiting' : pct >= 1 ? 'over' : pct >= 0.8 ? 'warn' : 'ok', period_start: start, unpriced: sum(mine.filter((r) => r.usd == null), (r) => r.n),
     period_end: b.period === 'day' ? new Date(day).setDate(new Date(day).getDate() + 1) : null,
     period_key: per ? sk ?? top[0]?.[0] ?? null : b.period === 'day' ? new Date(day).toLocaleDateString('sv') : 'rolling-7d',
     top: top.map(([k, usd]) => ({ label: k ? title(k) : '—', usd })) };
 }
 const budgets = () => (settings().budgets as any[]).map((b) => budgetStatus(b));
+// "$1.65 of $2.00", or for a budget in % of a window "4.1% of 5% of home's week ($19.40 at list price)"; a waiting one has no amount yet
+export const budgetAmt = (b: any) => b.unit === 'usd' ? `${fmtUsd(b.spent)} of ${fmtUsd(b.limit)}`
+  : `${b.spent == null ? 'waiting for data' : fmtPct(b.spent)} of ${b.limit}% of ${b.account ?? 'the account'}'s ${b.unit === 'pct_7d' ? 'week' : '5-hour window'} (${fmtUsd(b.spent_usd)} at list price)`;
 
 // One session's /v1/messages turns in order, with account, joined usage, burst and the migration each turn paid for, plus the five
 // tool results that cost the most to carry.
@@ -496,4 +732,7 @@ export function consoleApi(what: string, q: URLSearchParams, accounts?: any[]): 
   if (what === 'cost') return costView(q);
   if (what === 'insights') return insights(q);
   if (what === 'budgets') return budgets();
+  if (what === 'limits') return limitsView();
+  if (what === 'tools') return toolsView(q);
+  if (what === 'warm') return warmView();
 }

@@ -76,7 +76,7 @@ Until B4 has data, B1 and B3 carry the label **"saving if quality holds — unve
   it is the objective (quality minus cost); the tools are replay arithmetic and a small shadow test.
 - **Local models for the coding loop.** That is a quality trade. A local model is only an optional classifier backend
   for the brain (order: Jev → local → Haiku), added when someone asks.
-- ~~Router-originated keep-warm requests~~ — now planned as an opt-in scheduler, see below.
+- ~~Router-originated keep-warm requests~~ — built as an opt-in scheduler, see below.
 
 ## Where it shows up
 
@@ -122,6 +122,9 @@ before the cache goes cold.
 
 ## Next: limits as the unit, keep-warm scheduler, tool loading advisor
 
+Built on 2026-10-01; "As built" under each part says where the code differs. Measurements: NOTES.md "Limits as the unit, keep warm,
+tool loading, facts switch".
+
 ### Limits as the unit
 On a subscription the scarce thing is the 5-hour and weekly window, not dollars. Every response carries the
 account's utilization, so the router can measure the exchange rate from its own traffic: list-price dollars spent
@@ -136,6 +139,11 @@ Every dollar figure in the console gains "≈ N% of your 5-hour window · M% of 
 Rules: per account, rolling estimate over the last 14 days, needs a minimum of spend and movement before it is
 shown, and is marked low-confidence when utilization moves far more than router traffic explains (the account is
 being used elsewhere: acct-b moved 43% on $0.51 of router traffic). Budgets accept a limit in % of week.
+
+As built: windows are grouped by their reset header; a window counts once it moved 3 points on more than $0; `ok` needs $20 and 10
+points in total, anything less is shown with "(rough)". "Used elsewhere" = the latest window moved more than 3× as far per dollar as the
+account's own median, so it needs two qualifying windows: acct-b, with one, is `low` for thin data instead. Budgets take
+`unit: pct_7d | pct_5h` on one account, show "waiting for data" until there is a rate, and fire on a rough rate too.
 
 ### Keep-warm scheduler (opt-in, off by default)
 The cache lifetime resets on every read, so replaying a session's last request keeps a large context warm.
@@ -154,6 +162,13 @@ The cache lifetime resets on every read, so replaying a session's last request k
   warming of home can stop when the token expires. Pings are requests the router sends on its own with your login;
   they count toward your limits and are logged with source `warm`.
 
+As built: the request is held only while `warm_enabled` is on (so the first ping of a session comes after its next request), at most
+20 sessions and 64 MB. The ping is the identical bytes with the socket destroyed at `message_start`; the `max_tokens: 1` variant
+measured the same cost and was not shipped because it has to rewrite the body. "Until a time" is offered as 1h / 2h / 4h / until I'm
+back (`warm_max_hours`). `warm_min_usd` applies to rules and "after I stop", not to a session picked by hand. An oauth account's kept
+token is replayed as is. Proof on a 5-minute cache: with a ping at 4 min the turn at 7 min read 64,067 and wrote 41; without, read 0
+and wrote 64,107.
+
 ### Tool loading advisor
 Claude Code defers MCP tools behind tool search by default; a server with `"alwaysLoad": true` loads upfront.
 From each person's own ledger (tool calls per server, sessions that used it, ToolSearch round trips, definition
@@ -164,3 +179,10 @@ sizes) the console recommends, per project:
 Each line shows the arithmetic (definition tokens × turns × read price vs round trips avoided) and the exact
 config snippet to paste. The router does not rewrite tool lists in requests: the client's own search index would
 no longer match.
+
+As built: "now" is the newest tool list recorded for a main conversation in the scope (`requests.tool_servers_json`, new: older sessions
+have calls but no load state). A search round trip is credited to the first MCP call that follows a `ToolSearch` call in the same thread
+within 5 requests: the ledger has no user-turn boundaries and never sees the query. A loaded server that is never called is charged only
+for the turns of sessions whose recorded list had it loaded. Servers a plugin, a claude.ai connector or the app provides get the
+recommendation without a config change. Brain: `CRITICAL_FACTS.md` is loaded through one `@` import line in `~/.claude/CLAUDE.md`,
+switched from the Facts view.

@@ -141,7 +141,8 @@ folder** (`open <vault>` / `xdg-open`). The directory is always the configured v
 `GET graph` (`nodes`, `edges`) · `POST capture {session?}` · `POST scan {session}` · `POST distill {session, force?}` ·
 `POST scan-all {limit?}` · `POST extract-all` (202 `{total, estimate_usd, cap}`; 409 `brain_busy` while one runs) · `POST open {target: obsidian|folder}` ·
 `POST consolidate {project}` · `POST skills/import {url}` · `POST skills/<name>/promote|demote|reject` · `POST recall` ·
-`PUT facts {text}`. Reads always answer; every write is `409 brain_disabled` until `brain_enabled`. Enabling is
+`PUT facts {text}` · `POST facts-load {on}` (adds or removes the one line `@<vault>/CRITICAL_FACTS.md` in `<CLAUDE_HOME or ~/.claude>/CLAUDE.md`;
+`stats.facts_loaded` reads it back). Reads always answer; every write is `409 brain_disabled` until `brain_enabled`. Enabling is
 `PUT /router/settings {brain_enabled: true, brain_dir}`.
 
 ## Settings

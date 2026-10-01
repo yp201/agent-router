@@ -38,7 +38,7 @@ if (addCol('sessions', 'title text')) db.exec('delete from tail_offsets'); // re
 addCol('requests', 'agent_id text');
 db.exec('create index if not exists requests_agent on requests(agent_id)');
 const FP = ['system_hash', 'tools_hash', 'tools_count', 'msg_count', 'first_user_hash', 'first_user_tok', 'context_est', 'tool_names_json', 'ua_kind',
-  'tools_loaded', 'tools_deferred', 'tools_tok', 'effort', 'speed', 'beta_hash', 'image_count', 'cli_version']; // cache-key fingerprint (NOTES.md "Cost insights")
+  'tools_loaded', 'tools_deferred', 'tools_tok', 'effort', 'speed', 'beta_hash', 'image_count', 'cli_version', 'tool_servers_json']; // cache-key fingerprint (NOTES.md "Cost insights")
 for (const c of ['model_from_transcript', ...FP]) addCol('requests', `${c} ${/count|tok|est|loaded|deferred/.test(c) ? 'integer' : 'text'}`);
 if (addCol('requests', 'usage_src text')) db.exec(`update requests set usage_src = 'transcript' where cache_create is not null`); // all usage so far came from the tailer
 addCol('requests', 'source text');
@@ -82,6 +82,13 @@ export const DEFAULTS: Record<string, any> = {
   // (a stored brain_daily_units from before dollars is ignored)
   brain_enabled: false, brain_dir: null, brain_distill: 'manual', brain_daily_usd: 1, // brain_distill: 'manual' | 'on_idle'
   classifier: 'auto', brain_classifier_model: 'haiku', brain_writer_model: 'sonnet', brain_confidence: 0.7, // classifier: 'auto' | 'jev' | 'model'
+  // keep warm (router.ts warmTick, console.ts warmPlan): off until enabled. While on, the last main-thread request of sessions with at least
+  // warm_min_context cached tokens is held in memory and replayed warm_lead_min minutes before its 1h cache lapses, for sessions with a
+  // one-off (warm_sessions), a matching rule or warm_after_stop_hours > 0; rules and after-stop only cover a rebuild of warm_min_usd or more.
+  // warm_rules: [{ id, name, days: [0-6], from: 'HH:MM', to: 'HH:MM', scope: 'all'|'project', match }] in local time.
+  // warm_allow_5m: also ping 5-minute caches (never pays back; for the proof run in NOTES.md "Keep warm").
+  warm_enabled: false, warm_min_context: 100000, warm_min_usd: 1, warm_max_hours: 8, warm_daily_usd: 2, warm_lead_min: 5, warm_after_stop_hours: 0,
+  warm_rules: [], warm_allow_5m: false,
 };
 export const settings = (): Record<string, any> => ({
   ...DEFAULTS,

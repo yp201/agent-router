@@ -12,7 +12,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { db, logRequest, settings, putSetting, DEFAULTS, now, clock } from './ledger.ts';
 import { startTailer, joined } from './tailer.ts';
-import { consoleApi, util, timeline, advice, budgetStatus, fmtUsd, warmth } from './console.ts';
+import { consoleApi, util, timeline, advice, budgetStatus, budgetAmt, fmtUsd, warmth, limText, warmPlan, warmQuote, warmMem, BY_USER } from './console.ts';
 import { CLAUDE_BIN, handoff, notify, title } from './advisor.ts';
 import { brainApi, startBrain } from './brain.ts';
 import { type Account, listAccounts, getAccount, setAcct, healthy, token, forget, expiresAt } from './accounts.ts';
@@ -74,6 +74,10 @@ function fingerprint(p: any, bytes: number, hdr: IncomingMessage['headers']) {
   const typed = first.filter((t) => !t.trimStart().startsWith('<system-reminder>')).join('\n') || first.join('\n');
   const tools_hash = h16(tools.join('\n')), beta = String(hdr['anthropic-beta'] ?? ''), enumOf = (v: any) => (v == null || v === '' ? null : String(v).slice(0, 24));
   const images = (c: any): number => (Array.isArray(c) ? c.reduce((n, b) => n + (b?.type === 'image' ? 1 : b?.type === 'tool_result' ? images(b.content) : 0), 0) : 0);
+  // per MCP server ('' = built-in tools): definitions loaded / deferred and their JSON size; mcp__<server>__<tool> names the server
+  const servers: Record<string, { loaded: number; deferred: number; def_tokens: number }> = {};
+  for (const t of defs) { const x = (servers[/^mcp__(.+?)__/.exec(String(t?.name ?? ''))?.[1] ?? ''] ??= { loaded: 0, deferred: 0, def_tokens: 0 });
+    x[t?.defer_loading === true ? 'deferred' : 'loaded']++; x.def_tokens += Math.round(JSON.stringify(t).length / 4); }
   return {
     system_hash: h16(sys.join('\n')), tools_hash, tools_count: defs.length, msg_count: Array.isArray(p.messages) ? p.messages.length : null,
     first_user_hash: typed ? h16(typed) : null, first_user_tok: Math.round(typed.length / 4), context_est: Math.round(bytes / 4),
@@ -83,8 +87,10 @@ function fingerprint(p: any, bytes: number, hdr: IncomingMessage['headers']) {
     beta_hash: beta ? h16(beta.split(',').map((x) => x.trim()).sort().join(',')) : null,
     image_count: Array.isArray(p.messages) ? p.messages.reduce((n: number, m: any) => n + images(m?.content), 0) : null,
     cli_version: /claude-cli\/(\d+(?:\.\d+)*)/.exec(String(hdr['user-agent'] ?? ''))?.[1] ?? null,
+    tool_servers_json: defs.length ? JSON.stringify(servers) : null, // handle() stores it only when a thread's tool list changed
   };
 }
+const toolSeen = new Map<string, string>(); // thread -> the tool_servers_json last stored for it (memory: stored once more per thread after a restart)
 const uaShapes = new Set<string>(); // log each user-agent *shape* once (digits and hex masked), never the value
 const text = (c: any): string => typeof c === 'string' ? c : Array.isArray(c) ? text(c.find((b: any) => b?.type === 'text')?.text) : '';
 function sessionKey(p: any): string | null {
@@ -146,8 +152,11 @@ function warnCheck(id: string, j: string) {
 const okBudget = (b: any) => !!b && typeof b === 'object' && typeof b.id === 'string' && /^[\w-]{1,64}$/.test(b.id) && typeof b.name === 'string' && !!b.name.trim() && b.name.length <= 80
   && ['all', 'project', 'account', 'session'].includes(b.scope) && ['day', 'week', 'session'].includes(b.period)
   && (b.scope === 'all' ? b.match == null : b.scope === 'session' ? b.period === 'session' && (b.match == null || typeof b.match === 'string') : typeof b.match === 'string' && b.match !== '')
-  && Number.isFinite(b.limit) && b.limit > 0 && ['notify', 'stop'].includes(b.action)
+  && Number.isFinite(b.limit) && b.limit > 0 && ['notify', 'stop'].includes(b.action) && (b.unit == null || ['usd', 'pct_7d', 'pct_5h'].includes(b.unit))
   && Array.isArray(b.thresholds) && b.thresholds.every((x: any) => typeof x === 'number' && x > 0 && x <= 1);
+const okRule = (r: any) => !!r && typeof r === 'object' && typeof r.id === 'string' && /^[\w-]{1,64}$/.test(r.id) && typeof r.name === 'string' && !!r.name.trim() && r.name.length <= 80
+  && Array.isArray(r.days) && r.days.every((d: any) => Number.isInteger(d) && d >= 0 && d <= 6) && [r.from, r.to].every((x) => typeof x === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(x))
+  && (r.scope === 'all' ? r.match == null : r.scope === 'project' && typeof r.match === 'string' && r.match !== ''); // settings.warm_rules
 const okBudgets = (v: any) => Array.isArray(v) && v.every(okBudget) && new Set(v.map((b) => b.id)).size === v.length;
 // Budgets a request counts against, with their status. project = basename of the session's cwd (known once the tailer has seen its
 // transcript); a per-session budget (period 'session') is measured for this request's session.
@@ -163,10 +172,10 @@ function budgetCheck(key: string | null, acct: string) {
     const hit = [...b.thresholds].sort((x: number, y: number) => y - x).filter((th: number) => b.spent >= th * b.limit
       && db.prepare(`insert into budget_events (budget_id, period_key, threshold, ts) select ?, ?, ?, ? where not exists
         (select 1 from budget_events where budget_id = ? and period_key = ? and threshold = ? and ts >= ?)`).run(b.id, b.period_key, th, now(), b.id, b.period_key, th, b.period_start).changes);
-    if (hit.length) notify(`Budget ‘${b.name}’ at ${Math.floor(b.pct * 100)}% — ${fmtUsd(b.spent)} of ${fmtUsd(b.limit)}${b.action === 'stop' && b.state === 'over' ? ' — requests are now stopped' : ''}`);
+    if (hit.length) notify(`Budget ‘${b.name}’ at ${Math.floor(b.pct * 100)}% — ${budgetAmt(b)}${b.action === 'stop' && b.state === 'over' ? ' — requests are now stopped' : ''}`);
   }
 }
-const stopMsg = (b: any) => `agent-router budget ‘${b.name}’ is spent: ${fmtUsd(b.spent)} of ${fmtUsd(b.limit)} at list price ${
+const stopMsg = (b: any) => `agent-router budget ‘${b.name}’ is spent: ${budgetAmt(b)}${b.unit === 'usd' ? ' at list price' : ''} ${
   b.period === 'day' ? `today. It resets ${at(b.period_end)}` : b.period === 'week' ? 'in the last 7 days. The window is rolling: spend frees up as it ages past 7 days'
   : 'in this session. A per-session cap does not reset: start a new session'}. Raise or remove it at http://localhost:${PORT}/router/#cost`;
 
@@ -181,8 +190,11 @@ function coldTick() {
   for (const w of warmth(t - 3600_000)) {
     const left = w.cold_at! - t;
     if (!w.ttl_1h || w.ctx < st.cold_min_context || !(w.rebuild_usd! >= st.cold_min_usd) || warned.get(w.sk) === w.ts || left <= 0 || left > st.cold_lead_min * 60_000) continue;
+    const plan = st.warm_enabled ? warmPlan(w, st, t) : null, lim = limText(w.rebuild_usd, pinOf(w.sk));
+    if (plan?.by && !plan.stop) continue; // it is being kept warm: a ping goes out instead of a warning
     warned.set(w.sk, w.ts);
-    notify(`‘${title(w.sk)}’ goes cold in ${Math.max(1, Math.round(left / 60_000))} min — a message now costs about ${fmtUsd(w.read_usd)}, after that the next turn costs about ${fmtUsd(w.rebuild_usd)}`);
+    notify(`‘${title(w.sk)}’ goes cold in ${Math.max(1, Math.round(left / 60_000))} min — a message now costs about ${fmtUsd(w.read_usd)}, after that the next turn costs about ${fmtUsd(w.rebuild_usd)}${
+      lim ? ` (${lim})` : ''}${plan ? ` — keep-warm is on but does not cover this session${plan.stop ? `: ${plan.stop}` : ''}` : ''}`);
   }
 }
 setInterval(() => { try { coldTick(); } catch (e: any) { console.error('cold check failed:', e.message); } }, Number(process.env.COLD_TICK_MS) || 60_000).unref();
@@ -191,9 +203,10 @@ setInterval(() => { try { coldTick(); } catch (e: any) { console.error('cold che
 // SSE: message_start.message.usage, then message_delta.usage (later fields win); only the current partial line is held.
 // Non-stream JSON: top-level `usage`, body buffered up to 2 MB. Only numbers are kept. Any failure -> no usage on that row,
 // logged once (never the content), response untouched.
+// `first` (a keep-warm ping): the upstream socket is destroyed as soon as message_start's usage is read (any body byte when not SSE).
 const USAGE_CAP = 2 << 20;
 let usageWarned = false;
-function tapUsage(up: IncomingMessage) {
+function tapUsage(up: IncomingMessage, first = false) {
   const sse = String(up.headers['content-type']).includes('text/event-stream'), enc = String(up.headers['content-encoding'] ?? '').toLowerCase();
   const z = enc === 'gzip' ? createGunzip() : enc === 'deflate' ? createInflate() : enc === 'br' ? createBrotliDecompress() : null;
   const dec = new StringDecoder('utf8'), n = (v: any) => (typeof v === 'number' ? v : null);
@@ -203,7 +216,7 @@ function tapUsage(up: IncomingMessage) {
     try {
       buf += c ? dec.write(c) : dec.end();
       if (buf.length > USAGE_CAP) return void ([dead, buf] = [true, '']);
-      if (!sse) { if (!c && up.complete) u = JSON.parse(buf).usage; return; }
+      if (!sse) { if (!c && up.complete) u = JSON.parse(buf).usage; else if (first) up.destroy(); return; }
       const lines = buf.split('\n');
       buf = lines.pop()!;
       for (const l of lines) {
@@ -211,6 +224,7 @@ function tapUsage(up: IncomingMessage) {
         const d = JSON.parse(l.slice(5));
         u = { ...u, ...(d.type === 'message_start' ? d.message?.usage : d.type === 'message_delta' ? d.usage : null) };
       }
+      if (first && u) up.destroy();
     } catch {
       [dead, buf] = [true, ''];
       if (!usageWarned) { usageWarned = true; console.error('usage: could not parse a response stream; that row has no stream usage (logged once)'); }
@@ -228,6 +242,62 @@ function tapUsage(up: IncomingMessage) {
     up.on('data', (c) => z.write(c)).on('end', () => z.end()).on('close', () => z.end());
   });
 }
+
+// ---- keep warm (docs/COST-INSIGHTS.md "Keep-warm scheduler"; opt-in, settings.warm_enabled) ----
+// The last request of each large main conversation, exactly as it went upstream: the raw body bytes and the header set (authorization
+// included), keyed by thread (session key + first-user hash, the burst code's thread identity). Memory only: never serialised, never
+// logged, gone when the router exits. At most KEEP_MAX entries and KEEP_BYTES in total; the oldest goes first.
+type Kept = { sk: string; body: Buffer; path: string; headers: Record<string, any>; account_id: string; model: string | null; ts: number };
+const kept = new Map<string, Kept>(), KEEP_MAX = 20, KEEP_BYTES = 64 << 20;
+const keptBytes = () => [...kept.values()].reduce((n, k) => n + k.body.length, 0);
+function keep(thread: string, k: Kept | null) {
+  kept.delete(thread);
+  if (k) kept.set(thread, k);
+  for (const id of kept.keys()) { if (kept.size <= KEEP_MAX && keptBytes() <= KEEP_BYTES) break; kept.delete(id); }
+}
+Object.assign(warmMem, { has: (thread: string) => kept.has(thread), stats: () => ({ entries: kept.size, bytes: keptBytes() }) });
+// A ping: the kept request again, unchanged, through the same dial. Not through handle(): no pin, cooldown, migration, budget stop or
+// transcript join is touched, and a failure only stops that session's warming (console.ts warmPlan reads the logged status). The upstream
+// socket is destroyed as soon as message_start's usage has been read. Logged as a requests row with source 'warm'.
+const pinging = new Set<string>();
+async function ping(k: Kept) {
+  const t0 = now();
+  let status = 502, rid: string | null = null, rlj = '{}', usage: Record<string, any> = {};
+  pinging.add(k.sk);
+  try {
+    const up = await dial({ method: 'POST', path: k.path, headers: k.headers }, k.body);
+    up.on('error', () => {});
+    [status, rid] = [up.statusCode!, (up.headers['request-id'] as string) ?? null];
+    rlj = JSON.stringify(Object.fromEntries(Object.entries(up.headers).filter(([h]) => h.startsWith('anthropic-ratelimit-')).map(([h, v]) => [h, String(v)])));
+    if (status >= 300) up.destroy();
+    else {
+      if (rlj !== '{}') db.prepare('update accounts set last_ratelimit_json = ? where id = ?').run(rlj, k.account_id); // utilization only: no status, no cooldown
+      usage = await tapUsage(up, true);
+    }
+  } catch (e: any) { console.error('warm ping failed:', e.message); }
+  pinging.delete(k.sk);
+  console.log(new Date(t0).toISOString(), 'warm ping', status, rid, k.model, k.account_id);
+  try { logRequest({ ts: t0, request_id: rid, session_key: k.sk, account_id: k.account_id, method: 'POST', path: k.path, model: k.model, status, latency_ms: now() - t0, stream: 1,
+    retry_of: null, ratelimit_json: rlj, source: 'warm', ...usage }); } catch (e: any) { console.error('ledger insert failed:', e.message); }
+  return status;
+}
+// Every 30 s: ping each covered session whose cache lifetime ends within warm_lead_min (warmPlan decides, and says why not). A stop is
+// logged once and, for a one-off, recorded in warm_sessions.reason. Turning the feature off drops every held request.
+const stopped = new Map<string, string | null>();
+function warmTick() {
+  const st = settings(), t = now();
+  if (!st.warm_enabled) return void kept.clear();
+  for (const w of warmth(t - 25 * 3600_000)) {
+    const p = warmPlan(w, st, t), k = kept.get(w.thread);
+    if ((p.by || p.stop) && stopped.get(w.sk) !== p.stop) {
+      stopped.set(w.sk, p.stop);
+      db.prepare('update warm_sessions set reason = ? where session_key = ? and until_ts > 0').run(p.stop, w.sk);
+      if (p.stop) console.log(`warm: ‘${title(w.sk)}’ is not being pinged — ${p.stop}`);
+    }
+    if (p.next != null && p.next <= t && k && k.account_id === p.account && !pinging.has(w.sk)) ping(k).catch((e) => console.error('warm ping failed:', e.message));
+  }
+}
+setInterval(() => { try { warmTick(); } catch (e: any) { console.error('warm tick failed:', e.message); } }, Number(process.env.WARM_TICK_MS) || 30_000).unref();
 
 // pick + token; an oauth account whose token can't be loaded is skipped for this request
 async function choose(key: string | null, nonMsg: boolean, exclude: string[] = []) {
@@ -286,9 +356,12 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   const isMsg = req.method === 'POST' && pathname === '/v1/messages';
   const key = sessionKey(parsed), model = typeof parsed.model === 'string' ? parsed.model : null;
   const est = Math.round(body.length / 4), src = String(req.headers['x-agent-router-source'] ?? '');
-  let fp: Record<string, any> = {};
+  let fp: Record<string, any> = {}, th = ''; // th = the thread: session + first user message, as the burst code tells threads apart
   if (isMsg) {
     try { fp = fingerprint(parsed, decode(body).length, req.headers); } catch {}
+    th = `${key}\0${fp.first_user_hash ?? model}`;
+    if (fp.tool_servers_json && toolSeen.get(th) === fp.tool_servers_json) fp.tool_servers_json = null;
+    else if (fp.tool_servers_json) { if (toolSeen.size > 2000) toolSeen.clear(); toolSeen.set(th, fp.tool_servers_json); }
     const ua = String(req.headers['user-agent'] ?? '');
     fp.ua_kind = /claude-desktop/i.test(ua) ? 'desktop' : 'cli';
     const shape = ua.replace(/[0-9a-f]{8,}/gi, 'H').replace(/\d+/g, 'N');
@@ -340,7 +413,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     db.prepare(`update accounts set last_status = ?, last_seen = ?, last_ratelimit_json = case when ? = '{}' then last_ratelimit_json else ? end where id = ?`)
       .run(up.statusCode!, Date.now(), s, s, a.id);
     if (s !== '{}') warnCheck(a.id, s);
-    return { up, rl: s, rid: (up.headers['request-id'] as string) ?? null, why: isMsg && forced(up.statusCode!, a) ? cool(a, up) : null };
+    return { up, h, rl: s, rid: (up.headers['request-id'] as string) ?? null, why: isMsg && forced(up.statusCode!, a) ? cool(a, up) : null };
   };
 
   let status = 502, requestId: string | null = null, ratelimit = '{}', retryOf: number | null = null, usage: Promise<Record<string, any>> | undefined;
@@ -366,6 +439,14 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         .run({ key, acct: c.a.id, ts: start, sw: from ? 1 : 0, model });
       if (from) { migrate(start, key, from, c.a.id, est, requestId, reason); notify(note!); }
     }
+    // keep warm: hold this request while it is the last one of a large main conversation (streamed, has tools, not known to be a
+    // subagent's thread, cached context >= warm_min_context: the thread's previous turn, else this body / 4); otherwise drop what was held
+    if (isMsg && key && !src && status < 400) try {
+      const st = settings(), main = st.warm_enabled && parsed.stream === true && fp.tools_count > 0;
+      const prev = main ? one(`select cache_read + cache_create ctx, agent_id from requests where session_key = ? and first_user_hash is ? and source is null and status < 400
+        and cache_create is not null order by ts desc limit 1`, key, fp.first_user_hash ?? null) : null;
+      keep(th, main && !prev?.agent_id && (prev?.ctx ?? fp.context_est) >= st.warm_min_context ? { sk: key, body, path: req.url!, headers: r.h, account_id: c.a.id, model, ts: start } : null);
+    } catch (e: any) { console.error('keep-warm hold failed:', e.message); }
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(r.up.headers)) if (!SKIP_RES.has(k)) out[k] = v;
     res.writeHead(status, out);
@@ -408,9 +489,14 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
     const enums: Record<string, string[]> = { policy: ['sticky_least_utilized', 'prefer_home_until_80', 'manual'], brain_distill: ['manual', 'on_idle'], classifier: ['auto', 'jev', 'model'] };
     for (const [k, v] of Object.entries(input ?? {})) {
       const d = DEFAULTS[k], ok = !(k in DEFAULTS) ? false : k.endsWith('_pct') || k === 'brain_confidence' ? typeof v === 'number' && v >= 0 && v <= 1
+        : k === 'warm_rules' ? Array.isArray(v) && v.every(okRule) && new Set(v.map((r) => r.id)).size === v.length
+        : k === 'warm_max_hours' ? typeof v === 'number' && v > 0 && v <= 24 : k.startsWith('warm_') && typeof d === 'number' ? typeof v === 'number' && v >= 0
         : enums[k] ? enums[k].includes(v as string) : k === 'brain_dir' ? v === null || (typeof v === 'string' && /^(~|\/)/.test(v)) : d === null ? v === null || typeof v === 'string'
         : k === 'context_rules' ? Array.isArray(v) : k === 'budgets' ? okBudgets(v) : typeof d !== 'object' ? typeof v === typeof d : typeof v === 'object' && v !== null && !Array.isArray(v);
       if (!ok) return json(res, 400, { error: { type: 'invalid_setting', key: k } });
+      // a limit in % of a window is one account's window
+      const bad = k === 'budgets' && (v as any[]).find((b) => (b.unit ?? 'usd') !== 'usd' && b.scope !== 'account' && !(b.scope === 'all' && listAccounts().length === 1));
+      if (bad) return json(res, 400, { error: { type: 'invalid_setting', key: k, message: `budget ‘${bad.name}’: a limit in % of a window is measured against one account — use scope "account" (scope "all" only works while there is a single account)` } });
     }
     for (const [k, v] of Object.entries(input)) putSetting(k, v);
     return json(res, 200, settings());
@@ -419,7 +505,25 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
     const ok = listAccounts().filter(healthy), n = newSession(ok);
     return json(res, 200, { ...consoleApi('overview', url.searchParams, accountsView()), policy_line: n.a ? `new sessions start on ${n.a.id} — ${n.why}` : n.why });
   }
-  if (m === 'GET' && ['cache', 'cost', 'insights', 'sessions', 'budgets'].includes(what) && !id) return json(res, 200, await consoleApi(what, url.searchParams));
+  if (m === 'GET' && ['cache', 'cost', 'insights', 'sessions', 'budgets', 'limits', 'tools', 'warm'].includes(what) && !id) return json(res, 200, await consoleApi(what, url.searchParams));
+  // keep warm, one session: GET = the quote shown before it is switched on, POST {hours} = a one-off, DELETE = stop (also stops a rule's cover until its next request)
+  if (what === 'sessions' && action === 'warm') {
+    const st = settings(), t = now + clock.skew, set = db.prepare(`insert into warm_sessions (session_key, until_ts, created_ts, reason) values (?, ?, ?, ?)
+      on conflict (session_key) do update set until_ts = excluded.until_ts, created_ts = excluded.created_ts, reason = excluded.reason`);
+    if (m === 'GET') { const quote = warmQuote(id, Number(url.searchParams.get('hours'))); return quote ? json(res, 200, quote) : json(res, 404, { error: { type: 'no_warm_cache' } }); }
+    if (m === 'DELETE') { set.run(id, 0, t, BY_USER); return json(res, 200, { ok: true }); }
+    if (m === 'POST') {
+      if (!st.warm_enabled) return json(res, 409, { error: { type: 'warm_disabled' } });
+      if (!(Number(input.hours) > 0)) return json(res, 400, { error: { type: 'bad_hours' } });
+      const until_ts = t + Math.min(Number(input.hours), st.warm_max_hours, 24) * 3600_000;
+      set.run(id, until_ts, t, null);
+      return json(res, 200, { ok: true, until_ts });
+    }
+  }
+  if (DRILLS && m === 'POST' && what === 'sessions' && action === 'ping') { // drill: ping this session's held request now
+    const k = [...kept.values()].find((x) => x.sk === id);
+    return k ? json(res, 200, { ok: true, status: await ping(k) }) : json(res, 404, { error: { type: 'nothing_held' } });
+  }
   if (m === 'GET' && what === 'sessions' && action === 'timeline') return json(res, 200, await timeline(id));
   if (m === 'GET' && what === 'sessions' && action === 'advice') return json(res, 200, advice(id));
   if (m === 'GET' && what === 'advice') return json(res, 200, advice());

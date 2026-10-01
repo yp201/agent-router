@@ -423,3 +423,70 @@ Code: `brain.ts` (`pipeline()`, `batch()`, `graph()`, `open()`, `gate1()` split 
   so no new skill is asked for.
 - **Not built:** touch-screen pinch is handled, but there is no keyboard navigation of the graph; nodes can be un-pinned only all at once
   (Reset layout); scan-all does not resume after a restart (the progress is in memory).
+
+
+## Limits as the unit, keep warm, tool loading, facts switch (2026-10-01)
+Spec: `docs/COST-INSIGHTS.md` "Next". Code: `console.ts` (`limits()`, `asLimits()`, `limText()`, `warmPlan()`, `warmQuote()`, `ruleEnd()`, `toolsView()`),
+`router.ts` (`keep()`, `ping()`, `warmTick()`, the per-server fingerprint), `brain.ts` (`loadFacts()`), `advisor.ts` (`claudeHome()`).
+- **Limits estimator, on this machine's ledger** (14 days, grouped by each window's `…-reset` header; utilization comes with two decimals,
+  so movement is whole points): home $0.89 per 1% of 5h (7 windows, $297 on 335 points) and $4.85 per 1% of the week (2 windows, $335 on
+  69 points) over 2,522 requests; yp-2 $1.22 and $7.43 (1,740 requests, 5 + 1 windows): both `ok`. acct-b (removed since): 43 points of 5h
+  on $0.51 → $0.012 per point, `low` ("not enough traffic through the router yet": under $20). The "used outside the router" flag needs at
+  least two qualifying windows, since it compares the latest window with the account's own median. One scan is 24 ms on 27k rows
+  (SQLite reads the JSON); memoised until the next request is logged.
+- A dev router on a *copy* of the ledger sees home's windows move from the live router's traffic: its own estimate drifts down ($0.86)
+  exactly as an account used elsewhere would. Expected; the live ledger sees all of it.
+- **Budgets in %:** `unit: pct_7d | pct_5h`; `spent` is then percentage points (`spent_usd` keeps the dollars), state `waiting` until the
+  account has a rate. A low-confidence rate still fires (the row and the message show the dollars beside it).
+- **Keep warm — the proof** (dev router, real `claude -p --model sonnet` sessions, `FORCE_PROMPT_CACHING_5M=1` so every write was
+  `ephemeral_5m`; dev settings `warm_allow_5m`, `warm_lead_min: 1`, `warm_min_context: 3000`; context 64k tokens):
+  | | ping | turn 2 (`--resume`) at 7 min: cache read / cache write |
+  | --- | --- | --- |
+  | scheduler ping (variant a) at 4:06 | read 64,067 · wrote 0 · in 2 · out 2 · 1.9 s | **64,067 / 41** |
+  | drill ping with `max_tokens: 1` (variant b) at 4:02 | read 64,165 · wrote 0 · in 2 · out 1 · 1.5 s | 64,165 / 36 |
+  | control, no ping | — | **0 / 64,107** |
+  So a ping keeps the cache: $0.013 for the read against $0.16 for the 5m re-write on Sonnet 5.
+- **Ping variants.** (a) identical bytes, socket destroyed once `message_start`'s usage is read; (b) the same body with `max_tokens`
+  replaced by 1 and read to the end. Both got a 200 and a full cache read, and both refreshed the cache. (b) was accepted with 1 even on
+  Haiku 4.5's request with `thinking.budget_tokens: 31999` (out 1, 0.7 s; (a) on the same request: out 4 at `message_start`, 0.8 s). The
+  difference is a few output tokens (under $0.0001 a ping on any model) and half a second. **Shipped: (a).** It replays what was sent,
+  byte for byte, so it needs no parsing and works for the desktop's gzipped bodies; (b) has to edit (and for gzip re-encode) the body.
+  What an aborted stream is billed for after `message_start` is not observable from here; the row logs the `message_start` usage.
+- **Header set.** The ping sends exactly what `send()` sent for the kept request: every inbound header except the hop-by-hop ones
+  (`SKIP_REQ`), plus `host`, `content-length`, and the `authorization` of the account it went to. From the terminal CLI that is `accept`,
+  `authorization`, `content-type`, `user-agent`, `x-claude-code-session-id`, `x-stainless-*`, `anthropic-beta`, `anthropic-version`,
+  `anthropic-dangerous-direct-browser-access`, `x-app`, `accept-encoding`. No smaller set was tried: with the full set the read was complete.
+  For an oauth account the kept token is replayed as is (no refresh: a ping must not be able to mark an account `needs_login`); if it has
+  expired the ping gets a 401 and that session's warming stops until its next request, like home.
+- **Thread identity** is the burst code's: session key + `first_user_hash` (model when there is none). In the runs above each `claude -p`
+  session made three requests: the title side request (no tools, its own first-user hash: never held) and two turns of the main thread
+  (held, replaced by the newer one). A thread is known to be a subagent's once the tailer has joined one of its rows to a
+  `subagents/agent-*.jsonl` transcript (`agent_id`), which happens when that row is logged; from then on it is not held. A subagent's
+  *first* request is held if it is large enough (nothing in the request marks it), but the scheduler only looks up the thread of the
+  session's last main turn (`warmth()`), so it is never pinged and ages out of the 20 slots. After a compaction the first user message,
+  and so the thread, changes: the old entry is left to age out the same way.
+- **What a ping touches:** one `requests` row (`source = 'warm'`, no fingerprint) and the account's `last_ratelimit_json`. Not
+  `sessions` (pin, `last_ts`, `request_count`), not `migrations`, not `cool()`, not `warnCheck()`, not the budget stop, not `joined()`.
+  `turns()` already left out rows with a source; the Sessions list and brain capture used `source is not null` to hide the router's own
+  sessions and now exclude `warm` from that test. `warmth()` adds the last 2xx ping after the last real turn to `cold_at`.
+- **Scheduler state is the ledger.** `warmPlan()` derives cover, stop reason and next ping from rows + settings + whether the request is
+  in memory, so a failed ping "stops until the next real request" with no flag to clear. `warm_sessions.reason` is a record for one-offs
+  (and `stopped by you` with `until_ts = 0` is the Stop button, which also blocks rule cover until the next request).
+- **Nothing is held while `warm_enabled` is false** (the spec holds always): a default-off feature should not keep request bodies and
+  bearer tokens in memory. Cost: after switching it on, a session is first pinged after its next request.
+- **Not verified:** a 1-hour lifetime was not waited out (the 5m run shows the mechanism); a ping against a rate-limited account.
+- **Tool loading — what requests carry.** Terminal CLI behind the dev port (tool search off): 64 definitions, all loaded: 28 built-in
+  (22k tokens), `analytics-mcp` 9 (3.8k), `claude_ai_Google_Drive` 11 (3.8k), `claude_ai_Claude_Docs` 8 (1.2k), `ghg-calculator` 8
+  (1.2k). Desktop requests list deferred MCP definitions in `tools` with `defer_loading: true` (45 loaded + 24 deferred seen), so their
+  sizes are known; the terminal CLI with tool search on sends a `DeferredToolPlaceholder` and adds a server's definitions only once a
+  search found them, so a never-searched server is invisible in requests and appears only if a config file names it.
+  `tool_servers_json` is new: sessions from before this build have calls but no load state ("recorded from the next request on").
+- **"Now" and the dollars.** The state of a scope is the newest recorded tool list of a main conversation in it. A loaded server's
+  cost counts only the turns of sessions whose recorded list had it loaded; the first version multiplied by every turn of the scope
+  and put $3.24 on a connector that only the terminal probes had loaded. Always-load's cost is the hypothetical: every turn of the scope.
+- **Where a server lives:** `~/.claude.json` → `projects[cwd].mcpServers` (local), `<cwd>/.mcp.json` (project), top-level `mcpServers`
+  (user), matched on the name with everything outside `[A-Za-z0-9_-]` as `_`. Here: `analytics-mcp` and `ghg-calculator` at user scope.
+  `plugin_*` = a plugin's server, `claude_ai_*` or a UUID = a claude.ai connector, anything else = the app or a config not read.
+- **Facts switch.** `~/.claude/CLAUDE.md` on this machine is the single line `@~/agent-router-brain/CRITICAL_FACTS.md`; the switch reads
+  "on". `CLAUDE_HOME` stands in for `~/.claude` (and `${CLAUDE_HOME}.json` for `~/.claude.json`) in development and tests.
+

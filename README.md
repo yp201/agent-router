@@ -87,6 +87,10 @@ A budget is a spend limit over a scope (everything, one project, one account, or
   overrides a model's rates. On a subscription this is an equivalent, not a bill. A model that is not in the table has no price:
   its requests are counted as "unpriced" and left out of every sum, never guessed. Usage is read from each response as it
   streams through, so spend is current to the last request.
+- **Or a share of a window:** `"unit": "pct_7d"` (or `"pct_5h"`) makes `limit` percentage points of one account's weekly (or
+  5-hour) window, e.g. "this project may take 10% of home's week". It needs `scope: "account"` (or `all` while there is a single
+  account) and is converted from dollars at that account's measured rate (see *Limits as the unit*). Until there is a rate the
+  budget shows "waiting for data" and never fires.
 - **notify** posts one macOS notification the first time the budget passes 80% and 100% in a period.
 - **stop** also refuses further `/v1/messages` requests in that scope once it is at 100%: Claude Code shows
   `API Error: 400 agent-router budget ‘…’ is spent: $20.14 of $20.00 at list price today. It resets Fri 00:00. Raise or remove it at http://localhost:4001/router/#cost`
@@ -114,7 +118,8 @@ ledger and your transcripts at list prices; no model is asked for any of it.
   the cause: a model switch, fast mode turned on, an effort change on a model where that re-writes, a changed tool set. Compaction
   and clearing are shown as expected rebuilds, not misses.
 - **Going cold.** A macOS notification five minutes before a large 1-hour cache lapses, with what a message costs now and what
-  the next turn costs after (`cold_warn`, `cold_min_context`, `cold_min_usd`, `cold_lead_min`). The router sends nothing upstream.
+  the next turn costs after (`cold_warn`, `cold_min_context`, `cold_min_usd`, `cold_lead_min`). The router sends nothing upstream
+  (unless you turn on *Keep warm*, below; a session it is keeping warm gets a ping instead of this warning).
 - **Cache lifetime fit.** Your real pauses replayed under a 5-minute and a 1-hour cache, per bucket. It names `promptCacheTtl` or
   `subagentPromptCacheTtl` only when the other lifetime would have saved at least 5% and $1.
 - **Carrying cost.** Each tool result's size × the turns that re-read it × the read price: the ten costliest, and the top five
@@ -130,6 +135,67 @@ ledger and your transcripts at list prices; no model is asked for any of it.
   files or the web on a model above Haiku (*docs-recommended*: the Claude Code costs doc suggests `model: haiku` for those).
 
 Design, sources and what was left out: `docs/COST-INSIGHTS.md`.
+
+## Limits as the unit
+
+On a subscription the scarce thing is the 5-hour and the weekly window, not dollars. Every response carries the account's
+utilization, so the router measures the exchange rate from its own traffic: list-price dollars spent between two readings ÷
+the points the window moved, per account, over the last 14 days (`GET /router/limits`; Cost tab, "What a dollar is in windows").
+
+Wherever the console shows a dollar figure that one account paid for — findings, cache re-writes, a session's rebuild cost,
+budgets, the Cost tab, the model what-if, `./agent-router.sh report`, the going-cold notification — it adds
+`≈ 4.6% of your 5-hour window · 0.8% of your week`. A figure spanning accounts uses the account that paid most.
+
+- Shown only once an account has moved a window by at least 3 points on router traffic. Under $20 or 10 points of evidence the
+  phrase ends in `(rough)`.
+- Also `(rough)` when the latest window moved more than three times as far per dollar as the account's own median: the account
+  is being used somewhere the router does not see (another machine, claude.ai), so its windows fill faster than this says.
+- It is an estimate from list prices; Anthropic does not publish how usage is weighted.
+
+## Keep warm
+
+Off by default (`warm_enabled`; Cost & budgets → Keep warm). A prompt cache's lifetime restarts every time it is read, so
+replaying a session's last request shortly before the hour is up keeps a large context warm: the next message then costs a
+cache read instead of a full re-write. On Opus 5.5 one rebuild costs as much as 40 pings (about 37 hours of warming), on
+Fable 5.1 80, on Sonnet 5.5 20.
+
+Three things to know before turning it on:
+
+1. **The router sends requests on its own, with your login.** A ping is the session's last request, replayed unchanged; the
+   router hangs up as soon as the response starts. Pings count toward your limits and are logged with source `warm`.
+2. **The last request of each large session is held in memory only** (raw bytes and headers, at most 20 sessions and 64 MB):
+   never written to disk, the ledger or the log, and gone when the router restarts. Nothing is held while keep-warm is off.
+3. **The desktop login (home) is only refreshed while the app is in use.** Warming a home session overnight can stop with
+   "the desktop app's login expired"; it resumes when the session next sends a request.
+
+What gets pinged: sessions you pick (Sessions → *Keep warm* 1h / 2h / 4h / until I'm back, which first shows the ping and the
+rebuild cost in dollars and in % of your windows, the pings needed and the break-even), sessions matching a rule
+(`warm_rules`: "on weekdays 12:30–14:00 keep every session warm"), and, with `warm_after_stop_hours`, any session for that
+long after its last message. Rules and after-stop only cover sessions whose rebuild would cost at least `warm_min_usd` ($1).
+One ping goes out `warm_lead_min` (5) minutes before the cache would lapse. Only 1-hour caches: a 5-minute cache never pays back.
+
+It stops by itself, and says why: the session became active again (the clock just restarts), the time or the rule's window is
+over, `warm_max_hours` (8, at most 24) after the session's last request, `warm_daily_usd` ($2) is spent, the account is past
+`warn_pct` on either window, the account is cooling, disabled or needs a login, a ping failed (one failure stops that session
+until its next request), or the router restarted. A failed ping never cools an account or moves a session.
+`GET /router/warm` lists settings, today's spend, covered sessions with their next ping, and recent pings.
+
+## Tool loading
+
+Claude Code defers MCP tools behind tool search; a server with `"alwaysLoad": true` loads upfront. The Insights tab's **Tools**
+panel (`GET /router/tools?days=30&project=`) reads your own ledger — calls per server, the sessions that used it, `ToolSearch`
+round trips, definition sizes — and says, per project or overall:
+
+- **Always load** a server called in at least half of the sessions (4 or more) that is deferred now, when the search round
+  trips it would save (each one re-reads the whole prefix) cost more than carrying its definitions on every turn. Both numbers
+  are shown. If the server is defined in a file you own (`~/.claude.json` or the project's `.mcp.json`) the panel names the entry
+  to add `"alwaysLoad": true` to; for a plugin's or a claude.ai connector's server the flag cannot be set, and it says so.
+- **Disable** a server not called in 30 days: deferred, it still costs its tool names in every request; loaded, its definitions.
+  `claude mcp remove <name>` or the `/mcp` toggle.
+- **Leave deferred** everything else, and where tool search is off (a custom base URL does that) the `ENABLE_TOOL_SEARCH` fix.
+
+The router changes nothing: it never edits your config and never rewrites the tool list of a request. Only the names under
+`mcpServers` are read from your config files. Built-in tools are listed for information.
 
 ## Brain
 
@@ -158,6 +224,9 @@ skills/          one note per skill (status, the session and project it came fro
   a skill directory the router did not install is never overwritten. **Demote** removes it again, **Reject** deletes the
   candidate. The console counts each skill's uses from `Skill` tool calls in your transcripts and flags promoted skills
   unused for 30 days. No savings are claimed.
+- **Critical facts.** `CRITICAL_FACTS.md` is yours to write. *Load in every session* (Notes → Facts) keeps one line,
+  `@~/agent-router-brain/CRITICAL_FACTS.md`, in `~/.claude/CLAUDE.md`, so Claude Code injects the file into every session;
+  switching it off removes exactly that line. It applies from the next session; Cowork sessions skip it. Keep the file short.
 - **Recall.** *Install recall skill* adds a small `brain` skill that tells Claude to read the vault's index and at most three
   notes when you refer to past work.
 - **Pipeline.** The Brain tab opens on a funnel — captured (no model) → scanned (Haiku looks for a repeatable skill) → extracted
@@ -202,7 +271,7 @@ which ignores that setting.
 ## Development
 
 ```bash
-node --test test_router.ts   # 35 tests, fake upstream, no network
+node --test test_router.ts   # 46 tests, fake upstream, no network
 ```
 
 `router.ts` proxy + routing · `accounts.ts` token store · `tailer.ts` transcript join · `console.ts` analytics · `advisor.ts` context advisor · `brain.ts` notes and skills ·

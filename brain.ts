@@ -7,7 +7,7 @@ import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
 import { resolve, dirname, sep } from 'node:path';
 import { db, settings, now } from './ledger.ts';
-import { claude } from './advisor.ts';
+import { claude, claudeHome } from './advisor.ts';
 import { ROOT } from './tailer.ts';
 import { MSG, spendOf, fmtUsd } from './console.ts';
 
@@ -15,9 +15,23 @@ const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
 const DRILLS = process.env.DRILLS === '1';
 const IDLE = 15 * 60_000, MARK = '.agent-router', CAP = 200 << 10;
-// BRAIN_DIR / CLAUDE_SKILLS_DIR override the setting and ~/.claude/skills (development and tests never touch the real ones)
+// BRAIN_DIR / CLAUDE_SKILLS_DIR / CLAUDE_HOME override the setting, ~/.claude/skills and ~/.claude (development and tests never touch the real ones)
 export const dir = () => resolve((process.env.BRAIN_DIR ?? settings().brain_dir ?? '~/agent-router-brain').replace(/^~(?=\/|$)/, homedir()));
-const skillsDir = () => process.env.CLAUDE_SKILLS_DIR ?? `${homedir()}/.claude/skills`;
+const skillsDir = () => process.env.CLAUDE_SKILLS_DIR ?? `${claudeHome()}/skills`;
+// "Load in every session": one import line in the user's own CLAUDE.md (<CLAUDE_HOME or ~/.claude>/CLAUDE.md), which Claude Code expands
+// into every session's context. The switch adds or removes exactly that line and touches nothing else; its state is read from the file.
+const userMd = () => `${claudeHome()}/CLAUDE.md`;
+const factsLine = () => { const p = `${dir()}/CRITICAL_FACTS.md`; return `@${p.startsWith(`${homedir()}/`) ? `~${p.slice(homedir().length)}` : p}`; };
+const factsLoaded = () => { try { return readFileSync(userMd(), 'utf8').split('\n').includes(factsLine()); } catch { return false; } };
+function loadFacts(on: boolean) {
+  const f = userMd(), line = factsLine();
+  let text = '';
+  try { text = readFileSync(f, 'utf8'); } catch {}
+  if (on === text.split('\n').includes(line)) return;
+  if (on) { mkdirSync(dirname(f), { recursive: true }); return writeFileSync(f, `${text}${text && !text.endsWith('\n') ? '\n' : ''}${line}\n`); }
+  const rest = text.split('\n').filter((l) => l !== line).join('\n');
+  if (rest.trim()) writeFileSync(f, rest); else rmSync(f); // the file is deleted only when nothing else is in it
+}
 const err = (type: string, message?: string) => ({ error: { type, ...(message && { message }) } });
 class Bad extends Error {}  // a path from the API that leaves the vault -> 400
 class Over extends Error {} // brain_daily_usd is spent -> queue, no model call
@@ -108,7 +122,8 @@ commands worked, so a new session can look things up instead of working them out
 | Promoted skill (source sessions, uses, cost) | \`skills/\` |
 | Skill candidate (\`<name>/SKILL.md\`, awaiting review) | \`skills/candidates/\` |
 `;
-const FACTS = '# Critical facts\n\nA few lines every session should know (about 120 tokens). Yours to write; the router never changes this file.\n';
+// no boilerplate sentences: with "Load in every session" on, the whole file is injected into every session
+const FACTS = '<!-- Critical facts: a few short lines every session should know. Yours to write; with "Load in every session" on, this whole file goes into every session, so keep it small. -->\n';
 // Creates what is missing; _CLAUDE.md, CRITICAL_FACTS.md and log.md are written once (flag wx) and never overwritten.
 function vault() {
   const root = dir();
@@ -269,7 +284,7 @@ export async function capture(o: { session?: string; idle?: boolean } = {}) {
   const root = vault(), t = Date.now(), days = new Set<string>(), projects = new Set<string>();
   const rows = all(`select s.session_key sk from sessions s left join brain_sessions b using (session_key) where ${o.session ? 's.session_key = ?' : '1'}
     ${o.idle ? `and ((coalesce(s.last_ts, s.created_ts, 0) <= ${t - IDLE} and coalesce(s.last_ts, s.created_ts, 1) > coalesce(b.last_captured_ts, 0)) or (b.note_path is not null and b.trivial is null))` : ''}
-    and not exists (select 1 from requests r where r.session_key = s.session_key and r.source is not null)`, ...(o.session ? [o.session] : []));
+    and not exists (select 1 from requests r where r.session_key = s.session_key and r.source is not null and r.source != 'warm')`, ...(o.session ? [o.session] : []));
   let notes = 0, removed = 0;
   for (const { sk } of rows) {
     const n = await captureOne(sk, root).catch((e) => void console.error(`brain: capture ${sk.slice(0, 8)} failed: ${e.message}`));
@@ -538,7 +553,8 @@ export function stats() {
     source: k.source as string, source_session: k.source_session as string | null, promoted_ts: k.promoted_ts as number | null,
     source_usd: k.source_session ? spendOf(`session_key = ? and ${MSG()} and status < 400`, k.source_session).usd : null }));
   return { enabled: !!st.brain_enabled, dir: dir(), sessions_captured: b.c, distilled: b.d, candidates: skills.filter((k) => k.status === 'candidate').length,
-    promoted: skills.filter((k) => k.status === 'promoted').length, spend_today_usd: spend(), cap_usd: st.brain_daily_usd, queued: b.q, classifier_backend: backend(), obsidian: !!obsidian(), skills };
+    promoted: skills.filter((k) => k.status === 'promoted').length, spend_today_usd: spend(), cap_usd: st.brain_daily_usd, queued: b.q, classifier_backend: backend(), obsidian: !!obsidian(), skills,
+    facts_loaded: factsLoaded(), facts_line: factsLine(), facts_file: userMd() };
 }
 
 // ---- pipeline: every captured session and how far it got: captured -> scanned -> extracted -> candidate -> promoted ----
@@ -692,6 +708,7 @@ export async function brainApi(m: string, [what = '', a, b]: string[], q: URLSea
     if (m === 'POST' && what === 'skills' && a === 'import' && !b) return await importSkill(root, String(input.url ?? ''));
     if (m === 'POST' && what === 'skills' && a && b) return skillAct(root, a, b);
     if (m === 'POST' && what === 'recall') return recall(root);
+    if (m === 'POST' && what === 'facts-load') { loadFacts(input.on === true); return [200, { ok: true, facts_loaded: factsLoaded() }]; }
     if (m === 'PUT' && what === 'facts') {
       if (typeof input.text !== 'string' || input.text.length > 8192) return [400, err('bad_text', 'text, at most 8 KB')];
       writeFileSync(`${root}/CRITICAL_FACTS.md`, input.text);

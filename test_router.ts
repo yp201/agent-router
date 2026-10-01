@@ -128,6 +128,7 @@ async function setup(t: TestContext, env: Record<string, string> = {}) {
     seen: [] as { who: string; xkey?: string; body: string; enc?: string; src?: string }[],
     util: {} as Record<string, number>, util7: {} as Record<string, number>, fail: {} as Record<string, number>,
     refreshes: [] as any[], refreshStatus: 200, n: 0, usage: null as any, // usage: echoed as the response's top-level `usage`
+    reset: 0, // epoch s sent as the 5h and 7d window reset (the limits estimator groups readings by it); 0 = no reset headers
   };
   const handler = (req: IncomingMessage, res: ServerResponse) => {
     let body = '';
@@ -140,7 +141,8 @@ async function setup(t: TestContext, env: Record<string, string> = {}) {
       const who = WHO[req.headers.authorization ?? ''] ?? 'unknown';
       s.seen.push({ who, xkey: req.headers['x-api-key'] as string, body, enc: req.headers['content-encoding'] as string, src: req.headers['x-agent-router-source'] as string });
       const h = { 'content-type': 'application/json', 'request-id': `req_${++s.n}`, 'anthropic-ratelimit-unified-5h-utilization': String(s.util[who] ?? 0), 'anthropic-ratelimit-unified-5h-status': 'allowed',
-        ...(who in s.util7 && { 'anthropic-ratelimit-unified-7d-utilization': String(s.util7[who]) }) };
+        ...(who in s.util7 && { 'anthropic-ratelimit-unified-7d-utilization': String(s.util7[who]) }),
+        ...(s.reset && { 'anthropic-ratelimit-unified-5h-reset': String(s.reset), 'anthropic-ratelimit-unified-7d-reset': String(s.reset) }) };
       if (s.fail[who] > 0) {
         s.fail[who]--;
         return res.writeHead(429, { ...h, 'retry-after': '1', 'anthropic-ratelimit-unified-representative-claim': 'five_hour' }).end('{"type":"error","error":{"type":"rate_limit_error"}}');
@@ -420,6 +422,9 @@ test('fingerprints: hashes and counts per /v1/messages, tool names only when the
   assert.deepEqual([d.tools_count, d.tools_loaded, d.tools_deferred, d.tools_hash, d.tool_names_json, d.effort, d.speed, d.beta_hash, d.image_count, d.cli_version],
     [4, 3, 1, c.tools_hash, null, 'high', 'fast', h16('a-1,b-2'), 2, '2.1.300']);
   assert.ok(d.tools_tok > 0 && d.tools_tok < 40, 'size of the loaded definitions only');
+  // per-server totals ('' = built-in tools), stored when the thread's tool list changes: mcp__<server>__<tool> names the server
+  assert.deepEqual([a, b, c, d].map((r) => r.tool_servers_json && JSON.parse(r.tool_servers_json)), [{ '': { loaded: 2, deferred: 0, def_tokens: 16 } }, null, { '': { loaded: 3, deferred: 0, def_tokens: 24 } },
+    { '': { loaded: 3, deferred: 0, def_tokens: 24 }, x: { loaded: 0, deferred: 1, def_tokens: 15 } }]);
   const dir = dirname(h.ledger);
   assert.ok(!readdirSync(dir).map((f) => readFileSync(`${dir}/${f}`, 'latin1')).join('').includes('secret-prompt-text'), 'request body text stored');
   assert.match(h.stdout(), /user-agent shape: claude-cli\/N\.N\.N \(external, claude-desktop\)/);
@@ -1545,3 +1550,352 @@ test('ui.html: Brain has the Pipeline, Notes and Graph views; the layout runs to
   assert.ok(near > 2, `no two notes on top of each other (closest ${near.toFixed(1)})`);
   assert.ok(ms < 3000, `200 notes laid out in ${ms.toFixed(0)} ms`);
 });
+
+// ---- limits as the unit, keep warm, tool loading advisor, facts switch (docs/COST-INSIGHTS.md "Next") ----
+// rows written straight into the arith ledger (console.ts is imported in-process): one priced /v1/messages row per call
+const RLH = 'anthropic-ratelimit-unified-';
+async function ledgerRows() {
+  const c = await arith(), { db } = await import('./ledger.ts');
+  const ins = db.prepare(`insert into requests (ts, request_id, session_key, account_id, method, path, model, status, in_tok, out_tok, cache_read, cache_create, cache_1h, cache_5m, agent_id,
+    tools_hash, tools_count, tool_names_json, tool_servers_json, first_user_hash, ratelimit_json) values (:ts, :request_id, :session_key, :account_id, 'POST', '/v1/messages', :model, 200, :in_tok, :out_tok, :cache_read,
+    :cache_create, :cache_1h, :cache_5m, :agent_id, :tools_hash, :tools_count, :tool_names_json, :tool_servers_json, :first_user_hash, :ratelimit_json)`);
+  const row = (o: Record<string, any>) => ins.run({ ts: Date.now(), request_id: null, session_key: null, account_id: 'home', model: 'claude-opus-5-5', in_tok: 0, out_tok: 0, cache_read: 0, cache_create: 0, cache_1h: 0, cache_5m: 0,
+    agent_id: null, tools_hash: null, tools_count: null, tool_names_json: null, tool_servers_json: null, first_user_hash: null, ratelimit_json: '{}', ...o });
+  return { c, db, row };
+}
+
+test('limits: $ per 1% of each window from readings grouped by reset; low confidence on thin data and on use outside the router; asLimits formatting', async () => {
+  const { c, row } = await ledgerRows(), t0 = Date.now() - 3 * 864e5;
+  let n = 0;
+  // one reading: `usd` at list price on Opus 5.5 ($4/MTok input) and the utilization the response carried
+  const reading = (account_id: string, usd: number, r5: number, u5: number, u7: number) => row({ ts: t0 + n++ * 1000, account_id, in_tok: usd / 4 * 1e6,
+    ratelimit_json: JSON.stringify({ [`${RLH}5h-reset`]: String(r5), [`${RLH}5h-utilization`]: String(u5), [`${RLH}7d-reset`]: '9000', [`${RLH}7d-utilization`]: String(u7) }) });
+  // 'la': a window that moved 2 points (under 3: left out), one that moved 10 on $12 and one that moved 10 on $8 (the first reading's
+  // own cost is before the reading, so it is not counted); the week moved 16 points on the $32 after its first reading
+  reading('la', 4, 100, 0.50, 0.10); reading('la', 4, 100, 0.52, 0.10);
+  for (const [u5, u7] of [[0.10, 0.12], [0.12, 0.14], [0.16, 0.16], [0.20, 0.18]]) reading('la', 4, 200, u5, u7);
+  for (const [u5, u7] of [[0.00, 0.20], [0.04, 0.22], [0.10, 0.26]]) reading('la', 4, 300, u5, u7);
+  // 'lb': the account that moved 43 points on $0.51 of router traffic; 'lc': two steady windows, then one that moved 40 points on $4
+  reading('lb', 1, 100, 0.10, 0.10); reading('lb', 0.51, 100, 0.53, 0.19);
+  for (const [r5, us] of [[100, [0, 0.05, 0.10]], [200, [0, 0.05, 0.10]]] as [number, number[]][]) for (const u of us) reading('lc', 6, r5, u, 0.5);
+  reading('lc', 4, 300, 0.10, 0.5); reading('lc', 4, 300, 0.50, 0.5);
+  const L = c.limits(), la = L.get('la'), lb = L.get('lb'), lc = L.get('lc');
+  close(la['5h'].usd_per_pct, (12 + 8) / (10 + 10)); close(la['7d'].usd_per_pct, 32 / 16);
+  assert.deepEqual([la.requests, la['5h'].windows, la['5h'].moved, la['7d'].windows, la.confidence, la.reason], [9, 2, 20, 1, 'ok', null]);
+  close(lb['5h'].usd_per_pct, 0.51 / 43);
+  assert.deepEqual([lb.confidence, lb.reason], ['low', 'not enough traffic through the router yet'], '43 points on $0.51');
+  close(lc['5h'].usd_per_pct, 28 / 60); close(lc['5h'].usd, 28);
+  assert.deepEqual([lc['5h'].confidence, lc['5h'].reason, lc.confidence], ['low', 'used outside the router', 'low'], 'the latest window moved 10 points per dollar, the median is 0.83');
+  // asLimits: dollars -> percentage points of that account's windows
+  const a = c.asLimits(2, 'la')!;
+  close(a.pct_5h!, 2); close(a.pct_7d!, 1); assert.equal(a.confidence, 'ok');
+  assert.equal(c.limText(2, 'la'), '≈ 2.0% of your 5-hour window · 1.0% of your week');
+  assert.equal(c.limText(0.05, 'la'), '≈ <0.1% of your 5-hour window · <0.1% of your week');
+  assert.equal(c.limText(30, 'la'), '≈ 30% of your 5-hour window · 15% of your week');
+  assert.match(c.limText(1, 'lb'), /^≈ 84% of your 5-hour window · \d+% of your week \(rough\)$/);
+  assert.deepEqual([c.asLimits(1, 'nobody'), c.limText(1, 'nobody'), c.limText(null, 'la'), c.limText(1, null)], [null, '', '', ''], 'no estimate: nothing is shown');
+});
+
+test('budget in % of a window: waits for the estimator and never fires; then fires through it; needs one account', async (t) => {
+  const h = await budgetSetup(t);
+  const b = { id: 'w', name: 'home week', scope: 'account', match: 'home', period: 'day', limit: 5, unit: 'pct_7d', action: 'stop', thresholds: [1] };
+  const bad = await h.put({ budgets: [{ ...b, scope: 'project', match: 'p' }] });
+  assert.equal(bad.status, 400); assert.match((await bad.json()).error.message, /a limit in % of a window is measured against one account/);
+  assert.equal((await h.put({ budgets: [{ ...b, unit: 'euros' }] })).status, 400);
+  assert.equal((await h.put({ budgets: [{ ...b, scope: 'all', match: null }] })).status, 200, 'scope all with a single account');
+  assert.equal((await h.put({ budgets: [b] })).status, 200);
+  // no utilization readings yet: dollars are spent, the budget has no rate to convert them with
+  for (let i = 0; i < 3; i++) assert.equal((await h.turn('p1')).status, 200);
+  let [st] = await h.api('budgets');
+  assert.deepEqual([st.state, st.spent, st.pct, st.unit, st.account], ['waiting', null, 0, 'pct_7d', 'home']); close(st.spent_usd, 3 * B_USD);
+  assert.deepEqual(h.notes(), [], 'waiting for data never notifies');
+  assert.equal((await h.api('limits')).find((x: any) => x.account === 'home').confidence, null);
+  // two more turns between a reading of 10% and one of 20% of the week: $1.65 moved it 10 points -> $0.165 per point
+  h.s.reset = Math.round(Date.now() / 1000) + 86400;
+  for (const u of [0.10, 0.10, 0.20]) { h.s.util7.home = u; assert.equal((await h.turn('p1')).status, 200); }
+  const lim = (await h.api('limits')).find((x: any) => x.account === 'home');
+  close(lim.usd_per_pct_7d, 2 * B_USD / 10); close(lim.window_usd_7d, 20 * B_USD);
+  assert.deepEqual([lim.confidence, lim.usd_per_pct_5h, lim.basis.windows_7d, lim.util_7d], ['low', null, 1, 0.2]);
+  [st] = await h.api('budgets');
+  close(st.spent, 6 * B_USD / (2 * B_USD / 10), 'the $4.95 spent today is 30 points of the week'); assert.equal(st.state, 'over');
+  assert.equal(h.notes().length, 1); assert.match(h.notes()[0], /^Budget ‘home week’ at 600% — 30% of 5% of home's week \(\$4\.95 at list price\) — requests are now stopped$/);
+  const seen = h.s.seen.length, r = await h.turn('p1');
+  assert.equal(r.status, 400); assert.match(r.error.message, /budget ‘home week’ is spent: 30% of 5% of home's week \(\$4\.95 at list price\) today\./);
+  assert.equal(h.s.seen.length, seen, 'not dialed');
+  // a dollar budget's row says what it is in windows; with a second account a % budget over "all" is refused
+  await h.put({ budgets: [{ ...b, id: 'd', unit: 'usd', limit: 100, action: 'notify' }] });
+  assert.equal((await h.api('budgets'))[0].limits, '≈ 30% of your week (rough)');
+  await h.addAcct('acct-b', 'tok-b-fake');
+  assert.equal((await h.put({ budgets: [{ ...b, scope: 'all', match: null }] })).status, 400);
+  h.noLeak();
+});
+
+// A fake upstream that answers /v1/messages as SSE with usage in message_start, and records exactly what it was sent.
+async function warmSetup(t: TestContext) {
+  const s = { seen: [] as { body: string; headers: IncomingMessage['headers']; aborted: boolean }[], status: 200, util: 0.1, read: 0, create: 200e3 };
+  const up = await fakeUpstream(t, (req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c) => chunks.push(c)).on('end', () => {
+      const rec = { body: Buffer.concat(chunks).toString(), headers: req.headers, aborted: false };
+      s.seen.push(rec);
+      res.on('close', () => { rec.aborted = !res.writableEnded; });
+      const h = { 'request-id': `req_w${s.seen.length}`, [`${RLH}5h-utilization`]: String(s.util), [`${RLH}5h-status`]: 'allowed' };
+      if (s.status !== 200) return res.writeHead(s.status, { ...h, 'content-type': 'application/json' }).end('{"type":"error","error":{"type":"authentication_error"}}');
+      res.writeHead(200, { ...h, 'content-type': 'text/event-stream' });
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: s.read, cache_creation_input_tokens: s.create,
+        cache_creation: { ephemeral_1h_input_tokens: s.create, ephemeral_5m_input_tokens: 0 } } } })}\n\n`);
+      setTimeout(() => res.end(EV2), 150); // long enough for a ping to hang up first
+    });
+  });
+  const log = `${mkdtempSync(`${tmpdir()}/router-notify-`)}/notify.log`;
+  const r = await startRouter(t, { ...up, DRILLS: '1', NOTIFY: '0', NOTIFY_LOG: log, WARM_TICK_MS: '40', COLD_TICK_MS: '40' });
+  const api = (path: string, body?: unknown, method = 'POST') => fetch(`${r.base}/router/${path}`, body === undefined ? {} : { method, body: JSON.stringify(body) }).then((x) => x.json());
+  const db = new DatabaseSync(r.ledger, { readOnly: true, timeout: 2000 });
+  t.after(() => db.close());
+  const rows = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
+  // a main-conversation request: streamed, with tools; `pad` bytes of text carry MARKER
+  const turn = async (sk: string, pad = 16e3, extra: Record<string, unknown> = {}) => {
+    const body = JSON.stringify({ model: 'claude-opus-5-5', stream: true, metadata: { user_id: JSON.stringify({ session_id: sk }) }, tools: [{ name: 'Read', input_schema: {} }],
+      messages: [{ role: 'user', content: `MARKER-IN-BODY ${'x'.repeat(pad)}` }], ...extra });
+    const res = await fetch(`${r.base}/v1/messages?beta=true`, { method: 'POST', headers: { authorization: 'Bearer tok-home-fake', 'content-type': 'application/json', 'anthropic-beta': 'b-1' }, body });
+    await res.text(); await new Promise((ok) => setTimeout(ok, 40));
+    return { status: res.status, body };
+  };
+  const warm = async (sk: string) => (await api('warm')).sessions.find((x: any) => x.session_key === sk);
+  const pings = () => rows(`select * from requests where source = 'warm' order by id`);
+  return { s, ...r, api, rows, turn, warm, pings, wait: (ms: number) => new Promise((ok) => setTimeout(ok, ms)), put: (b: unknown) => api('settings', b, 'PUT'),
+    notes: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []) };
+}
+const M = 60_000;
+
+test('keep warm: a request is held only for a large main conversation and only in memory; a ping replays it byte for byte, is logged as source=warm and leaves the session alone', async (t) => {
+  const h = await warmSetup(t);
+  await h.turn('off');
+  assert.equal((await h.api('warm')).memory.entries, 0, 'nothing is held while keep-warm is off');
+  assert.deepEqual(await h.api('sessions/off/warm', { hours: 1 }), { error: { type: 'warm_disabled' } });
+  for (const bad of [{ warm_max_hours: 25 }, { warm_daily_usd: -1 }, { warm_enabled: 'yes' }, { warm_rules: [{ id: 'r', name: 'x', days: [7], from: '10:00', to: '11:00', scope: 'all' }] },
+    { warm_rules: [{ id: 'r', name: 'x', days: [1], from: '25:00', to: '11:00', scope: 'all' }] }, { warm_rules: [{ id: 'r', name: 'x', days: [1], from: '10:00', to: '11:00', scope: 'project' }] }])
+    assert.equal((await h.put(bad)).error?.type, 'invalid_setting', JSON.stringify(bad));
+  assert.equal((await h.put({ warm_enabled: true, warm_min_context: 2000, warm_rules: [{ id: 'r', name: 'lunch', days: [1, 2, 3, 4, 5], from: '12:30', to: '14:00', scope: 'all', match: null }] })).warm_enabled, true);
+  await h.turn('small', 2e3);                      // about 500 tokens: under warm_min_context
+  await h.turn('nostream', 16e3, { stream: false });
+  await h.turn('notools', 16e3, { tools: [] });
+  assert.equal((await h.api('warm')).memory.entries, 0);
+  const big = await h.turn('big');                 // 16 KB / 4 = 4k tokens on its first turn
+  const mem = (await h.api('warm')).memory;
+  assert.equal(mem.entries, 1); assert.ok(mem.bytes === Buffer.byteLength(big.body));
+  const first = h.s.seen.at(-1)!, before = h.rows(`select * from sessions where session_key = 'big'`)[0];
+  // the ping: same bytes, same headers (authorization included), hung up after message_start
+  h.s.read = 200e3; h.s.create = 0;
+  assert.deepEqual(await h.api('sessions/big/ping', {}), { ok: true, status: 200 });
+  const ping = h.s.seen.at(-1)!;
+  assert.equal(h.s.seen.length, 6); assert.equal(ping.body, big.body); assert.deepEqual(ping.headers, first.headers);
+  assert.equal(ping.headers.authorization, 'Bearer tok-home-fake');
+  await until(() => ping.aborted, 'the ping closes the stream once message_start has arrived');
+  assert.equal(first.aborted, false);
+  const [w] = h.pings();
+  assert.deepEqual([w.session_key, w.account_id, w.status, w.model, w.request_id, w.cache_read, w.cache_create, w.in_tok, w.usage_src, w.first_user_hash],
+    ['big', 'home', 200, 'claude-opus-5-5', 'req_w6', 200e3, 0, 10, 'stream', null]);
+  const view = await h.api('warm');
+  close(view.pings[0].usd, (200e3 * 0.2 + 10 * 4 + 1 * 20) / 1e6); close(view.spent_today_usd, view.pings[0].usd);
+  // the session is untouched: same pin, turn count and last_ts; one turn in its timeline; no migration; the account was not cooled
+  assert.deepEqual(h.rows(`select * from sessions where session_key = 'big'`)[0], before);
+  assert.deepEqual([before.account_id, before.request_count], ['home', 1]);
+  assert.equal((await h.api('sessions/big/timeline')).turns.length, 1);
+  const srow = (await h.api('sessions')).find((x: any) => x.session_key === 'big');
+  assert.ok(srow, 'a session with a warm row is still listed'); assert.equal(srow.cold_at, w.ts + 60 * M, 'the ping restarted the lifetime');
+  assert.deepEqual(h.rows('select count(*) n from migrations')[0].n, 0);
+  assert.deepEqual({ ...h.rows(`select cooling_until, needs_login from accounts where id = 'home'`)[0] }, { cooling_until: null, needs_login: 0 });
+  assert.deepEqual((await h.api('sessions/small/ping', {})).error, { type: 'nothing_held' });
+  // a thread the tailer has matched to a subagent transcript is not held (and what was held for it is dropped)
+  await h.turn('sub'); assert.equal((await h.api('warm')).memory.entries, 2);
+  const rw = new DatabaseSync(h.ledger, { timeout: 2000 }); rw.prepare(`update requests set agent_id = 'agent-1' where session_key = 'sub'`).run(); rw.close();
+  await h.turn('sub'); assert.equal((await h.api('warm')).memory.entries, 1);
+  // the thread's next request replaces the held one (a thread = the session and its first user message, as in the burst code)
+  const next = await h.turn('big', 16e3, { max_tokens: 5 });
+  assert.deepEqual((await h.api('warm')).memory, { entries: 1, bytes: Buffer.byteLength(next.body) }); assert.notEqual(next.body, big.body);
+  // at most 20 are held: the oldest goes first
+  await Promise.all(Array.from({ length: 22 }, (_, i) => h.turn(`lru${i}`)));
+  assert.equal((await h.api('warm')).memory.entries, 20);
+  assert.deepEqual((await h.api('sessions/big/ping', {})).error, { type: 'nothing_held' }, 'evicted');
+  await h.put({ warm_enabled: false });
+  await until(async () => (await h.api('warm')).memory.entries === 0, 'held requests are dropped when keep-warm is turned off');
+  // nothing of any body reached the disk or the log
+  const dir = dirname(h.ledger), files = readdirSync(dir).filter((f) => f.startsWith('ledger.sqlite')).map((f) => readFileSync(`${dir}/${f}`, 'latin1')).join('');
+  assert.ok(!files.includes('MARKER-IN-BODY') && !h.stdout().includes('MARKER-IN-BODY'), 'request body text on disk or in the log');
+  assert.ok(!files.includes('tok-home-fake') && !h.stdout().includes('tok-home-fake'), 'token on disk or in the log');
+});
+
+test('keep warm scheduler: one ping inside the lead window, again after a real request, stops at the daily budget, on a 401 (no cooldown, no needs_login) and above warn_pct', async (t) => {
+  const h = await warmSetup(t), base = new Date().getHours() >= 20 ? 5 * 60 * M : 0; // every step on one calendar day: the budget is per day
+  const clock = (min: number) => h.api('clock', { skew_ms: base + min * M });
+  await clock(0);
+  await h.put({ warm_enabled: true, warm_min_context: 2000 });
+  await h.turn('s1');                               // writes 200k on the 1h cache: a rebuild is $1.60, a ping (a read) $0.04
+  assert.equal(await h.warm('s1'), undefined, 'not covered: nobody asked for it');
+  const quote = await h.api('sessions/s1/warm?hours=2');
+  close(quote.ping_usd, 200010 * 0.2 / 1e6); close(quote.rebuild_usd, 200010 * 8 / 1e6); close(quote.breakeven_pings, 40); close(quote.breakeven_hours, 40 * 55 / 60);
+  assert.deepEqual([quote.pings, quote.lifetime, quote.account], [2, '1h', 'home'], 'pings at 55 and 110 minutes keep it warm for 2 hours');
+  assert.match(quote.text, /One ping \(a cache read of 200k tokens\): \$0\.04\nA rebuild once it has gone cold: \$1\.60\nPings needed: 2 — \$0\.08 in total\nBreak-even: a rebuild costs as much as 40 pings ≈ 37 hours/);
+  assert.equal((await h.api('sessions/s1/warm', { hours: 30 })).ok, true);
+  let w = await h.warm('s1');
+  const t0 = h.rows(`select ts from requests where session_key = 's1'`)[0].ts;
+  assert.deepEqual([w.by, w.stop, w.pings, w.next, w.until - t0 <= 8 * 60 * M], ['one-off', null, 0, t0 + 55 * M, true], 'never past warm_max_hours');
+  h.s.read = 200e3; h.s.create = 0;
+  await clock(54); await h.wait(200);
+  assert.equal(h.pings().length, 0, 'not yet inside the 5-minute lead');
+  await clock(56);
+  await until(() => h.pings().length === 1, 'pinged inside the lead window'); await h.wait(250);
+  assert.equal(h.pings().length, 1, 'once: the ping restarted the lifetime');
+  w = await h.warm('s1');
+  assert.deepEqual([w.pings, w.stop, w.next, w.cold_at], [1, null, h.pings()[0].ts + 55 * M, h.pings()[0].ts + 60 * M]); close(w.usd, (200e3 * 0.2 + 40 + 20) / 1e6);
+  assert.deepEqual(h.notes(), [], 'no going-cold warning for a session that is being kept warm');
+  // a real request: the session is active, the count starts over and the next ping is due 55 minutes after it
+  await h.turn('s1');
+  w = await h.warm('s1');
+  assert.deepEqual([w.pings, w.stop], [0, null]); assert.ok(w.next > h.pings()[0].ts + 55 * M - 1000);
+  // the daily budget is spent ($0.04 so far): due, but not sent
+  await h.put({ warm_daily_usd: 0.03 });
+  await clock(112); await h.wait(250);
+  assert.equal(h.pings().length, 1); assert.equal((await h.warm('s1')).stop, 'today’s keep-warm budget of $0.03 is spent');
+  await until(() => h.notes().length === 1, 'going-cold warning, since nothing keeps it warm now');
+  assert.match(h.notes()[0], /^‘s1’ goes cold in 4 min — .* — keep-warm is on but does not cover this session: today’s keep-warm budget of \$0\.03 is spent$/);
+  // budget raised, and the login has expired: the ping gets a 401; warming stops, the account is neither cooled nor marked
+  h.s.status = 401;
+  await h.put({ warm_daily_usd: 2 });
+  await until(() => h.pings().length === 2, 'pinged once the budget allows it'); await h.wait(250);
+  assert.deepEqual([h.pings().length, h.pings()[1].status], [2, 401], 'one failure stops it: no retry');
+  assert.equal((await h.warm('s1')).stop, 'the desktop app’s login expired; warming resumes when the session next sends a request');
+  assert.deepEqual({ ...h.rows(`select cooling_until, needs_login, disabled from accounts where id = 'home'`)[0] }, { cooling_until: null, needs_login: 0, disabled: 0 });
+  assert.equal(h.rows('select count(*) n from migrations')[0].n, 0);
+  assert.equal(h.rows(`select reason from warm_sessions where session_key = 's1'`)[0].reason, 'the desktop app’s login expired; warming resumes when the session next sends a request');
+  // the next real request resumes it; that response says the account is at 90% of its 5-hour window, over warn_pct
+  h.s.status = 200; h.s.util = 0.9;
+  await h.turn('s1');
+  assert.equal((await h.warm('s1')).stop, 'home is at 90% of its 5-hour window (warn threshold 80%)');
+  await clock(170); await h.wait(250);
+  assert.equal(h.pings().length, 2);
+  // Stop: no cover until the session's next request, whatever else would cover it
+  await h.put({ warn_pct: 0.95, warm_after_stop_hours: 6, warm_min_usd: 0 });
+  assert.equal((await h.warm('s1')).stop, null);
+  assert.deepEqual(await h.api('sessions/s1/warm', {}, 'DELETE'), { ok: true });
+  assert.deepEqual([(await h.warm('s1')).by, (await h.warm('s1')).stop], [null, 'stopped by you']);
+  await h.turn('s1');
+  assert.deepEqual([(await h.warm('s1')).by, (await h.warm('s1')).stop], ['after you stop', null], 'active again: "after I stop" covers it');
+});
+
+test('keep-warm rules: a local-time window, also across midnight; a rule covers a matching session whose rebuild is worth it; Stop wins', async () => {
+  const { c, db, row } = await ledgerRows(), at = (day: number, hh: number, mm: number) => new Date(2026, 8, 27 + day, hh, mm).getTime(); // 27 Sep 2026 is a Sunday: day 1 = Monday
+  const night = { id: 'n', name: 'night', days: [1], from: '22:00', to: '02:00', scope: 'all', match: null }, lunch = { id: 'l', name: 'lunch', days: [3], from: '12:30', to: '14:00', scope: 'project', match: 'proj' };
+  assert.equal(new Date(at(1, 0, 0)).getDay(), 1);
+  assert.deepEqual([at(1, 21, 59), at(1, 22, 0), at(1, 23, 30), at(2, 1, 59), at(2, 2, 0), at(2, 23, 0), at(1, 1, 0)].map((x) => c.ruleEnd(night, x)),
+    [null, at(2, 2, 0), at(2, 2, 0), at(2, 2, 0), null, null, null], 'Monday 22:00 to Tuesday 02:00; Monday 01:00 belongs to Sunday night');
+  assert.deepEqual([at(3, 12, 29), at(3, 12, 30), at(3, 13, 59), at(3, 14, 0), at(4, 13, 0)].map((x) => c.ruleEnd(lunch, x)), [null, at(3, 14, 0), at(3, 14, 0), null, null]);
+  // a main conversation with 200k on the 1h cache ($1.60 to rebuild), last active Wednesday 12:00, in project `proj`
+  const ts = at(3, 12, 0), now = at(3, 12, 40);
+  row({ ts, session_key: 'rs', cache_create: 200e3, cache_1h: 200e3, tools_count: 3, first_user_hash: 'fh' });
+  db.prepare(`insert into sessions (session_key, account_id, cwd) values ('rs', 'home', '/w/proj')`).run();
+  const w = c.warmth(ts - 1).find((x: any) => x.sk === 'rs')!, st = { ...(await import('./ledger.ts')).settings(), warm_enabled: true, warm_rules: [night, lunch] };
+  assert.deepEqual([w.thread, w.cold_at], ['rs\0fh', ts + 60 * M]);
+  c.warmMem.has = (th: string) => th === 'rs\0fh';
+  let p = c.warmPlan(w, st, now);
+  assert.deepEqual([p.by, p.until, p.stop, p.next, p.pings], ['rule ‘lunch’', at(3, 14, 0), null, ts + 55 * M, 0]);
+  assert.equal(c.warmPlan(w, { ...st, warm_rules: [{ ...lunch, match: 'other' }] }, now).by, null, 'another project');
+  assert.equal(c.warmPlan(w, { ...st, warm_min_usd: 2 }, now).by, null, 'a rebuild under warm_min_usd is not worth a rule');
+  assert.equal(c.warmPlan(w, st, at(3, 14, 1)).by, null, 'the window is over');
+  c.warmMem.has = () => false;
+  assert.match(c.warmPlan(w, st, now).stop!, /^its last request is not in memory \(router restart or eviction\)/);
+  c.warmMem.has = () => true;
+  db.prepare(`insert into warm_sessions values ('rs', 0, ?, 'stopped by you')`).run(ts + 1);
+  p = c.warmPlan(w, st, now);
+  assert.deepEqual([p.by, p.stop, p.next], [null, 'stopped by you', null]);
+});
+
+test('tool loading advisor: always load, leave deferred, disable and tool-search-off on a fixture, with the arithmetic and where the server is defined', async () => {
+  const { c, db, row } = await ledgerRows(), home = mkdtempSync(`${tmpdir()}/router-chome-`), t0 = Date.now() - 5 * 3600_000;
+  // the user's own config: alpha at user scope. Only names may be read from it.
+  process.env.CLAUDE_HOME = `${home}/.claude`;
+  writeFileSync(`${home}/.claude.json`, JSON.stringify({ mcpServers: { alpha: { command: 'npx', env: { API_KEY: 'sk-config-secret' }, headers: { authorization: 'Bearer hdr-secret' } } } }));
+  const use = db.prepare('insert into tool_uses (id, request_id, name) values (?, ?, ?)'), sess = db.prepare('insert into sessions (session_key, account_id, cwd) values (?, ?, ?)');
+  const servers = { '': { loaded: 10, deferred: 0, def_tokens: 5000 }, alpha: { loaded: 0, deferred: 3, def_tokens: 1000 }, beta: { loaded: 0, deferred: 2, def_tokens: 50_000 },
+    plugin_acme_gamma: { loaded: 0, deferred: 4, def_tokens: 800 }, delta: { loaded: 5, deferred: 0, def_tokens: 2000 } };
+  let n = 0;
+  // 12 turns per session on Opus 5.5, each reading a 100k prefix: $0.02 a request at $0.20/MTok
+  const session = (sk: string, cwd: string, calls: Record<number, string>, extra: Record<string, any> = {}) => {
+    sess.run(sk, 'home', cwd);
+    for (let i = 1; i <= 12; i++) { const rid = `req_${sk}_${i}`;
+      row({ ts: t0 + n++ * 1000, request_id: rid, session_key: sk, cache_read: 100e3, tools_count: 20, tools_hash: 'th-on', first_user_hash: sk, ...(i === 12 && extra) });
+      if (calls[i]) use.run(`tu_${sk}_${i}`, rid, calls[i]); }
+  };
+  const alpha = Object.fromEntries([1, 3, 5, 7, 9].flatMap((i) => [[i, 'ToolSearch'], [i + 1, 'mcp__alpha__query']])); // 5 searches, each followed by an alpha call
+  row({ ts: t0 - 1000, tools_hash: 'th-on', tool_names_json: '["Read","ToolSearch"]' }); // the names behind each tools_hash, as the router stores them once
+  row({ ts: t0 - 1000, tools_hash: 'th-off', tool_names_json: '["Read","mcp__alpha__query"]' });
+  session('t1', '/w/tp', { ...alpha, 11: 'ToolSearch', 12: 'mcp__beta__run' });
+  session('t2', '/w/tp', alpha); session('t3', '/w/tp', alpha);
+  session('t4', '/w/tp', { 1: 'ToolSearch', 2: 'mcp__beta__run', 3: 'Read' }, { tool_servers_json: JSON.stringify(servers) });
+  session('o1', '/w/other', { 1: 'mcp__alpha__query' }, { tools_hash: 'th-off', tool_servers_json: JSON.stringify({ '': { loaded: 10, deferred: 0, def_tokens: 5000 }, alpha: { loaded: 3, deferred: 0, def_tokens: 1000 } }) });
+  const v = c.toolsView(new URLSearchParams('project=tp')), by = Object.fromEntries(v.servers.map((x: any) => [x.server, x])), perTok = 48 * 0.2 / 1e6;
+  assert.deepEqual([v.project, v.sessions, v.turns, v.days, v.tool_search], ['tp', 4, 48, 30, { on: true, calls: 17, sessions: 4, class: null, fix: null }]);
+  assert.deepEqual(v.servers.map((x: any) => [x.server, x.class]), [['alpha', 'always_load'], ['delta', 'disable'], ['beta', 'leave_deferred'], ['plugin_acme_gamma', 'disable'], ['(built-in tools)', 'builtin']], 'ranked by dollars, built-ins last');
+  // alpha: 3 of 4 sessions, 15 round trips × $0.02 against 1,000 definition tokens × 48 turns × the read price
+  close(by.alpha.benefit_usd, 15 * 0.02); close(by.alpha.cost_usd, 1000 * perTok); close(by.alpha.usd, 0.30 - 0.0096);
+  assert.deepEqual([by.alpha.calls, by.alpha.sessions, by.alpha.share, by.alpha.searches, by.alpha.origin, by.alpha.projects], [15, 3, 0.75, 15, 'user', ['tp']]);
+  assert.deepEqual(by.alpha.where, { file: `${home}/.claude.json`.replace(process.env.HOME!, '~'), at: 'mcpServers["alpha"]', scope: 'user' });
+  assert.match(by.alpha.change, /^Add `"alwaysLoad": true` to mcpServers\["alpha"\] in .*\.claude\.json \(applies from the next session\)\.$/);
+  // beta: half the sessions, but 2 round trips ($0.04) do not pay for 50k tokens of definitions on every turn ($0.48)
+  close(by.beta.benefit_usd, 0.04); close(by.beta.cost_usd, 0.48);
+  assert.deepEqual([by.beta.share, by.beta.searches, by.beta.usd, by.beta.change, by.beta.origin], [0.5, 2, 0, null, 'app']);
+  // never called: a deferred one still costs its names, a loaded one its definitions on every turn that carried them
+  assert.deepEqual([by.plugin_acme_gamma.calls, by.plugin_acme_gamma.usd, by.plugin_acme_gamma.origin], [0, 0, 'plugin']);
+  assert.deepEqual(by.plugin_acme_gamma.evidence, ['not called in 30 days', 'deferred: it still costs its 4 tool names in the deferred list of every request']);
+  assert.match(by.plugin_acme_gamma.change, /^Switch it off in `\/mcp`: it comes from a plugin/);
+  // delta's definitions are charged over the turns of the one session whose recorded tool list had them loaded (t4: 12 turns)
+  close(by.delta.usd, 2000 * 12 * 0.2 / 1e6); assert.match(by.delta.evidence[1], /^loaded upfront: 2k tokens of definitions × the 12 turns that carried them × the read price = \$0\.00$/);
+  assert.equal(by['(built-in tools)'].calls, 18);
+  assert.deepEqual(v.tools.slice(0, 3).map((x: any) => [x.name, x.server, x.calls, x.sessions]), [['ToolSearch', null, 17, 4], ['mcp__alpha__query', 'alpha', 15, 3], ['mcp__beta__run', 'beta', 2, 2]]);
+  // the other project: its newest tool list has no tool-search tool, so everything is loaded upfront
+  const o = c.toolsView(new URLSearchParams('project=other&days=7'));
+  assert.deepEqual([o.sessions, o.tool_search.class, o.tool_search.on], [1, 'tool_search_off', false]); assert.match(o.tool_search.fix, /"ENABLE_TOOL_SEARCH": "true"/);
+  assert.deepEqual(o.servers.map((x: any) => [x.server, x.class]), [['alpha', 'loaded'], ['(built-in tools)', 'builtin']]);
+  // every project together: "now" is the newest tool list (the other project's), where alpha is loaded. Nothing from the config file but the server's name got out
+  const all = c.toolsView(new URLSearchParams()), a = all.servers.find((x: any) => x.server === 'alpha');
+  assert.ok(all.sessions >= 5 && all.projects.includes('tp') && all.projects.includes('other'));
+  assert.deepEqual([a.class, a.calls, a.sessions], ['loaded', 16, 4]);
+  assert.ok(!/sk-config-secret|hdr-secret|npx/.test(JSON.stringify([v, o, all])), 'config values leaked');
+  delete process.env.CLAUDE_HOME;
+});
+
+test('brain facts: "Load in every session" adds and removes exactly one import line in the user CLAUDE.md; new facts files carry no boilerplate', async (t) => {
+  const chome = `${mkdtempSync(`${tmpdir()}/router-chome-`)}/.claude`, b = await brainSetup(t, { CLAUDE_HOME: chome }), md = `${chome}/CLAUDE.md`;
+  const stats = async () => (await b.call('GET', 'stats'))[1], LINE = '@~/vault/CRITICAL_FACTS.md'; // the vault is under HOME: the ~ form
+  assert.deepEqual([(await stats()).facts_loaded, (await stats()).facts_line, (await stats()).facts_file, existsSync(md)], [false, LINE, md, false]);
+  // no file: created with just the line; off again: the file held nothing else, so it goes
+  assert.deepEqual(await b.call('POST', 'facts-load', { on: true }), [200, { ok: true, facts_loaded: true }]);
+  assert.equal(readFileSync(md, 'utf8'), `${LINE}\n`);
+  assert.deepEqual(await b.call('POST', 'facts-load', { on: true }), [200, { ok: true, facts_loaded: true }]);
+  assert.equal(readFileSync(md, 'utf8'), `${LINE}\n`, 'not added twice');
+  assert.deepEqual(await b.call('POST', 'facts-load', { on: false }), [200, { ok: true, facts_loaded: false }]);
+  assert.ok(!existsSync(md));
+  // a file with the user's own content: the line is appended, and removing it leaves the rest byte for byte
+  const mine = '# Mine\n\n- always use pnpm\n@~/other/notes.md\n';
+  writeFileSync(md, mine);
+  await b.call('POST', 'facts-load', { on: true });
+  assert.equal(readFileSync(md, 'utf8'), `${mine}${LINE}\n`); assert.equal((await stats()).facts_loaded, true);
+  await b.call('POST', 'facts-load', { on: false });
+  assert.equal(readFileSync(md, 'utf8'), mine); assert.equal((await stats()).facts_loaded, false);
+  // a line in the middle, and a file without a final newline
+  writeFileSync(md, `# Mine\n${LINE}\nlast line`);
+  assert.equal((await stats()).facts_loaded, true, 'the state is read from the file');
+  await b.call('POST', 'facts-load', { on: false });
+  assert.equal(readFileSync(md, 'utf8'), '# Mine\nlast line');
+  await b.call('POST', 'facts-load', { on: true });
+  assert.equal(readFileSync(md, 'utf8'), `# Mine\nlast line\n${LINE}\n`);
+  // the template of a new facts file is one HTML comment; an existing file is never rewritten
+  assert.match(b.read('CRITICAL_FACTS.md'), /^<!-- [^\n]* -->\n$/);
+  await b.call('PUT', 'facts', { text: 'Deploys go through wrangler.\n' });
+  await b.call('POST', 'capture', {});
+  assert.equal(b.read('CRITICAL_FACTS.md'), 'Deploys go through wrangler.\n');
+  const ui = readFileSync(`${import.meta.dirname}/ui.html`, 'utf8');
+  assert.match(ui, /Load in every session/); assert.match(ui, /Applies from the next session; Cowork sessions skip it\./);
+});
+

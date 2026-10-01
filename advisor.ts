@@ -7,6 +7,8 @@ import { homedir, tmpdir } from 'node:os';
 import { db, settings } from './ledger.ts';
 
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
+// The user-level Claude directory; CLAUDE_HOME stands in for ~/.claude (development and tests never touch the real one). `${claudeHome()}.json` = ~/.claude.json
+export const claudeHome = () => process.env.CLAUDE_HOME ?? `${homedir()}/.claude`;
 const which = () => { try { return execFileSync('which', ['claude'], { encoding: 'utf8' }).trim() || null; } catch { return null; } };
 export const CLAUDE_BIN: string = process.env.CLAUDE_BIN ?? settings().claude_bin ?? which() ?? `${homedir()}/.local/bin/claude`;
 
