@@ -76,7 +76,7 @@ Until B4 has data, B1 and B3 carry the label **"saving if quality holds — unve
   it is the objective (quality minus cost); the tools are replay arithmetic and a small shadow test.
 - **Local models for the coding loop.** That is a quality trade. A local model is only an optional classifier backend
   for the brain (order: Jev → local → Haiku), added when someone asks.
-- **Router-originated keep-warm requests.** A2 notifies instead; the router keeps to forwarding what the client sends.
+- ~~Router-originated keep-warm requests~~ — now planned as an opt-in scheduler, see below.
 
 ## Where it shows up
 
@@ -119,3 +119,48 @@ Built: the corrections, A1–A4, A7, B1, B2, `GET /router/insights` findings, th
 `/usage` now shows cache misses with a likely cause for the main conversation, and `/insights` reports on work
 patterns. What this adds: subagents, history across sessions and accounts, dollars, what-if replays, and a warning
 before the cache goes cold.
+
+## Next: limits as the unit, keep-warm scheduler, tool loading advisor
+
+### Limits as the unit
+On a subscription the scarce thing is the 5-hour and weekly window, not dollars. Every response carries the
+account's utilization, so the router can measure the exchange rate from its own traffic: list-price dollars spent
+between two readings ÷ the utilization that moved. Measured on this machine (2026-10-01):
+
+| Account | $ per 1% of 5h | $ per 1% of week | Basis |
+|---|---|---|---|
+| home | 0.87 | 4.72 | 2,378 requests, 7 windows |
+| yp-2 | 1.22 | 7.43 | 1,724 requests, 5 windows |
+
+Every dollar figure in the console gains "≈ N% of your 5-hour window · M% of your week" for the account that paid.
+Rules: per account, rolling estimate over the last 14 days, needs a minimum of spend and movement before it is
+shown, and is marked low-confidence when utilization moves far more than router traffic explains (the account is
+being used elsewhere: acct-b moved 43% on $0.51 of router traffic). Budgets accept a limit in % of week.
+
+### Keep-warm scheduler (opt-in, off by default)
+The cache lifetime resets on every read, so replaying a session's last request keeps a large context warm.
+- **How.** The router keeps the last main-thread request of each large session in memory only (raw bytes as
+  received, plus its headers), never on disk. A warm ping replays it unchanged and closes the stream as soon as the
+  response starts. Cost: one cache read of the prefix.
+- **When.** Per session: "Keep warm for 2h / until a time". Rules: "keep sessions above $X rebuild cost warm for up
+  to N hours after I stop" and time windows such as a lunch break. One ping a few minutes before the lifetime ends.
+  One-hour caches only; five-minute caches never pay back.
+- **Shown before enabling.** Ping cost and rebuild cost in dollars and in % of the 5-hour and weekly window, and the
+  break-even: on Opus 5.5 a rebuild costs 40 pings (about 37 hours), on Fable 5.1 80, on Sonnet 5.5 20.
+- **Stops by itself** when the session becomes active, the duration ends, the daily warm budget is spent, the
+  account passes its warn threshold on either window, any ping fails, or the router restarts (the request is gone
+  from memory). A failed ping never cools an account or moves a session.
+- **Limits to state.** The home account's token is only refreshed while the desktop app is active, so overnight
+  warming of home can stop when the token expires. Pings are requests the router sends on its own with your login;
+  they count toward your limits and are logged with source `warm`.
+
+### Tool loading advisor
+Claude Code defers MCP tools behind tool search by default; a server with `"alwaysLoad": true` loads upfront.
+From each person's own ledger (tool calls per server, sessions that used it, ToolSearch round trips, definition
+sizes) the console recommends, per project:
+- **Always load** the few servers used in most sessions: saves a search round trip (a full prefix read) each time.
+- **Leave deferred** everything else, and set `ENABLE_TOOL_SEARCH=true` where a custom base URL turned it off.
+- **Disable** servers not used in 30 days.
+Each line shows the arithmetic (definition tokens × turns × read price vs round trips avoided) and the exact
+config snippet to paste. The router does not rewrite tool lists in requests: the client's own search index would
+no longer match.
