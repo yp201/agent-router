@@ -38,7 +38,7 @@ h1 { margin: 0; font: 400 34px var(--serif); } h2 { margin: 0; font-size: 16px; 
 .mono { font-family: var(--mono); } .teal { color: var(--teal); } .clay { color: var(--clay); } .amber { color: var(--amber); }
 .chip { font-size: 11px; padding: 2px 7px; border-radius: 99px; background: var(--line); color: var(--muted); white-space: nowrap; }
 .chip.ok { background: #23342F; color: var(--teal); } .chip.warn { background: #3A2E24; color: var(--amber); } .chip.bad { background: #3A2420; color: var(--clay); }
-button, select, input { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+button, select, input, textarea { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
 button { cursor: pointer; font-weight: 500; } button:hover:not(:disabled) { border-color: var(--muted); } button:disabled { opacity: .5; cursor: default; }
 button.primary { background: var(--clay); border-color: var(--clay); color: var(--bg); font-weight: 600; }
 button.sm, select.sm { padding: 6px 10px; border-radius: 6px; }
@@ -62,9 +62,13 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .err { color: var(--clay); }
 .plain { border: 0; background: none; padding: 0; font: inherit; text-align: left; max-width: 100%; } .plain:hover { color: var(--clay); }
 .meter .bar { height: 4px; }
+.brain { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 16px; align-items: start; }
+.md { overflow-wrap: anywhere; } .md h1 { font-size: 26px; margin: 0 0 6px; } .md h2 { margin: 14px 0 4px; } .md h3, .md h4 { margin: 10px 0 2px; font-size: 14px; }
+.md p, .md ul, .md ol { margin: 4px 0; } .md ul, .md ol { padding-left: 20px; } .md a { color: var(--teal); } .md td { border: 1px solid var(--line); padding: 4px 8px; }
+.md code { font: 12px var(--mono); background: var(--bg); padding: 1px 4px; border-radius: 4px; } .md table { border-collapse: collapse; margin: 6px 0; }
 [hidden] { display: none !important; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
-@media (max-width: 1000px) { .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid2 { grid-template-columns: 1fr; } }
+@media (max-width: 1000px) { .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid2, .brain { grid-template-columns: 1fr; } }
 @media (max-width: 720px) {
   .app { flex-direction: column; } .rail { width: auto; height: auto; position: static; flex-direction: row; flex-wrap: wrap; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
   .brand { padding: 4px 12px 4px 0; font-size: 22px; } .grow, .status { display: none; } main { padding: 20px 16px; } .grid4 { grid-template-columns: 1fr; }
@@ -80,6 +84,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     <a href="#cache"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>Cache</a>
     <a href="#cost"><svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg>Cost &amp; budgets</a>
     <a href="#insights"><svg viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/><circle cx="12" cy="12" r="5"/></svg>Insights</a>
+    <a href="#brain"><svg viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h14v16H6a2 2 0 0 0-2 2z"/><path d="M4 21a2 2 0 0 0 2 2h14v-4"/><path d="M9 8h6M9 12h4"/></svg>Brain</a>
     <div class="grow"></div>
     <div class="status" id="status" aria-live="polite">connecting…</div>
   </nav>
@@ -110,7 +115,7 @@ const model = (m) => esc((m ?? '—').replace(/^claude-/, '').replace(/-\d{8}$/,
 const get = (p) => fetch(`/router/${p}`).then((r) => r.json());
 const send = (method, p, body) => fetch(`/router/${p}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) }).then((r) => r.json());
 let S = {};            // last settings
-const ui = { cacheSession: 'all', cacheDays: 7, dollars: false, open: {}, added: null, tl: null, busy: {}, b: {} }; // view state that survives re-renders
+const ui = { cacheSession: 'all', cacheDays: 7, dollars: false, open: {}, added: null, tl: null, busy: {}, b: {}, note: 'index.md', bq: '', bedit: false, files: [] }; // view state that survives re-renders
 const kt = (n) => n == null ? '—' : `${Math.round(n / 1000)}k`;
 const ctxColor = (s) => s.context_pct >= s.urgent_pct ? 'clay' : s.context_pct >= s.warn_pct ? 'amber' : 'muted';
 // Session timeline: x = turn, one lane per account (first appearance order), bar = context (teal read + clay write cap)
@@ -155,6 +160,36 @@ const kpi = (label, value, sub, cls = '') => `<div class="panel kpi"><div class=
 const head = (title, sub, right = '') => `<header class="top"><div class="col"><h1>${title}</h1><div class="muted">${sub}</div></div>${right}</header>`;
 const acctLine = (a) => a.kind === 'home' ? 'desktop login · never stored'
   : `oauth · ${a.token_expires_at ? `token refreshes in ${dur((a.token_expires_at - Date.now()) / 1000)}` : 'token not loaded yet'}`;
+
+// md:begin
+// The Brain tab's Markdown renderer. Notes and imported skills are untrusted text: the whole source is HTML-escaped first and only then
+// formatted. Links exist only for http(s) URLs and in-vault [[wikilinks]]; no raw HTML passes through. test_router.ts loads this block.
+const md = (src) => {
+  const lines = String(src ?? '').replace(/\r\n/g, '\n').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`).split('\n'), out = [];
+  // wikilinks before links: their output has spaces, so a later [text](url) can never swallow generated markup into an href
+  const inline = (t) => t.split(/(``.+?``|`[^`]+`)/).map((p, i) => i % 2 ? `<code>${p.replace(/^``? ?| ?``?$/g, '')}</code>` : p
+    .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, to, as) => `<a href="#brain" data-wl="${to}">${as ?? to}</a>`)
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, url) => /^https?:\/\//i.test(url) ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>` : m)
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')).join('');
+  let open = '', para = [], pre = null, fm = lines[0] === '---' ? [] : null;
+  const close = () => { if (para.length) out.push(`<p>${inline(para.join(' '))}</p>`); if (open) out.push(`</${open}>`); para = []; open = ''; };
+  const into = (tag, row) => { if (para.length || open !== tag) { close(); out.push(`<${tag}>`); open = tag; } out.push(row); };
+  lines.forEach((l, i) => {
+    let m;
+    if (fm) { if (i && l === '---') { out.push(`<pre class="muted">${fm.join('\n')}</pre>`); fm = null; } else if (i) fm.push(l); }
+    else if (pre) { if (/^```/.test(l)) { out.push(`<pre>${pre.join('\n')}</pre>`); pre = null; } else pre.push(l); }
+    else if (/^```/.test(l)) { close(); pre = []; }
+    else if (/^&#60;!-- agent-router:(begin|end)[\w ]*--&#62;\s*$/.test(l)) close(); // our own block markers
+    else if ((m = l.match(/^(#{1,4})\s+(.*)$/))) { close(); out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); }
+    else if ((m = l.match(/^\s*(?:[-*]|(\d+)\.)\s+(.*)$/))) into(m[1] ? 'ol' : 'ul', `<li>${inline(m[2])}</li>`);
+    else if (/^\|.*\|\s*$/.test(l)) { if (!/^[|\s:-]+$/.test(l)) into('table', `<tr>${l.trim().slice(1, -1).split('|').map((c) => `<td>${inline(c.trim())}</td>`).join('')}</tr>`); }
+    else if (!l.trim()) close();
+    else { if (open) close(); para.push(l); }
+  });
+  close();
+  return out.join('\n') + (pre ? `<pre>${pre.join('\n')}</pre>` : '') + (fm ? `<pre>${fm.join('\n')}</pre>` : '');
+};
+// md:end
 
 // ---------- views: each returns [paths to fetch, render(data)] ----------
 const views = {
@@ -411,6 +446,89 @@ const views = {
         </div>
       </div></section>`;
   }],
+
+  brain: [['brain/stats', 'brain/tree', () => `brain/note?path=${encodeURIComponent(ui.note)}`, () => ui.bq ? `brain/search?q=${encodeURIComponent(ui.bq)}` : 'settings', 'settings'], (b, t, note, hits) => {
+    const sub = 'Notes about past sessions, as plain files, so the next session does not work the same thing out again.';
+    if (!b.enabled) return head('Brain', sub) + `<form class="panel" id="brain-enable" style="max-width:760px">
+      <h2>The brain is off</h2>
+      <div class="note">Turning it on does three things:</div>
+      <div class="note"><b style="color:var(--fg)">1. Notes, for free.</b> Every session that has been idle for 15 minutes gets one Markdown note in <span class="mono">wiki/logs/</span> under the folder below: what you asked (each prompt cut to 300 characters), the files it wrote, the commands that worked, the tools and subagents it used. Obvious secrets are redacted. No model is called, and your existing sessions are written on the first pass.</div>
+      <div class="note"><b style="color:var(--fg)">2. Distilling, which spends quota.</b> Turning a session into decisions, learnings and a skill candidate is a call through your own <span class="mono">claude</span> CLI: a small model decides whether it is worth it, a larger one writes. It only runs when you click Distill (or when you switch it to run on idle), and never past the daily cap of ${units(b.cap_units)} units.</div>
+      <div class="note"><b style="color:var(--fg)">3. Skills, only when you say so.</b> Skill candidates stay in the folder until you promote one; promoting copies it to your Claude skills folder. Nothing else is written outside the folder below.</div>
+      <div class="note">The ledger still stores no request bodies. This folder is the one place that holds excerpts of your own prompts and commands, and you can open it in Obsidian.</div>
+      <label class="col small muted">Folder<input name="dir" value="${esc(b.dir)}" class="mono"></label>
+      <div class="row"><button class="primary">Enable</button></div></form>`;
+    ui.files = t.files;
+    const f = t.files, base = (p) => p.split('/').pop().replace(/\.md$/, ''), path = note.path ?? '';
+    const item = (p, label = base(p)) => `<button class="plain nm small${p === ui.note ? ' clay' : ''}" data-note="${esc(p)}" title="${esc(p)}">${esc(label)}</button>`;
+    const grp = (label, k, items, n = items.length) => n ? `<details data-k="bt-${k}" ${ui.open[`bt-${k}`] ?? k !== 'daily' ? 'open' : ''}><summary>${label} <span class="muted">${n}</span></summary><div class="col" style="margin:6px 0 10px;gap:3px">${items.join('')}</div></details>` : '';
+    const logs = f.filter((p) => p.startsWith('wiki/logs/')).reverse();
+    let last = '';
+    const sess = logs.slice(0, 300).map((p) => { const d = base(p).slice(0, 10), h = d === last ? '' : `<span class="label" style="margin-top:6px">${esc(d)}</span>`; last = d; return h + item(p, base(p).slice(11) || base(p)); });
+    const cand = f.filter((p) => /^skills\/candidates\/[^/]+\/SKILL\.md$/.test(p)), st = (p) => b.skills.find((k) => k.name === p.split('/')[2])?.status;
+    const tree = ui.bq ? `<div class="between"><span class="small muted">${hits.length} match${hits.length === 1 ? '' : 'es'} for “${esc(ui.bq)}”</span><button class="sm" data-bact="clear">Clear</button></div>
+        ${hits.map((h) => `<button class="plain small" data-note="${esc(h.path)}"><span class="${h.path === ui.note ? 'clay' : ''}">${esc(base(h.path))}</span><br><span class="muted">${esc(h.snippet)}</span></button>`).join('') || '<div class="note">Nothing found.</div>'}`
+      : `<div class="row" style="flex-wrap:wrap;gap:4px 12px">${f.includes('index.md') ? item('index.md', 'Index') : ''}${f.includes('CRITICAL_FACTS.md') ? item('CRITICAL_FACTS.md', 'Facts') : ''}${f.includes('_CLAUDE.md') ? item('_CLAUDE.md', 'Manual') : ''}${f.includes('log.md') ? item('log.md', 'Log') : ''}</div>
+        ${grp('Sessions', 'logs', sess, logs.length)}${grp('Projects', 'proj', f.filter((p) => p.startsWith('wiki/projects/')).map((p) => item(p)))}
+        ${grp('Skills — promoted', 'skills', cand.filter((p) => st(p) === 'promoted').map((p) => item(p, p.split('/')[2])))}
+        ${grp('Skills — candidates', 'cand', cand.filter((p) => st(p) !== 'promoted').map((p) => item(p, p.split('/')[2])))}
+        ${grp('Daily', 'daily', f.filter((p) => p.startsWith('wiki/daily/')).reverse().map((p) => item(p)))}
+        ${f.length ? '' : '<div class="note">No notes yet. Sessions are written once they have been idle for 15 minutes, or now with “Capture now”.</div>'}`;
+    const kind = path.startsWith('wiki/logs/') ? 'session' : path.startsWith('wiki/projects/') ? 'project' : cand.includes(path) ? 'candidate' : /^skills\/[^/]+\.md$/.test(path) ? 'skill' : path === 'CRITICAL_FACTS.md' ? 'facts' : '';
+    const name = kind === 'candidate' ? path.split('/')[2] : kind === 'skill' ? base(path) : '', sk = b.skills.find((k) => k.name === name), s = note.session, g = s?.gate_json ? JSON.parse(s.gate_json) : null;
+    const btn = (act, label, extra = '') => `<button class="sm" data-bact="${act}" ${extra} ${ui.busy.brain ? 'disabled' : ''}>${label}</button>`;
+    const acts = kind === 'session' && s ? btn('distill', ui.busy.brain ? 'Distilling…' : s.distilled_ts ? 'Distill again' : 'Distill', `data-sk="${esc(s.session_key)}"`) + (g && !g.gated ? btn('force', 'Distill anyway', `data-sk="${esc(s.session_key)}"`) : '')
+      : kind === 'project' ? btn('consolidate', ui.busy.brain ? 'Consolidating…' : 'Consolidate', `data-name="${esc(base(path))}"`)
+      : sk?.status === 'promoted' ? btn('demote', 'Demote', `data-name="${esc(name)}"`)
+      : kind === 'candidate' && sk ? btn('promote', 'Promote', `data-name="${esc(name)}"`) + btn('reject', 'Reject', `data-name="${esc(name)}"`)
+      : kind === 'facts' && !ui.bedit ? btn('edit', 'Edit') : '';
+    const gate = !s ? '' : `<div class="small muted">${s.queued ? '<span class="chip warn">queued: the daily cap is spent</span> ' : ''}${!g ? 'Not gated yet.' : g.forced ? 'Distilled without the gate.'
+      : g.answers ? `Gate (${esc(g.backend)}): ${Object.entries(g.answers).map(([k, a]) => `${esc(k)} = ${esc(a.value)} <span class="mono">${a.confidence.toFixed(2)}</span>`).join(' · ')} → ${g.gated ? (g.want_skill ? 'distill, skill wanted' : 'distill, no skill') : 'not worth distilling'}`
+      : `Gate: too little hands-on work (${g.pre.tool_calls} tool calls) → not distilled`}${s.distilled_ts ? ` · distilled ${ago(s.distilled_ts)}` : ''}</div>`;
+    const body = !path ? '<div class="note">Pick a note on the left.</div>'
+      : kind === 'facts' && ui.bedit ? `<form id="brain-facts" class="col" style="gap:8px"><textarea name="text" rows="12" class="mono" style="width:100%">${esc(note.text)}</textarea><div class="row"><button class="sm primary">Save</button><button type="button" class="sm" data-bact="clear">Cancel</button></div></form>`
+      : kind === 'candidate' ? `${sk && sk.source !== 'session' && sk.source !== 'builtin' ? `<div class="inset warnbox"><span class="small">Imported from <span class="mono">${esc(sk.source)}</span>. These are someone else's instructions: read all of it before promoting. Shown as raw text, nothing hidden.</span></div>` : ''}<pre>${esc(note.text)}</pre>`
+      : `<div class="md">${md(note.text)}</div>`;
+    const BC = 'grid-template-columns:minmax(0,1.2fr) 150px 50px 70px 70px 100px minmax(0,1.2fr) 90px';
+    return head('Brain', sub, `<details data-k="bset" ${ui.open.bset ? 'open' : ''} style="max-width:420px"><summary>Settings</summary>
+        <form id="brain-settings" class="col" style="gap:8px;margin-top:8px">
+          <label class="between small"><span>Distill</span><select name="brain_distill" class="sm">${[['manual', 'only when I click'], ['on_idle', 'when a session goes idle']].map(([v, l]) => `<option value="${v}" ${S.brain_distill === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+          <label class="between small"><span>Daily cap (units)</span><input name="brain_daily_units" value="${units(b.cap_units)}" class="mono" style="width:90px"></label>
+          <label class="between small"><span>Classifier <span class="muted">(in use: ${esc(b.classifier_backend)})</span></span><select name="classifier" class="sm">${['auto', 'jev', 'model'].map((v) => `<option ${S.classifier === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <div class="row"><button class="sm">Save</button><button type="button" class="sm" data-bact="disable">Turn the brain off</button></div>
+        </form></details>`)
+    + `<section class="grid4">
+      ${kpi('Brain spend today', units(b.spend_today_units), `of ${units(b.cap_units)} units${b.queued ? ` · ${b.queued} queued for tomorrow` : ''}`, b.spend_today_units >= b.cap_units ? 'clay' : '')}
+      ${kpi('Sessions captured', b.sessions_captured, `${b.distilled} distilled`)}
+      ${kpi('Skills promoted', b.promoted, 'loaded by every new session', 'teal')}
+      ${kpi('Candidates waiting', b.candidates, 'review, then promote or reject', b.candidates ? 'amber' : '')}
+    </section>
+    <section class="brain">
+      <div class="panel" style="gap:10px">
+        <form id="brain-search" class="row"><label class="sr" for="bq">Search the vault</label><input id="bq" name="q" value="${esc(ui.bq)}" placeholder="Search notes…" style="flex-grow:1;min-width:0"><button class="sm">Search</button></form>
+        <div class="col" data-scroll="tree" style="gap:8px;max-height:70vh;overflow-y:auto">${tree}</div>
+        <div class="row" style="flex-wrap:wrap"><button class="sm" data-bact="capture">Capture now</button><button class="sm" data-bact="recall" title="Installs a ‘brain’ skill that tells Claude to look in this vault when you refer to past work">Install recall skill</button></div>
+        <form id="brain-import" class="col" style="gap:6px"><label class="col small muted">Import a skill from a URL (https, one SKILL.md)<input name="url" placeholder="https://github.com/owner/repo/blob/main/skill/SKILL.md"></label><button class="sm">Import as candidate</button></form>
+      </div>
+      <div class="panel">
+        <div class="between" style="flex-wrap:wrap"><h2 class="nm">${esc(path ? base(path) : 'No note')}</h2><div class="row">${acts}</div></div>
+        ${gate}
+        ${note.abs ? `<div class="row small" style="flex-wrap:wrap"><a class="teal" href="obsidian://open?path=${encodeURIComponent(note.abs)}">Open in Obsidian</a><span class="mono muted" style="overflow-wrap:anywhere">${esc(note.abs)}</span></div>` : ''}
+        ${body}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="between"><h2>Skills</h2><span class="small muted">uses are counted from Skill tool calls in your transcripts · no savings are claimed</span></div>
+      <div class="table">
+        <div class="tr th" style="${BC}"><span>skill</span><span>status</span><span>uses</span><span>sessions</span><span>projects</span><span>last used</span><span>source</span><span>cost to find</span></div>
+        ${b.skills.map((k) => `<div class="tr" style="${BC}"><span class="nm">${item(`skills/candidates/${k.name}/SKILL.md`, k.name)}</span>
+          <span><span class="chip ${k.status === 'promoted' ? 'ok' : ''}">${esc(k.status)}</span>${k.status === 'promoted' && (k.last_used ?? k.promoted_ts) < Date.now() - 30 * 864e5 ? ' <span class="chip warn" title="Its description costs prefix tokens in every session">unused 30d</span>' : ''}</span>
+          <span>${k.uses}</span><span>${k.sessions}</span><span>${k.projects}</span><span>${k.last_used ? ago(k.last_used) : NA}</span><span class="nm" title="${esc(k.source)}">${esc(k.source)}</span><span>${k.source_units ? units(k.source_units) : NA}</span></div>`).join('')
+          || '<div class="note">No skills yet. Distilling a session that worked out a reusable procedure proposes one; you can also import a SKILL.md by URL.</div>'}
+      </div>
+      <div class="note">A promoted skill adds its description line to every session's prefix, and applies from the next session. Skills unused for 30 days are flagged so you can demote them.</div>
+    </section>`;
+  }],
 };
 
 // ---------- routing, polling, rendering ----------
@@ -434,7 +552,9 @@ async function refresh(force) {
     // field means the poll waits; clicking Create used to move focus to the button and get the form re-rendered away
     const dirty = [...main.querySelectorAll('input, textarea')].some((i) => i.type !== 'radio' && i.type !== 'checkbox' && i.value !== i.defaultValue);
     if (!force && ((f && main.contains(f) && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(f.tagName)) || dirty)) return;
+    const keep = [...main.querySelectorAll('[data-scroll]')].map((x) => [x.dataset.scroll, x.scrollTop]); // inner scrollers survive the re-render
     $('#main').innerHTML = render(...data);
+    for (const [k, y] of keep) { const x = main.querySelector(`[data-scroll="${k}"]`); if (x) x.scrollTop = y; }
     document.title = `agent-router`;
   } catch (e) {
     $('#status').innerHTML = `<span class="err">router unreachable: ${esc(e.message)}</span>`;
@@ -447,11 +567,35 @@ async function act(path, body, method = 'POST') {
   return r;
 }
 const putSettings = (patch) => act('settings', patch, 'PUT');
+async function brainAct(d) {
+  const a = d.bact, skill = `brain/skills/${encodeURIComponent(d.name)}/${a}`;
+  if (a === 'clear') { ui.bq = ''; ui.bedit = false; refresh(true); }
+  if (a === 'edit') { ui.bedit = true; refresh(true); }
+  if (a === 'capture' || a === 'recall') act(`brain/${a}`);
+  if (a === 'disable' && confirm('Turn the brain off? Notes stay where they are; nothing new is written.')) putSettings({ brain_enabled: false });
+  if (a === 'promote' && confirm(`Promote ${d.name}? It is copied to your Claude skills folder and every new session loads its description.`)) act(skill);
+  if (a === 'demote') act(skill);
+  if (a === 'reject' && confirm(`Reject ${d.name}? The candidate is deleted.`)) act(skill).then(() => { ui.note = 'index.md'; refresh(true); });
+  if (a === 'distill' || a === 'force' || a === 'consolidate') { // model calls: seconds to minutes
+    ui.busy.brain = true; refresh(true);
+    const r = await send('POST', a === 'consolidate' ? 'brain/consolidate' : 'brain/distill', a === 'consolidate' ? { project: d.name } : { session: d.sk, force: a === 'force' }).catch((e) => ({ error: { type: e.message } }));
+    delete ui.busy.brain;
+    if (r?.error) alert(`Failed: ${r.error.type}`); else if (r?.queued) alert('The daily brain cap is spent. Queued: it runs when the cap frees up.');
+    refresh(true);
+  }
+}
 
 document.addEventListener('click', (e) => {
-  const t = e.target.closest('button, a[data-session]');
+  const t = e.target.closest('button, a[data-session], a[data-wl]');
   if (!t) return;
   const d = t.dataset;
+  if (d.note) { ui.note = d.note; ui.bedit = false; refresh(true); }
+  if (d.wl) { // [[wikilink]]: a vault path, else the note with that name
+    e.preventDefault();
+    const w = d.wl.replace(/\.md$/, ''), hit = ui.files.find((p) => p === `${w}.md`) ?? ui.files.find((p) => p.endsWith(`/${w.split('/').pop()}.md`));
+    if (hit) { ui.note = hit; refresh(true); }
+  }
+  if (d.bact) brainAct(d);
   if (d.session) { ui.cacheSession = d.session; return; } // then the #cache link navigates
   if (d.a) { const [id, action] = d.a.split('/'); if (action !== 'remove' || confirm(`Remove ${id}? Its sessions fall back to another account.`)) act(`accounts/${encodeURIComponent(id)}/${action}`); }
   if (d.tl) { ui.tl = ui.tl === d.tl ? null : d.tl; refresh(true); }
@@ -515,6 +659,15 @@ document.addEventListener('submit', async (e) => {
     if (!r?.error) { ui.b = {}; refresh(true); }
   }
   if (fid === 'rule-add') putSettings({ context_rules: [...S.context_rules, { id: `r${Date.now()}`, text: String(f.get('text')), enabled: true, state: 'proposed' }] });
+  if (fid === 'brain-enable') putSettings({ brain_enabled: true, brain_dir: String(f.get('dir')).trim() || null });
+  if (fid === 'brain-search') { ui.bq = String(f.get('q')).trim(); refresh(true); }
+  if (fid === 'brain-facts') { await act('brain/facts', { text: String(f.get('text')) }, 'PUT'); ui.bedit = false; refresh(true); }
+  if (fid === 'brain-import') { const r = await act('brain/skills/import', { url: String(f.get('url')).trim() }); if (r?.name) { ui.note = `skills/candidates/${r.name}/SKILL.md`; refresh(true); } }
+  if (fid === 'brain-settings') {
+    const cap = parseUnits(String(f.get('brain_daily_units')));
+    if (!(cap >= 0)) return alert('Daily cap: a number of units, e.g. 200k');
+    putSettings({ brain_distill: f.get('brain_distill'), brain_daily_units: cap, classifier: f.get('classifier') });
+  }
   if (fid === 'ov') putSettings({ openvikings_endpoint: String(f.get('endpoint')).trim() || null });
 });
 addEventListener('hashchange', () => { deep(); refresh(true); });

@@ -4,7 +4,7 @@ import { createServer, request as httpRequest, type IncomingMessage, type Server
 import { createServer as createTls, request as httpsRequest } from 'node:https';
 import { createServer as createNet, type AddressInfo } from 'node:net';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, mkdirSync, appendFileSync, cpSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, mkdirSync, appendFileSync, cpSync, symlinkSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { tmpdir, networkInterfaces } from 'node:os';
@@ -125,7 +125,7 @@ const WHO: Record<string, string> = { 'Bearer tok-home-fake': 'home', 'Bearer to
 
 async function setup(t: TestContext, env: Record<string, string> = {}) {
   const s = {
-    seen: [] as { who: string; xkey?: string; body: string; enc?: string }[],
+    seen: [] as { who: string; xkey?: string; body: string; enc?: string; src?: string }[],
     util: {} as Record<string, number>, util7: {} as Record<string, number>, fail: {} as Record<string, number>,
     refreshes: [] as any[], refreshStatus: 200, n: 0, usage: null as any, // usage: echoed as the response's top-level `usage`
   };
@@ -138,7 +138,7 @@ async function setup(t: TestContext, env: Record<string, string> = {}) {
         return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ access_token: 'tok-c-new', refresh_token: 'tok-c-new-r', expires_in: 3600 }));
       }
       const who = WHO[req.headers.authorization ?? ''] ?? 'unknown';
-      s.seen.push({ who, xkey: req.headers['x-api-key'] as string, body, enc: req.headers['content-encoding'] as string });
+      s.seen.push({ who, xkey: req.headers['x-api-key'] as string, body, enc: req.headers['content-encoding'] as string, src: req.headers['x-agent-router-source'] as string });
       const h = { 'content-type': 'application/json', 'request-id': `req_${++s.n}`, 'anthropic-ratelimit-unified-5h-utilization': String(s.util[who] ?? 0), 'anthropic-ratelimit-unified-5h-status': 'allowed',
         ...(who in s.util7 && { 'anthropic-ratelimit-unified-7d-utilization': String(s.util7[who]) }) };
       if (s.fail[who] > 0) {
@@ -433,7 +433,7 @@ test('tailer: joins transcript usage on requestId, records tool_use, persists of
   assert.deepEqual([r1.in_tok, r1.out_tok, r1.cache_read, r1.cache_create, r1.cache_1h, r1.cache_5m, r1.thinking_tok, r1.session_id, r1.api_block_index, r1.model_from_transcript, r1.jsonl_path],
     [3, 50, 1000, 200, 200, 0, 7, 'tj', 1, 'claude-haiku-4', f]);
   assert.equal(r1.usage_src, 'transcript', 'the response carried no usage, so the tailer filled it');
-  assert.deepEqual({ ...(db.prepare('select * from tool_uses').get() as any) }, { id: 'tu1', request_id: 'req_1', name: 'Bash' });
+  assert.deepEqual({ ...(db.prepare('select * from tool_uses').get() as any) }, { id: 'tu1', request_id: 'req_1', name: 'Bash', arg: null });
   assert.equal((db.prepare(`select cwd from sessions where session_key = 'tj'`).get() as any).cwd, '/tmp/proj-x');
   const off = () => (db.prepare('select offset from tail_offsets where path = ?').get(f) as any)?.offset;
   await until(() => off() === statSync(f).size, 'offset persisted');
@@ -778,4 +778,332 @@ test('budgets: stop answers 400 without dialing upstream; count_tokens passes; p
 
 test('ui.html never reads form.id (shadowed by <input name="id">)', () => {
   assert.ok(!readFileSync(new URL('./ui.html', import.meta.url), 'utf8').includes('e.target.id ==='), 'form.id is shadowed by <input name="id">; use getAttribute'); // regression: Add account did nothing
+});
+
+// ---- brain (docs/BRAIN.md): fixture transcripts, a fake `claude`, a temp vault and a temp skills dir ----
+const jrow = (sk: string, o: any) => JSON.stringify({ sessionId: sk, cwd: '/tmp/proj-x', timestamp: new Date().toISOString(), ...o }) + '\n';
+const tuse = (sk: string, rid: string, id: string, name: string, input: any) => arow(rid, { in: 10, read: 0, create: 100 }, [{ type: 'tool_use', id, name, input }], sk);
+const tres = (sk: string, id: string, is_error = false) => jrow(sk, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'TOOL-OUTPUT', ...(is_error && { is_error }) }] } });
+// a session that did hands-on work: one prompt, n Bash commands that worked, one file written
+const worked = (sk: string, rid: string, n = 8) => jrow(sk, { type: 'user', message: { role: 'user', content: `deploy the worker ${sk}` } })
+  + Array.from({ length: n }, (_, i) => tuse(sk, rid, `${sk}-b${i}`, 'Bash', { command: `npx wrangler step-${i}` }) + tres(sk, `${sk}-b${i}`)).join('')
+  + tuse(sk, rid, `${sk}-w`, 'Write', { file_path: '/tmp/proj-x/wrangler.toml', content: 'x' }) + tres(sk, `${sk}-w`);
+const WRITER = { summary: 'Deployed the worker.', decisions: ['Deploy with wrangler because the project already uses it'], learnings: ['wrangler needs the account id in wrangler.toml'], open_threads: [],
+  tags: ['Cloudflare Workers', 'deploy'], skill: { name: 'deploy-worker', description: 'Use when deploying a Cloudflare worker: build, then deploy.', body: '1. Run `npm run build`\n2. Run `npx wrangler deploy`' } };
+const gateJson = (kind: string, conf: number) => '```json\n' + JSON.stringify({ answers: { reusable: { value: true, confidence: 0.9 }, kind: { value: kind, confidence: conf }, matches: { value: 'new', confidence: 0.9 } } }) + '\n```';
+
+async function brainSetup(t: TestContext, env: Record<string, string> = {}, enable = true) {
+  const proj = mkdtempSync(`${tmpdir()}/router-proj-`), tmp = mkdtempSync(`${tmpdir()}/router-brain-`), vault = `${tmp}/vault`, skills = `${tmp}/skills`;
+  // fake `claude`: canned output per prompt kind, and one line per call: kind, the --model value, the tagging env var
+  writeFileSync(`${tmp}/claude`, `#!/bin/sh\np=$(cat)\ncase "$p" in "You are a classifier"*) k=classifier;; *) k=writer;; esac\necho "$k $3 $ANTHROPIC_CUSTOM_HEADERS" >> ${tmp}/calls\ncat ${tmp}/$k.json\n`, { mode: 0o755 });
+  writeFileSync(`${tmp}/classifier.json`, gateJson('skill', 0.85));
+  writeFileSync(`${tmp}/writer.json`, JSON.stringify(WRITER));
+  // HOME = temp: a real ~/.agent-router/typesafe.key must never turn these into live Jev calls
+  const h = await setup(t, { CLAUDE_PROJECTS_DIR: proj, BRAIN_DIR: vault, CLAUDE_SKILLS_DIR: skills, CLAUDE_BIN: `${tmp}/claude`, HOME: tmp, NOTIFY: '0', DRILLS: '1', ...env });
+  const put = (b: unknown) => fetch(`${h.base}/router/settings`, { method: 'PUT', body: JSON.stringify(b) });
+  const call = async (method: string, path: string, body?: unknown): Promise<[number, any]> => {
+    const r = await fetch(`${h.base}/router/brain/${path}`, { method, ...(body !== undefined && { body: JSON.stringify(body) }) });
+    return [r.status, await r.json()];
+  };
+  // one routed request for the session, then its transcript; resolves once the tailer has joined the two (the path capture reads)
+  const session = async (sk: string, text: (rid: string) => string) => {
+    await h.msg(sk);
+    const rid = `req_${h.s.n}`, f = `${proj}/-tmp-proj-x/${sk}.jsonl`;
+    mkdirSync(dirname(f), { recursive: true });
+    writeFileSync(f, text(rid));
+    await until(async () => (await h.rows('select jsonl_path p from requests where request_id = ?', rid))[0]?.p, `${sk} joined`);
+    return f;
+  };
+  if (enable) assert.equal((await put({ brain_enabled: true })).status, 200);
+  return { ...h, proj, tmp, vault, skills, put, call, session, read: (rel: string) => readFileSync(`${vault}/${rel}`, 'utf8'),
+    calls: () => (existsSync(`${tmp}/calls`) ? readFileSync(`${tmp}/calls`, 'utf8').trim().split('\n') : []) };
+}
+
+test('brain capture: note from the transcript, secret redacted, failed command absent, user text kept, retitle renames, own calls skipped', async (t) => {
+  const b = await brainSetup(t), SECRET = 'sk-ant-api03-SECRETSECRETSECRET';
+  // every shape the scrubber names, in one command
+  const MORE = ['ghp_abcdefghijklmnopqrstuvwxyz0123456789', 'github_pat_11ABCDEFG0123456789abcdef', 'AKIAIOSFODNN7EXAMPLE', 'hunter2', 'zzz999', 'wJalrXUtnFEMI', 'MIIEpAIBAAKCAQEA'];
+  const leaky = `GH=${MORE[0]} PAT=${MORE[1]} AWS=${MORE[2]} mysql --password=${MORE[3]} "api_key": "${MORE[4]}" AWS_SECRET_ACCESS_KEY=${MORE[5]}\n-----BEGIN RSA PRIVATE KEY-----\n${MORE[6]}\n-----END RSA PRIVATE KEY-----\necho done`;
+  await b.session('bs', (rid) => jrow('bs', { type: 'user', message: { role: 'user', content: '<system-reminder>r</system-reminder>deploy the worker' } })
+    + jrow('bs', { type: 'user', isMeta: true, message: { role: 'user', content: 'INJECTED-SKILL-TEXT' } })
+    + jrow('bs', { type: 'user', message: { role: 'user', content: '<task-notification>agent done</task-notification>' } })
+    + tuse('bs', rid, 'b1', 'Bash', { command: 'npm run depoly' }) + tres('bs', 'b1', true)
+    + tuse('bs', rid, 'b2', 'Bash', { command: 'npm run deploy' }) + tres('bs', 'b2')
+    + tuse('bs', rid, 'b3', 'Bash', { command: `curl -H "Authorization: Bearer ${SECRET}" https://api.example.com/deploy` }) + tres('bs', 'b3')
+    + tuse('bs', rid, 'b4', 'Bash', { command: leaky }) + tres('bs', 'b4')
+    + tuse('bs', rid, 'w1', 'Write', { file_path: '/tmp/proj-x/wrangler.toml', content: 'x' }) + tres('bs', 'w1'));
+  // the brain's own model call: tagged by header, stored in requests.source, never forwarded, never captured
+  await b.msg('own', {}, { 'x-agent-router-source': 'brain' });
+  assert.equal(b.s.seen.at(-1)!.src, undefined, 'the tagging header must not reach upstream');
+  writeFileSync(`${b.proj}/-tmp-proj-x/own.jsonl`, worked('own', `req_${b.s.n}`));
+  await until(async () => (await b.rows(`select jsonl_path p from requests where session_key = 'own'`))[0]?.p, 'own joined');
+  assert.deepEqual((await b.rows('select session_key k, source from requests order by id')).map((r) => [r.k, r.source]), [['bs', null], ['own', 'brain']]);
+  assert.deepEqual((await b.api('sessions')).map((s: any) => s.session_key), ['bs'], 'the router\'s own sessions stay out of the Sessions view');
+
+  assert.deepEqual((await b.call('POST', 'capture', {}))[1].notes, 1);
+  const day = new Date().toLocaleDateString('sv'), logs = () => readdirSync(`${b.vault}/wiki/logs`);
+  assert.deepEqual(logs(), [`${day} deploy the worker.md`]);
+  let note = b.read(`wiki/logs/${logs()[0]}`);
+  assert.match(note, /^---\nsession: bs\ntitle: deploy the worker\nproject: proj-x\nstarted: "\d{4}-.*"\nended: ".*"\nturns: 1\nmodels: \[claude-haiku-4\]\naccounts: \[home\]\nunits: \d+\n/);
+  assert.match(note, /tags: \[session, proj-x\]\n---\n<!-- agent-router:begin -->\n# deploy the worker\n/);
+  assert.match(note, /## Asked\n\n- deploy the worker\n\n## Files touched\n\n- `wrangler\.toml`\n\n## Commands run\n\n- `npm run deploy`\n- `curl -H "Authorization: \[redacted\]" https:\/\/api\.example\.com\/deploy`\n- `GH=\[redacted\] PAT=\[redacted\] AWS=\[redacted\] mysql --password=\[redacted\] "api_key": "\[redacted\]" AWS_SECRET_ACCESS_KEY=\[redacted\] \[redacted\] echo done`\n\n## Tools\n\n- Bash × 4\n- Write × 1\n/);
+  for (const x of [SECRET, ...MORE, 'depoly', 'TOOL-OUTPUT', 'INJECTED', 'task-notification']) assert.ok(!note.includes(x), `${x} in the note`);
+  assert.match(b.read('index.md'), new RegExp(`## Sessions\\n\\n- \\[\\[${day} deploy the worker\\]\\] — proj-x`));
+  assert.match(b.read(`wiki/daily/${day}.md`), new RegExp(`## Sessions\\n\\n- \\[\\[${day} deploy the worker\\]\\]`));
+  assert.match(b.read('wiki/projects/proj-x.md'), new RegExp(`<!-- agent-router:begin knowledge -->\\n\\n?<!-- agent-router:end knowledge -->[\\s\\S]*## Sessions\\n\\n- \\[\\[${day} deploy the worker\\]\\]`));
+  assert.match(b.read('_CLAUDE.md'), /## Folder Map\n\n\| Note type \| Folder \|[\s\S]*`wiki\/logs\/`[\s\S]*`wiki\/projects\/`[\s\S]*`wiki\/daily\/`[\s\S]*`skills\/`[\s\S]*`skills\/candidates\/`/);
+
+  // text outside the markers is the user's: kept on recapture; _CLAUDE.md is never rewritten; a retitled session renames its note
+  appendFileSync(`${b.vault}/wiki/logs/${logs()[0]}`, '\nMY OWN NOTE\n');
+  writeFileSync(`${b.vault}/_CLAUDE.md`, 'mine now');
+  appendFileSync(`${b.proj}/-tmp-proj-x/bs.jsonl`, jrow('bs', { type: 'custom-title', customTitle: 'Worker: deploy/fix' }));
+  await until(async () => (await b.rows(`select title from sessions where session_key = 'bs'`))[0].title === 'Worker: deploy/fix', 'retitled');
+  assert.deepEqual((await b.call('POST', 'capture', { session: 'bs' }))[1].notes, 1);
+  assert.deepEqual(logs(), [`${day} Worker deploy fix.md`]);
+  note = b.read(`wiki/logs/${logs()[0]}`);
+  assert.match(note, /title: "Worker: deploy\/fix"\n[\s\S]*<!-- agent-router:end -->\n\nMY OWN NOTE\n$/);
+  assert.equal(note.split('agent-router:begin').length, 2, 'one generated block, rewritten in place');
+  assert.equal(b.read('_CLAUDE.md'), 'mine now');
+  assert.match(b.read('index.md'), /Worker deploy fix\]\]/); assert.ok(!b.read('index.md').includes('deploy the worker'));
+  assert.equal((await b.call('GET', 'stats'))[1].sessions_captured, 1);
+  // a transcript the router never routed (it is older than the ledger): found by its file name
+  writeFileSync(`${b.proj}/-tmp-proj-x/old.jsonl`, worked('old', 'req_none', 1));
+  await until(async () => (await b.rows(`select 1 from sessions where session_key = 'old'`)).length, 'transcript-only session seen');
+  assert.equal((await b.call('POST', 'capture', {}))[1].notes, 2);
+  assert.deepEqual(logs(), [`${day} Worker deploy fix.md`, `${day} deploy the worker old.md`]);
+  assert.deepEqual(b.calls(), [], 'capture never calls a model');
+  b.noLeak();
+});
+
+test('brain gate + distill: classifier then writer through the tagged runner; low confidence, pre-filter and bad JSON never reach the writer', async (t) => {
+  const b = await brainSetup(t), day = new Date().toLocaleDateString('sv');
+  await b.session('bd', (rid) => worked('bd', rid));
+  const [status, r] = await b.call('POST', 'distill', { session: 'bd' });
+  assert.deepEqual([status, r.gated, r.backend, r.want_skill, r.distilled, r.skill], [200, true, 'model', true, true, 'deploy-worker']);
+  assert.deepEqual(r.answers, { reusable: { value: true, confidence: 0.9 }, kind: { value: 'skill', confidence: 0.85 } }, 'fenced JSON is tolerated');
+  assert.deepEqual(r.pre, { tool_calls: 9, files: 1, commands: 8 });
+  assert.deepEqual(b.calls(), ['classifier haiku x-agent-router-source: brain', 'writer sonnet x-agent-router-source: brain']);
+  const [row] = await b.rows(`select * from brain_sessions where session_key = 'bd'`);
+  assert.deepEqual([row.gate_backend, JSON.parse(row.gate_json).answers.kind.confidence, row.skill_candidate, row.queued, row.distilled_ts > 0, row.gated_ts > 0], ['model', 0.85, 'deploy-worker', 0, true, true]);
+  const note = b.read(row.note_path);
+  assert.match(note, /<!-- agent-router:begin distilled -->\n## Distilled\n\nDeployed the worker\.\n\n### Decisions\n\n- Deploy with wrangler because the project already uses it\n\n### Learnings\n\n- wrangler needs[^\n]*\n\nSkill candidate: \[\[skills\/candidates\/deploy-worker\/SKILL\|deploy-worker\]\]\n<!-- agent-router:end distilled -->/);
+  assert.match(note, /^---\nsession: bd\n[\s\S]*\ntags: \[cloudflare-workers, deploy, session, proj-x\]\n---\n/);
+  assert.match(note, /## Commands run\n\n- `npx wrangler step-0`/, 'the captured block is still there');
+  const skill = b.read('skills/candidates/deploy-worker/SKILL.md');
+  assert.equal(skill, '---\nname: deploy-worker\ndescription: "Use when deploying a Cloudflare worker: build, then deploy."\n---\n\n1. Run `npm run build`\n2. Run `npx wrangler deploy`\n');
+  assert.ok(!existsSync(`${b.skills}/deploy-worker`), 'a candidate never reaches the skills dir by itself');
+  const bullet = `- ${day} · decision · Deploy with wrangler because the project already uses it ([[${day} deploy the worker bd]])`;
+  assert.equal(b.read('wiki/projects/proj-x.md').split(bullet).length, 2);
+  assert.match(b.read('log.md'), /distill wiki\/logs\/.* -> skill candidate deploy-worker/);
+
+  // a second run of the same session: the same dated bullets are not added twice, the session keeps its own candidate; a run that
+  // words things differently replaces that session's bullets instead of piling up
+  assert.equal((await b.call('POST', 'distill', { session: 'bd' }))[1].skill, 'deploy-worker');
+  assert.equal(b.read('wiki/projects/proj-x.md').split(bullet).length, 2, 'duplicate bullet dropped');
+  assert.equal(b.read('wiki/projects/proj-x.md').split(' · learning · ').length, 2);
+  writeFileSync(`${b.tmp}/writer.json`, JSON.stringify({ ...WRITER, decisions: ['Deploy with wrangler, as before'] }));
+  await b.call('POST', 'distill', { session: 'bd' });
+  assert.deepEqual(b.read('wiki/projects/proj-x.md').match(/· decision · [^(]+/g), ['· decision · Deploy with wrangler, as before ']);
+  writeFileSync(`${b.tmp}/writer.json`, JSON.stringify(WRITER));
+  assert.equal(b.calls().length, 6);
+
+  // low confidence -> the writer is not called
+  writeFileSync(`${b.tmp}/classifier.json`, gateJson('skill', 0.4));
+  await b.session('bl', (rid) => worked('bl', rid));
+  const low = (await b.call('POST', 'distill', { session: 'bl' }))[1];
+  assert.deepEqual([low.gated, low.distilled, low.answers.kind.confidence], [false, undefined, 0.4]);
+  assert.deepEqual(b.calls().slice(6), ['classifier haiku x-agent-router-source: brain']);
+  // …unless the user says so
+  assert.deepEqual((await b.call('POST', 'distill', { session: 'bl', force: true }))[1].distilled, true);
+  assert.deepEqual(b.calls().slice(7), ['writer sonnet x-agent-router-source: brain']);
+  // too little hands-on work: no model call at all
+  await b.session('bp', (rid) => worked('bp', rid, 2));
+  const pre = (await b.call('POST', 'distill', { session: 'bp' }))[1];
+  assert.deepEqual([pre.gated, pre.why, pre.pre.tool_calls], [false, 'prefilter', 3]);
+  // an answer that is not the JSON asked for: no gate stored, no writer
+  writeFileSync(`${b.tmp}/classifier.json`, 'Sure! I think this is a skill.');
+  await b.session('bj', (rid) => worked('bj', rid));
+  assert.deepEqual((await b.call('POST', 'distill', { session: 'bj' }))[1], { pre: { tool_calls: 9, files: 1, commands: 8 }, gated: false, why: 'classifier_failed' });
+  assert.equal((await b.rows(`select gated_ts from brain_sessions where session_key = 'bj'`))[0].gated_ts, null);
+  assert.match(b.stdout(), /brain: classifier did not return the JSON asked for; no gate/);
+  assert.equal(b.calls().length, 9);
+  assert.deepEqual((await b.call('POST', 'distill', { session: 'nope' })), [404, { error: { type: 'no_note' } }]);
+  const st = (await b.call('GET', 'stats'))[1];
+  assert.deepEqual([st.sessions_captured, st.distilled, st.candidates, st.promoted, st.classifier_backend], [4, 2, 1, 0, 'model']);
+  assert.deepEqual(st.skills.map((k: any) => [k.name, k.status, k.source, k.source_session, k.uses]), [['deploy-worker', 'candidate', 'session', 'bd', 0]]);
+  b.noLeak();
+});
+
+test('brain classifier: Jev request and answers follow the TypeSafe docs; a 500 falls back to the model backend', async (t) => {
+  const reqs: { url: string; auth?: string; body: any }[] = [];
+  let fail = false;
+  const ts = createServer((req, res) => { let d = ''; req.on('data', (c) => (d += c)).on('end', () => {
+    reqs.push({ url: req.url!, auth: req.headers.authorization, body: JSON.parse(d) });
+    if (fail) return res.writeHead(500).end('{"error":"boom"}');
+    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ model: 'jev-1.13.0', usage: { input_tokens: 392, output_tokens: 65 }, answers: {
+      reusable: { type: 'noul', noul: 0.25 }, kind: { type: 'choice', choice: 'project-knowledge', confidence: 0.8, probabilities: { skill: 0.1, 'project-knowledge': 0.85, nothing: 0.05 } } } }));
+  }); });
+  const port = await listen(ts);
+  t.after(() => ts.close());
+  const b = await brainSetup(t, { TYPESAFE_URL: `http://127.0.0.1:${port}`, TYPESAFE_API_KEY: 'ts-fake-key' });
+  await b.session('bj', (rid) => worked('bj', rid));
+  const r = (await b.call('POST', 'distill', { session: 'bj' }))[1];
+  assert.deepEqual([reqs.length, reqs[0].url, reqs[0].auth, reqs[0].body.model, Object.keys(reqs[0].body).sort()], [1, '/v1/systemone', 'Bearer ts-fake-key', 'jev-latest', ['model', 'questions', 'state']]);
+  assert.match(reqs[0].body.state, /^# deploy the worker bj\n[\s\S]*## Commands run\n\n- `npx wrangler step-0`/);
+  const q = reqs[0].body.questions;
+  assert.deepEqual(Object.keys(q), ['reusable', 'kind'], 'no `matches` question while no skill exists');
+  assert.deepEqual(q.reusable, { type: 'noul', instructions: 'The session worked out a multi-step procedure that would apply in other projects' });
+  assert.deepEqual([q.kind.type, typeof q.kind.instructions, Object.keys(q.kind.criteria), Object.values(q.kind.criteria).every((v) => typeof v === 'string')], ['choice', 'string', ['skill', 'project-knowledge', 'nothing'], true]);
+  // noul is p(yes) only: value = p >= 0.5, confidence = max(p, 1 - p); choice carries its own confidence
+  assert.deepEqual([r.backend, r.gated, r.want_skill, r.distilled, r.skill], ['jev', true, false, true, null]);
+  assert.deepEqual(r.answers, { reusable: { value: false, confidence: 0.75 }, kind: { value: 'project-knowledge', confidence: 0.8 } });
+  assert.deepEqual(b.calls(), ['writer sonnet x-agent-router-source: brain'], 'Jev answered: the classifier model is not called');
+  assert.ok(!existsSync(`${b.vault}/skills/candidates/deploy-worker`), 'the writer\'s skill is dropped when the gate did not ask for one');
+  assert.equal((await b.call('GET', 'stats'))[1].classifier_backend, 'jev');
+
+  fail = true;
+  await b.session('bk', (rid) => worked('bk', rid));
+  const f = (await b.call('POST', 'distill', { session: 'bk' }))[1];
+  assert.deepEqual([reqs.length, f.backend, f.gated, f.skill], [2, 'model', true, 'deploy-worker']);
+  assert.deepEqual(b.calls().slice(1), ['classifier haiku x-agent-router-source: brain', 'writer sonnet x-agent-router-source: brain']);
+  assert.match(b.stdout(), /brain: jev failed \(500\)/);
+  // a skill now exists, so the next gate also asks whether it already covers the session
+  fail = false;
+  await b.session('bm', (rid) => worked('bm', rid));
+  await b.call('POST', 'distill', { session: 'bm' });
+  assert.deepEqual(Object.keys(reqs[2].body.questions.matches.criteria), ['deploy-worker', 'new']);
+  assert.ok(!b.stdout().includes('ts-fake-key'), 'TypeSafe key leaked to stdout');
+  b.noLeak();
+});
+
+test('brain daily cap: spend tagged source=brain over brain_daily_units queues the distill and makes no model call', async (t) => {
+  const b = await brainSetup(t);
+  await b.put({ brain_daily_units: 500 });
+  await b.session('bc', (rid) => worked('bc', rid));
+  b.s.usage = B_USAGE; // 825 units, on a request the brain's own subprocess made
+  await b.msg('own', {}, { 'x-agent-router-source': 'brain' });
+  await b.msg('adv', {}, { 'x-agent-router-source': 'advisor' }); // the advisor's calls are tagged too, and are not brain spend
+  let st = await until(async () => { const s = (await b.call('GET', 'stats'))[1]; return s.spend_today_units && s; }, 'brain spend logged');
+  assert.deepEqual([st.spend_today_units, st.cap_units, st.queued], [B_UNITS, 500, 0]);
+  assert.deepEqual(await b.call('POST', 'distill', { session: 'bc' }), [200, { queued: true }]);
+  assert.deepEqual(b.calls(), [], 'no subprocess call over the cap');
+  assert.deepEqual({ ...(await b.rows(`select queued, gated_ts, distilled_ts from brain_sessions where session_key = 'bc'`))[0] }, { queued: 1, gated_ts: null, distilled_ts: null });
+  st = (await b.call('GET', 'stats'))[1];
+  assert.deepEqual([st.queued, st.distilled], [1, 0]);
+  assert.equal((await b.api('cost')).one_shots.count, 1, 'own calls are not counted with the one-shots (only bc\'s request is)');
+  // raise the cap: the same request goes through and clears the queue flag
+  await b.put({ brain_daily_units: 100000 });
+  assert.equal((await b.call('POST', 'distill', { session: 'bc' }))[1].distilled, true);
+  assert.equal((await b.rows(`select queued from brain_sessions where session_key = 'bc'`))[0].queued, 0);
+  b.noLeak();
+});
+
+test('brain skills: import by URL (https only, 200 KB, text, must be a skill), promote with marker, unmarked dir is never touched, demote, recall, uses counted', async (t) => {
+  const skill = (name: string) => `---\nname: ${name}\ndescription: >\n  Use when working with PDFs:\n  split, merge.\n---\n\n1. Run \`qpdf --split-pages in.pdf\`\n<!-- hidden -->\n`;
+  const web = createServer((req, res) => {
+    const text = (body: string, type = 'text/plain; charset=utf-8') => res.writeHead(200, { 'content-type': type }).end(body);
+    if (req.url === '/a/SKILL.md') return text(skill('pdf-tools'));
+    if (req.url === '/raw/o/r/main/skills/gh-blob/SKILL.md' || req.url === '/raw/o/r/v1.2/skills/gh-tree/SKILL.md') return text(skill(req.url.split('/')[6]));
+    if (req.url === '/b/SKILL.md') return text(skill('second-skill'), 'text/markdown');
+    if (req.url === '/redir') return res.writeHead(302, { location: '/b/SKILL.md' }).end();
+    if (req.url === '/loop') return res.writeHead(302, { location: '/loop' }).end();
+    if (req.url === '/out') return res.writeHead(302, { location: 'http://example.com/SKILL.md' }).end();
+    if (req.url === '/big') return text(skill('big-skill') + 'x'.repeat(210 << 10));
+    if (req.url === '/readme') return text('# Not a skill\n');
+    if (req.url === '/badname') return text(skill('Bad Name'));
+    if (req.url === '/bin') return text(skill('bin-skill'), 'application/octet-stream');
+    res.writeHead(404).end();
+  });
+  const port = await listen(web), url = (p: string) => `http://127.0.0.1:${port}${p}`;
+  t.after(() => web.close());
+  const b = await brainSetup(t, { GITHUB_RAW_URL: `http://127.0.0.1:${port}/raw` }), imp = (u: string) => b.call('POST', 'skills/import', { url: u });
+
+  assert.deepEqual(await imp(url('/a/SKILL.md')), [201, { name: 'pdf-tools', description: 'Use when working with PDFs: split, merge.', status: 'candidate', source: url('/a/SKILL.md') }]);
+  assert.equal(b.read('skills/candidates/pdf-tools/SKILL.md'), skill('pdf-tools'), 'stored verbatim');
+  assert.ok(!existsSync(`${b.skills}/pdf-tools`), 'an import is never promoted by itself');
+  assert.deepEqual((await imp(url('/redir')))[0], 201, 'one redirect is followed');
+  assert.deepEqual([(await imp(url('/big')))[0], (await imp(url('/loop')))[0], (await imp(url('/missing')))[0]], [413, 502, 502]);
+  assert.deepEqual(await imp(url('/readme')), [422, { error: { type: 'not_a_skill', message: 'no YAML frontmatter' } }]);
+  assert.deepEqual([(await imp(url('/badname')))[1].error.message, (await imp(url('/bin')))[1].error.type], ['frontmatter `name` must be kebab-case, at most 64 characters', 'not_text']);
+  for (const bad of ['http://example.com/SKILL.md', `http://localhost:${port}/a/SKILL.md`, 'ftp://x/SKILL.md', 'file:///etc/passwd', url('/out')]) assert.deepEqual(await imp(bad), [400, { error: { type: 'https_only' } }], bad);
+  assert.deepEqual((await imp('not a url'))[0], 400);
+  assert.deepEqual((await imp(url('/a/SKILL.md')))[0], 409, 'a name that exists is not overwritten');
+  assert.deepEqual(readdirSync(`${b.vault}/skills/candidates`).sort(), ['pdf-tools', 'second-skill']);
+  // github.com page URLs are rewritten to the raw file: /blob/<ref>/<path>, and /tree/<ref>/<dir> -> <dir>/SKILL.md
+  assert.deepEqual([(await imp('https://github.com/o/r/blob/main/skills/gh-blob/SKILL.md'))[1].name, (await imp('https://github.com/o/r/tree/v1.2/skills/gh-tree/'))[1].name], ['gh-blob', 'gh-tree']);
+  for (const n of ['gh-blob', 'gh-tree']) assert.equal((await b.call('POST', `skills/${n}/reject`))[0], 200);
+
+  // promote: copied to the skills dir with a marker
+  assert.deepEqual(await b.call('POST', 'skills/pdf-tools/promote'), [200, { ok: true, name: 'pdf-tools', status: 'promoted' }]);
+  assert.equal(readFileSync(`${b.skills}/pdf-tools/SKILL.md`, 'utf8'), skill('pdf-tools'));
+  assert.equal(JSON.parse(readFileSync(`${b.skills}/pdf-tools/.agent-router`, 'utf8')).source, url('/a/SKILL.md'));
+  // a directory of that name that we did not install: refused, untouched
+  mkdirSync(`${b.skills}/second-skill`); writeFileSync(`${b.skills}/second-skill/SKILL.md`, 'theirs');
+  assert.deepEqual((await b.call('POST', 'skills/second-skill/promote'))[0], 409);
+  assert.equal(readFileSync(`${b.skills}/second-skill/SKILL.md`, 'utf8'), 'theirs');
+  assert.deepEqual([(await b.call('POST', 'skills/nope/promote'))[0], (await b.call('POST', 'skills/..%2F..%2Fx/promote'))[0], (await b.call('POST', 'skills/pdf-tools/reject'))[0]], [404, 404, 409]);
+
+  // a Skill tool call in a transcript counts as a use of that skill
+  await b.session('su', (rid) => jrow('su', { type: 'user', message: { role: 'user', content: 'split this pdf' } }) + tuse('su', rid, 'sk1', 'Skill', { skill: 'pdf-tools' }) + tres('su', 'sk1') + tuse('su', rid, 'sk2', 'Skill', { skill: 'other' }));
+  const st = await until(async () => { const s = (await b.call('GET', 'stats'))[1]; return s.skills[0].uses && s; }, 'skill use counted');
+  assert.deepEqual([st.promoted, st.candidates], [1, 1]);
+  assert.deepEqual(st.skills.map(({ last_used, promoted_ts, ...k }: any) => k), [
+    { name: 'pdf-tools', status: 'promoted', uses: 1, sessions: 1, projects: 1, source: url('/a/SKILL.md'), source_session: null, source_units: null },
+    { name: 'second-skill', status: 'candidate', uses: 0, sessions: 0, projects: 0, source: url('/redir'), source_session: null, source_units: null }]);
+  assert.ok(st.skills[0].last_used > 0 && st.skills[0].promoted_ts > 0);
+  assert.deepEqual((await b.rows(`select name, arg from tool_uses where name = 'Skill' order by id`)).map((r) => r.arg), ['pdf-tools', 'other']);
+  assert.match(b.read('skills/pdf-tools.md'), /Status: promoted since \d{4}-\d\d-\d\d · Source: http:\/\/127\.0\.0\.1/);
+
+  // demote removes only what carries the marker; reject deletes the candidate
+  assert.deepEqual((await b.call('POST', 'skills/pdf-tools/demote'))[1].status, 'candidate');
+  assert.ok(!existsSync(`${b.skills}/pdf-tools`) && existsSync(`${b.vault}/skills/candidates/pdf-tools/SKILL.md`) && !existsSync(`${b.vault}/skills/pdf-tools.md`));
+  assert.deepEqual((await b.call('POST', 'skills/second-skill/reject'))[1].status, 'rejected');
+  assert.ok(!existsSync(`${b.vault}/skills/candidates/second-skill`) && existsSync(`${b.skills}/second-skill/SKILL.md`));
+  // the recall skill installs under the same rule
+  mkdirSync(`${b.skills}/brain`);
+  assert.deepEqual((await b.call('POST', 'recall'))[0], 409);
+  rmSync(`${b.skills}/brain`, { recursive: true });
+  assert.deepEqual(await b.call('POST', 'recall'), [200, { ok: true, name: 'brain', status: 'promoted' }]);
+  const recall = readFileSync(`${b.skills}/brain/SKILL.md`, 'utf8');
+  assert.ok(/^---\nname: brain\ndescription: Recall past work[^\n]+\n---\n/.test(recall) && recall.includes(`${b.vault}/index.md`));
+  assert.ok(existsSync(`${b.skills}/brain/.agent-router`));
+  assert.deepEqual(readdirSync(b.skills).sort(), ['brain', 'second-skill']);
+  b.noLeak();
+});
+
+test('brain safety: writes are 409 until enabled, API paths cannot leave the vault, the renderer escapes HTML and only links http(s)', async (t) => {
+  const b = await brainSetup(t, {}, false);
+  assert.deepEqual((await b.api('settings')).brain_enabled, false, 'off by default');
+  for (const [m, p] of [['POST', 'capture'], ['POST', 'distill'], ['POST', 'consolidate'], ['POST', 'skills/import'], ['POST', 'skills/x/promote'], ['POST', 'recall'], ['PUT', 'facts']])
+    assert.deepEqual(await b.call(m, p, { session: 's', url: 'https://example.com/SKILL.md', text: 'x' }), [409, { error: { type: 'brain_disabled' } }], p);
+  assert.ok(!existsSync(b.vault) && !existsSync(b.skills), 'nothing is written while disabled');
+  assert.deepEqual([(await b.call('GET', 'stats'))[1].enabled, (await b.call('GET', 'tree'))[1].files], [false, []]);
+  for (const bad of [{ brain_distill: 'always' }, { classifier: 'gpt' }, { brain_confidence: 2 }, { brain_daily_units: '200k' }, { brain_enabled: 'yes' }, { brain_dir: 'relative/dir' }]) assert.equal((await b.put(bad)).status, 400, JSON.stringify(bad));
+  assert.equal((await b.put({ brain_enabled: true, brain_distill: 'on_idle', brain_dir: null })).status, 200);
+
+  assert.deepEqual(await b.call('PUT', 'facts', { text: '# Facts\n\nDeploys go through wrangler.\n' }), [200, { ok: true }]);
+  assert.equal((await b.call('PUT', 'facts', { text: 'x'.repeat(9000) }))[0], 400);
+  const note = (p: string) => b.call('GET', `note?path=${encodeURIComponent(p)}`);
+  assert.deepEqual((await note('CRITICAL_FACTS.md'))[1], { path: 'CRITICAL_FACTS.md', abs: `${b.vault}/CRITICAL_FACTS.md`, text: '# Facts\n\nDeploys go through wrangler.\n', session: null });
+  writeFileSync(`${b.tmp}/outside.md`, 'OUTSIDE');
+  symlinkSync(`${b.tmp}/outside.md`, `${b.vault}/wiki/link.md`);
+  for (const bad of ['../outside.md', 'wiki/../../outside.md', '/etc/passwd', `${b.tmp}/outside.md`, 'wiki/link.md', '']) assert.deepEqual(await note(bad), [400, { error: { type: 'bad_path' } }], bad);
+  assert.equal((await note('wiki/missing.md'))[0], 404);
+  assert.deepEqual((await b.call('GET', 'tree'))[1], { dir: b.vault, files: ['CRITICAL_FACTS.md', '_CLAUDE.md', 'log.md'] }, 'symlinks are not listed');
+  assert.deepEqual((await b.call('GET', 'search?q=WRANGLER'))[1], [{ path: 'CRITICAL_FACTS.md', line: 3, snippet: 'Deploys go through wrangler.' }]);
+  assert.deepEqual((await b.call('GET', 'search?q=x'))[1], []);
+
+  // the renderer, loaded from the page itself
+  const page = readFileSync(new URL('./ui.html', import.meta.url), 'utf8');
+  const md = new Function(`${page.slice(page.indexOf('// md:begin'), page.indexOf('// md:end'))}; return md;`)() as (s: string) => string;
+  const html = md(['---', 'title: "<script>alert(0)</script>"', '---', '# Head <script>alert(1)</script>', '<!-- agent-router:begin -->', '<img src=x onerror=alert(2)>', '- item **bold** `code <b>`',
+    '[x](javascript:alert(3))', '[y](JaVaScRiPt:alert(4))', '[d](data:text/html,<script>alert(5)</script>)', '[q](https://a.b/"onmouseover="alert(6))', '[ok](https://example.com/a?b=1&c=2)',
+    '[[wiki/projects/proj-x|proj]] and [[2026-10-01 note]]', '[[a" onclick="alert(7)]]', '<a href="javascript:alert(8)">raw</a>', '```', '<script>alert(9)</script>', '```', '| a | <b>b</b> |'].join('\n'));
+  assert.deepEqual([...new Set(html.match(/<\/?[a-zA-Z][\w-]*/g))].sort(), ['</a', '</b', '</code', '</h1', '</li', '</p', '</pre', '</table', '</td', '</tr', '</ul', '<a', '<b', '<code', '<h1', '<li', '<p', '<pre', '<table', '<td', '<tr', '<ul'], 'only tags the renderer makes');
+  assert.ok(!/<script|<img/i.test(html) && !/href="(?!https?:\/\/|#brain")/i.test(html), html);
+  assert.deepEqual(html.match(/<a [^>]*>/g), ['<a href="https://a.b/&#34;onmouseover=&#34;alert(6" target="_blank" rel="noopener noreferrer">', '<a href="https://example.com/a?b=1&#38;c=2" target="_blank" rel="noopener noreferrer">',
+    '<a href="#brain" data-wl="wiki/projects/proj-x">', '<a href="#brain" data-wl="2026-10-01 note">', '<a href="#brain" data-wl="a&#34; onclick=&#34;alert(7)">']);
+  assert.match(html, /<li>item <b>bold<\/b> <code>code &#60;b&#62;<\/code><\/li>/);
+  assert.ok(html.includes('[x](javascript:alert(3))') && !html.includes('agent-router:begin'), 'a refused link stays visible as text; our markers are hidden');
+  b.noLeak();
 });

@@ -280,3 +280,58 @@ not per session: the cheapest fallback is the account that recently served the s
 - **Clock:** `ledger.ts now()` = `Date.now()` + a skew that only `POST /router/clock {skew_ms}` (DRILLS=1) sets; request rows and budget
   windows both use it. The period-roll test moves it a day forward.
 
+
+## Brain (2026-10-01)
+Spec: `docs/BRAIN.md`. Code: `brain.ts` (+ hooks in router/tailer/console/advisor/ledger). Off by default; nothing is written until `brain_enabled`.
+- **Tagging the router's own model calls.** `ANTHROPIC_CUSTOM_HEADERS` is honoured by CLI 2.1.268 (format `Name: value`, verified live against the
+  dev router): `advisor.ts claude()` sets `x-agent-router-source: brain|advisor`, and both `/v1/messages` requests of a `claude -p` carried it
+  (the `/api/hello` probe does not). The router stores it in `requests.source` and strips the header before dialing (it is in `SKIP_REQ`).
+  Brain spend today = `sum(UNITS)` where `source = 'brain'` since local midnight. Rows with a `source` are left out of `turns()` (so out of
+  Cache, Cost, one-shots, Insights, timeline) and out of the Sessions view; budgets still count them. No `--session-id` fallback was needed.
+- **A bare `claude -p` is expensive, a lean one is not** (same one-line prompt, haiku, measured on the dev router):
+  | flags | turn request | title request |
+  | --- | --- | --- |
+  | none (what the advisor used so far) | 21,019 tokens of prefix (cache write), 36 MCP tools | 899 in |
+  | `--strict-mcp-config` | 7,674 (cache write), 0 tools | 899 in |
+  | `--strict-mcp-config --disable-slash-commands --system-prompt …` | 1,758 in | 899 in |
+  | `--safe-mode` | 3,343 in | 899 in |
+  | `--safe-mode --system-prompt …` | 360–377 in | 899 in |
+  | `--safe-mode --system-prompt … --name x` | 377 in | none |
+  | … + `MAX_THINKING_TOKENS=0` | 347 in, 4 out (was 43–71 out) | none |
+  The body dump showed why: plugin `SessionStart` hook output (5.3k chars of someone's style plugin) was being injected as a `<system-reminder>`
+  into the advisor's prompt; the "title request" is the CLI naming the session, and it re-sends the *whole prompt* (5.4k and 7.4k tokens for a
+  real classifier and writer call); thinking was on with a 32k budget; and the prompt was written to the 1h cache (2×) that a one-shot never
+  reads. The runner now always passes `--safe-mode --system-prompt <one line> --name "agent-router <source>"` and sets `MAX_THINKING_TOKENS=0`,
+  `DISABLE_PROMPT_CACHING=1`. This applies to the advisor too. `--safe-mode` still reads `env` from `~/.claude/settings.json` (checked with a
+  throwaway HOME whose settings pointed at the dev port: the request arrived there), so CLI-only installs keep routing through the router.
+- **Jev wire shapes, confirmed from docs.typesafe.ai (`/introduction/quickstart`, `/primitives/choice`, `/primitives/noul`):**
+  `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer <key>`, body `{state, model: "jev-latest", questions: {<id>: {type, instructions, criteria?}}}`.
+  choice: `criteria` is an object `{option: description}`; answer `{type: "choice", choice, confidence, probabilities: {option: p}}`.
+  noul: `criteria` is optional, an object `{true, false}`; answer is **only** `{type: "noul", noul: p}` (p of yes) — no `confidence`, no
+  `probabilities` (BRAIN.md had assumed both). So `classify()` maps noul to `{value: p >= 0.5, confidence: max(p, 1 - p)}`. Response top level:
+  `{model, answers, usage: {input_tokens, output_tokens}}`. Not stated in those pages: error bodies/status codes (any non-2xx or malformed
+  answer falls back to the model backend) and whether a one-option choice is accepted (so `matches` is only asked once a skill exists).
+  No TypeSafe key on this machine: Jev runs only against the fake server in the test. Its usage is not in units (another vendor's bill).
+- **Model backend** returns the same `{answers: {key: {value, confidence}}}`; ```` ```json ```` fences and prose around the object are tolerated; an
+  answer that fails validation (missing key, confidence outside 0–1, a choice not among the criteria) is no gate at all, logged once.
+  First real run answered `reusable: false` with confidence 0.35 (it gave p(yes)); the prompt now says confidence is about the value given.
+- **Gate rule:** pre-filter `tool_calls >= 8 and (files written or commands run)`; then the writer runs iff `kind != nothing` at
+  `>= brain_confidence`; a skill is wanted only for `kind = skill` with `reusable = true` at that confidence and `matches = new` (or an unsure
+  match). The writer's `skill` is dropped unless wanted. "Distill anyway" (`force`) skips both.
+- **Capture reads** user rows minus `isMeta`/`isSidechain`/`isCompactSummary`/`isVisibleInTranscriptOnly`, minus rows whose `origin.kind` is not
+  `human` (peer and task notifications), minus text starting with `<` (`<task-notification>`, `<command-name>`, `<bash-input>` …). A Bash
+  command is listed only if its `tool_result` exists and is not `is_error`. Transcript path: `requests.jsonl_path`, else
+  `<projects>/*/<session>.jsonl` by name (sessions from before the router, or never routed, have no joined request).
+- **Dry run, dev router on a copy of the live ledger, real transcripts:** capture of everything: 49 sessions looked at, 42 notes written
+  (the other 7 have no transcript on disk) in 0.43–0.47 s; vault 65 files, ~400 KB; no secret-shaped string in any note (the only `sk-ant` /
+  `Bearer` hits were grep patterns the user had typed). One real session (climatefluent, 96 turns, 2.5M units, 146 tool calls):
+  | run | classifier (haiku) | writer (sonnet) | wall |
+  | --- | --- | --- | --- |
+  | bare runner | 22,726 units (2 requests) | 28,123 units (2 requests) | 22 s |
+  | lean runner | 5,526 units (5,151 in / 75 out, 1.6 s) | 10,865 units (6,870 in / 799 out, 9.2 s) | 14 s |
+  | lean, forced (skill wanted) | — | 15,305 units (7,485 in / 1,564 out, 16.3 s) | 18 s |
+  Gate (model): `reusable = false (0.85)`, `kind = project-knowledge (0.90)` → distilled, no skill asked for; 3 decisions, 3 learnings,
+  5 open threads on the project note. The forced run produced a valid candidate (`verify-referral-links-after-route-change`). At ~16k units
+  a session the 200k default cap is about 12 distills a day.
+- **Not built:** the per-prompt recall hook (the `brain` skill is the recall path), bundled scripts in imported skills, vector search
+  (search is a substring scan), automatic demotion (unused-for-30-days is a chip in the console).

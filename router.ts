@@ -14,6 +14,7 @@ import { db, logRequest, settings, putSetting, DEFAULTS, now, clock } from './le
 import { startTailer, joined } from './tailer.ts';
 import { consoleApi, util, timeline, advice, budgetStatus, fmtUnits } from './console.ts';
 import { CLAUDE_BIN, handoff, notify, title } from './advisor.ts';
+import { brainApi, startBrain } from './brain.ts';
 import { type Account, listAccounts, getAccount, setAcct, healthy, token, forget, expiresAt } from './accounts.ts';
 
 const { UPSTREAM_IP, UPSTREAM_CA, TLS_DIR = `${homedir()}/.agent-router/ca` } = process.env;
@@ -21,8 +22,8 @@ const UP_HOST = process.env.UPSTREAM_HOST ?? 'api.anthropic.com', UP_PORT = Numb
 const UP_TRUST = UPSTREAM_CA ? [...rootCertificates, readFileSync(UPSTREAM_CA, 'utf8')] : undefined;
 const PORT = Number(process.env.PORT ?? 4001), TLS_PORT = Number(process.env.TLS_PORT ?? 443);
 const DUMP = process.env.DUMP_BODIES_DIR;
-// host/content-length recomputed; the rest are hop-by-hop
-const SKIP_REQ = new Set(['host', 'content-length', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'expect', 'te', 'trailer', 'proxy-connection']);
+// host/content-length recomputed; x-agent-router-source is ours (stored in requests.source, never sent upstream); the rest are hop-by-hop
+const SKIP_REQ = new Set(['host', 'content-length', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'expect', 'te', 'trailer', 'proxy-connection', 'x-agent-router-source']);
 // the body is piped raw, so content-encoding/content-length/transfer-encoding still describe it; only hop-by-hop goes
 const SKIP_RES = new Set(['connection', 'keep-alive']);
 
@@ -257,7 +258,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
   const isMsg = req.method === 'POST' && pathname === '/v1/messages';
   const key = sessionKey(parsed), model = typeof parsed.model === 'string' ? parsed.model : null;
-  const est = Math.round(body.length / 4);
+  const est = Math.round(body.length / 4), src = String(req.headers['x-agent-router-source'] ?? '');
   let fp: Record<string, any> = {};
   if (isMsg) {
     try { fp = fingerprint(parsed, decode(body).length); } catch {}
@@ -269,7 +270,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   const log = (account_id: string, status: number, request_id: string | null, ratelimit_json: string, retry_of: number | null, usage: Record<string, any> = {}) => {
     const row = {
       ts: start, request_id, session_key: key, account_id, method: req.method!, path: req.url!, model,
-      status, latency_ms: now() - start, stream: parsed.stream === true ? 1 : 0, retry_of, ratelimit_json, ...fp, ...usage,
+      status, latency_ms: now() - start, stream: parsed.stream === true ? 1 : 0, retry_of, ratelimit_json, source: /^[\w-]{1,32}$/.test(src) ? src : null, ...fp, ...usage,
     };
     console.log(new Date(start).toISOString(), row.method, row.path, status, row.latency_ms, request_id, model, account_id);
     try { const id = logRequest(row); joined(request_id); return id; } catch (e: any) { console.error('ledger insert failed:', e.message); return null; }
@@ -377,10 +378,10 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
   if (m === 'GET' && what === 'stats') return json(res, 200, all('select * from requests order by id desc limit 100'));
   if (m === 'GET' && what === 'settings') return json(res, 200, settings());
   if (m === 'PUT' && what === 'settings') {
-    const enums: Record<string, string[]> = { policy: ['sticky_least_utilized', 'prefer_home_until_80', 'manual'] };
+    const enums: Record<string, string[]> = { policy: ['sticky_least_utilized', 'prefer_home_until_80', 'manual'], brain_distill: ['manual', 'on_idle'], classifier: ['auto', 'jev', 'model'] };
     for (const [k, v] of Object.entries(input ?? {})) {
-      const d = DEFAULTS[k], ok = !(k in DEFAULTS) ? false : k.endsWith('_pct') ? typeof v === 'number' && v >= 0 && v <= 1
-        : enums[k] ? enums[k].includes(v as string) : d === null ? v === null || typeof v === 'string'
+      const d = DEFAULTS[k], ok = !(k in DEFAULTS) ? false : k.endsWith('_pct') || k === 'brain_confidence' ? typeof v === 'number' && v >= 0 && v <= 1
+        : enums[k] ? enums[k].includes(v as string) : k === 'brain_dir' ? v === null || (typeof v === 'string' && /^(~|\/)/.test(v)) : d === null ? v === null || typeof v === 'string'
         : k === 'context_rules' ? Array.isArray(v) : k === 'budgets' ? okBudgets(v) : typeof d !== 'object' ? typeof v === typeof d : typeof v === 'object' && v !== null && !Array.isArray(v);
       if (!ok) return json(res, 400, { error: { type: 'invalid_setting', key: k } });
     }
@@ -399,6 +400,7 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
     const r = await handoff(id);
     return !r ? json(res, 404, { error: { type: 'no_transcript' } }) : r.text ? json(res, 200, r) : json(res, 502, { error: { type: 'advisor_failed' } });
   }
+  if (what === 'brain') return json(res, ...(await brainApi(m!, path.split('/').slice(3).map(decodeURIComponent), url.searchParams, input)));
   if (m === 'GET' && what === 'migrations') return json(res, 200, all('select * from migrations order by ts desc limit 100'));
   if (m === 'GET' && what === 'accounts') return json(res, 200, accountsView());
   if (DRILLS && m === 'POST' && what === 'clock') { clock.skew = Number(input.skew_ms) || 0; console.warn(`DRILL clock skew ${clock.skew} ms`); return json(res, 200, { ok: true, skew_ms: clock.skew }); }
@@ -469,3 +471,4 @@ else createTls(cert, handler)
   .on('error', (e: any) => console.error(`transparent mode off (:${TLS_PORT} ${e.code})`))
   .listen(TLS_PORT, '::', () => { tlsOn = true; console.log(`transparent mode on https://api.anthropic.com:${TLS_PORT} (loopback only)`); });
 startTailer();
+startBrain();

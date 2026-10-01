@@ -15,6 +15,8 @@ not a way to share one account between people. MIT licensed.
 - **Ledger.** Every request joined to your session transcripts by request id: cache read/write per turn, bursts and
   why they happened, per-window headroom, per-session cost.
 - **Console** at `http://localhost:4001/router/`: accounts, sessions (switch with one click), cache manager, budgets, insights.
+- **Brain** (optional, off by default). Plain Markdown notes about your past sessions, and skills extracted from them, so the
+  next session looks things up instead of working them out again.
 
 
 ## What it looks like
@@ -96,6 +98,40 @@ curl -X PUT localhost:4001/router/settings -d '{"budgets": [
 A project is the basename of the session's working directory, known once the session's transcript has been read: the first
 request or two of a brand-new session are not counted against (or stopped by) a project budget.
 
+## Brain
+
+Off until you enable it in the console's **Brain** tab (or `PUT /router/settings {"brain_enabled": true}`). It writes plain
+Markdown into one folder, `~/agent-router-brain` by default (`brain_dir`), laid out so it opens as an Obsidian vault:
+
+```
+_CLAUDE.md  index.md  CRITICAL_FACTS.md  log.md
+wiki/logs/       one note per session: what you asked, files written, commands that worked, tools, subagents, account switches
+wiki/projects/   one note per project: dated decisions, learnings and open threads, plus its sessions
+wiki/daily/      one note per day: sessions and spend
+skills/          one note per promoted skill;  skills/candidates/<name>/SKILL.md  awaiting your review
+```
+
+- **Capture is free.** A session that has been idle for 15 minutes gets its note straight from its transcript; no model is
+  called. Prompts are cut to 300 characters, commands to 200, obvious secrets (API keys, bearer tokens, `password=`, private
+  keys) are redacted, tool output is never copied. Text you write outside the `<!-- agent-router:begin/end -->` markers is kept.
+- **Distilling spends quota, and only when asked.** Click **Distill** on a session (or set `brain_distill` to `on_idle`). A
+  classifier first decides whether the session is worth it: [TypeSafe's Jev](https://docs.typesafe.ai) if you have a key
+  (`TYPESAFE_API_KEY` or `~/.agent-router/typesafe.key`), otherwise Haiku. Only then does Sonnet write the summary, the dated
+  bullets for the project note and, when the session worked out a reusable procedure, a skill candidate. Both models run
+  through your own `claude` CLI and this router; their requests are tagged, summed in the same units as budgets, and stop at
+  `brain_daily_units` (200k a day by default). Over the cap, work is queued for the next day.
+- **Skills go candidate → promoted, by hand.** A candidate (extracted, or imported from an https URL to one `SKILL.md`) is just
+  a file in the vault. **Promote** copies it to `~/.claude/skills/<name>/` with a marker file, so every new session loads it;
+  a skill directory the router did not install is never overwritten. **Demote** removes it again, **Reject** deletes the
+  candidate. The console counts each skill's uses from `Skill` tool calls in your transcripts and flags promoted skills
+  unused for 30 days. No savings are claimed.
+- **Recall.** *Install recall skill* adds a small `brain` skill that tells Claude to read the vault's index and at most three
+  notes when you refer to past work.
+
+Settings: `brain_enabled`, `brain_dir`, `brain_distill` (`manual` | `on_idle`), `brain_daily_units`, `classifier`
+(`auto` | `jev` | `model`), `brain_classifier_model` (`haiku`), `brain_writer_model` (`sonnet`), `brain_confidence` (0.7).
+Design and the choices behind it: `docs/BRAIN.md`.
+
 ## Day to day
 
 ```bash
@@ -124,12 +160,13 @@ which ignores that setting.
 ## Development
 
 ```bash
-node --test test_router.ts   # 22 tests, fake upstream, no network
+node --test test_router.ts   # 28 tests, fake upstream, no network
 ```
 
-`router.ts` proxy + routing · `accounts.ts` token store · `tailer.ts` transcript join · `console.ts` analytics · `advisor.ts` context advisor ·
+`router.ts` proxy + routing · `accounts.ts` token store · `tailer.ts` transcript join · `console.ts` analytics · `advisor.ts` context advisor · `brain.ts` notes and skills ·
 `ui.html` console · `agent-router.sh` install/status/uninstall. Plan and findings: `PLAN.md`, `NOTES.md`, `docs/`.
 
 Tokens are read from the official CLI's credential store at request time; a refreshed token is written back to that same
 store (the CLI's own) and never written to the ledger, logs or UI.
-No request bodies are stored — only hashes, counts and token totals.
+The ledger stores no request bodies — only hashes, counts and token totals. The optional brain, when you enable it, writes
+excerpts of your own prompts and commands to a folder you choose.

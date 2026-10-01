@@ -21,12 +21,19 @@ export function windowOf(model: string | null, ctx = 0) {
 
 // `claude -p` with the prompt on stdin. Env minus CLAUDE_CODE_* / ANTHROPIC_* so the child is a plain CLI on the user's login
 // (it still reaches the API through this router, like any other client). null on any failure; never throws.
-export function claude(prompt: string): Promise<string | null> {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CLAUDE_CODE_|ANTHROPIC_)/.test(k)));
+// ANTHROPIC_CUSTOM_HEADERS tags the child's requests: the router stores the value in requests.source and strips the header.
+// A bare `claude -p` adds ~21k tokens of system prompt, MCP tools, skills and plugin hook output to every call, names the session with a
+// second request that re-sends the whole prompt, thinks, and writes a 1h cache nobody reads. LEAN + the env below remove all four
+// (measured in NOTES.md "Brain"): what is billed is the prompt and the answer.
+const LEAN = ['--safe-mode', '--system-prompt', 'You are a precise text-processing function. Follow the instructions in the message exactly and output only what it asks for.'];
+export function claude(prompt: string, o: { model?: string; source?: string; timeout?: number } = {}): Promise<string | null> {
+  const source = o.source ?? 'advisor';
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CLAUDE_CODE_|ANTHROPIC_)/.test(k))), ANTHROPIC_CUSTOM_HEADERS: `x-agent-router-source: ${source}`,
+    MAX_THINKING_TOKENS: '0', DISABLE_PROMPT_CACHING: '1' };
   return new Promise((ok) => {
-    const c = execFile(CLAUDE_BIN, ['-p', '--model', settings().advisor_model, '--output-format', 'text', '--no-session-persistence', '--tools', ''],
-      { env, cwd: tmpdir(), timeout: 60_000, maxBuffer: 1 << 20 }, (e, out) => {
-        if (e || !out.trim()) console.log(`advisor: ${CLAUDE_BIN} failed (${e ? e.code ?? e.signal ?? 'exit' : 'empty output'})`);
+    const c = execFile(CLAUDE_BIN, ['-p', '--model', o.model ?? settings().advisor_model, '--output-format', 'text', '--no-session-persistence', '--tools', '', '--name', `agent-router ${source}`, ...LEAN],
+      { env, cwd: tmpdir(), timeout: o.timeout ?? 60_000, maxBuffer: 1 << 20 }, (e, out) => {
+        if (e || !out.trim()) console.log(`${source}: ${CLAUDE_BIN} failed (${e ? e.code ?? e.signal ?? 'exit' : 'empty output'})`);
         ok(e ? null : out.trim() || null);
       });
     c.stdin!.on('error', () => {}).end(prompt);

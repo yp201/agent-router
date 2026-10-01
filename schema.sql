@@ -45,7 +45,8 @@ create table if not exists requests (
   context_est integer,                -- decoded body bytes / 4
   tool_names_json text,               -- tool names only (no schemas), stored the first time a tools_hash is seen
   ua_kind text,                       -- 'desktop' | 'cli' from the inbound user-agent
-  agent_id text                       -- subagent that made it (from <session>/subagents/agent-<id>.jsonl); null = the session itself
+  agent_id text,                      -- subagent that made it (from <session>/subagents/agent-<id>.jsonl); null = the session itself
+  source text                         -- inbound x-agent-router-source ('brain' | 'advisor'): the router's own model calls; null = a client
 );
 create table if not exists migrations (
   ts integer, session_key text, from_account text, to_account text,
@@ -57,7 +58,7 @@ create table if not exists migrations (
 );
 create index if not exists requests_session_ts on requests(session_key, ts);
 create table if not exists agents (agent_id text primary key, session_key text, name text, first_ts integer, last_ts integer); -- subagents
-create table if not exists tool_uses (id text primary key, request_id text, name text); -- tool_use blocks from transcripts
+create table if not exists tool_uses (id text primary key, request_id text, name text, arg text); -- tool_use blocks from transcripts; arg = skill name, Skill tool only
 create table if not exists tail_offsets (path text primary key, offset integer);   -- tailer resume points
 -- context advisor: one row per session per level ('warn' | 'urgent'), plus 'handoff' summaries; names/targets/sizes only, never tool output
 create table if not exists advice (id integer primary key, session_key text, ts integer, level text, pct real, context_total integer, window integer,
@@ -66,3 +67,8 @@ create table if not exists settings (key text primary key, value text);         
 create index if not exists requests_ts on requests(ts);
 -- budgets (settings.budgets): one row the first time a budget crosses a threshold in a period; dedupes notifications, doubles as history
 create table if not exists budget_events (budget_id text, period_key text, threshold real, ts integer);
+-- brain (brain.ts): what was captured / gated / distilled per session, and every skill candidate it knows
+create table if not exists brain_sessions (session_key text primary key, last_captured_ts integer, note_path text, gate_json text, gate_backend text,
+  gated_ts integer, distilled_ts integer, skill_candidate text, queued integer default 0);
+create table if not exists brain_skills (name text primary key, status text, -- 'candidate' | 'promoted' | 'rejected'
+  source text, source_session text, created_ts integer, promoted_ts integer);

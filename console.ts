@@ -4,7 +4,7 @@ import { windowOf, title } from './advisor.ts';
 
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
-const MSG = (t = '') => `(${t}path = '/v1/messages' or ${t}path like '/v1/messages?%')`;
+export const MSG = (t = '') => `(${t}path = '/v1/messages' or ${t}path like '/v1/messages?%')`;
 const RL = 'anthropic-ratelimit-unified-';
 // a window whose reset has passed reads 0 utilization (headers are only refreshed by the next response)
 export const util = (json: string | null, w: '5h' | '7d', k = 'utilization'): number | null => {
@@ -37,11 +37,12 @@ const FIX: Record<string, string> = {
 };
 
 // /v1/messages rows (2xx/3xx) since `since`, each annotated with `i` (turn in session), `switched`, and `burst`.
+// The router's own advisor/brain calls (requests.source) are not turns of anyone's session and are left out.
 function turns(since: number, session?: string | null) {
   const rows = all(`select r.id, r.ts, r.request_id, r.session_key, r.account_id, r.model, r.latency_ms, r.status, r.agent_id, r.tools_hash, r.tools_count,
       r.system_hash, r.first_user_hash, r.msg_count, r.context_est, r.cache_read, r.cache_create, r.in_tok, r.out_tok, ${UNITS('r.')} units,
       exists (select 1 from migrations m where r.request_id is not null and m.request_id = r.request_id) migrated
-    from requests r where ${MSG()} and status < 400 and session_key is not null and ts >= ? ${session ? 'and session_key = ?' : ''} order by ts`,
+    from requests r where ${MSG()} and status < 400 and session_key is not null and source is null and ts >= ? ${session ? 'and session_key = ?' : ''} order by ts`,
     ...(session ? [since, session] : [since]));
   const by = new Map<string, any[]>();
   for (const r of rows) { const k = r.session_key ?? '-'; if (!by.has(k)) by.set(k, []); by.get(k)!.push(r); }
@@ -129,7 +130,8 @@ function sessions() {
         where r.session_key = s.session_key and r.context_est is not null order by r.ts desc limit 1) context_est,
       (select actual_cost_tokens from migrations m where m.session_key = s.session_key and actual_cost_tokens is not null order by ts desc limit 1) last_switch_cost_actual,
       (select ua_kind from requests r where r.session_key = s.session_key and ua_kind is not null order by r.ts desc limit 1) source
-    from sessions s where account_id is not null order by last_ts desc limit 100`) // transcript-only rows (a title, never routed) have no pin
+    from sessions s where account_id is not null and not exists (select 1 from requests r where r.session_key = s.session_key and r.source is not null)
+    order by last_ts desc limit 100`) // transcript-only rows (a title, never routed) have no pin; source = the router's own advisor/brain calls
     .map((s) => {
       // context meter: the main thread's last joined turn (the context that auto-compacts), same basis as the advisor
       const m = one(`select in_tok + cache_read + cache_create ctx, model from requests where session_key = ? and agent_id is null

@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { db, fillActual } from './ledger.ts';
 import { check } from './advisor.ts';
 
-const ROOT = process.env.CLAUDE_PROJECTS_DIR ?? `${homedir()}/.claude/projects`;
+export const ROOT = process.env.CLAUDE_PROJECTS_DIR ?? `${homedir()}/.claude/projects`;
 const CHUNK = 4 << 20; // read in 4 MB slices and yield between them so a big first scan never stalls proxying
 
 // usage is fill-if-null: the router already wrote it from the response stream (usage_src 'stream') for most rows
@@ -27,7 +27,7 @@ const typed = (c: any) => typeof c === 'string' ? c.replace(/<system-reminder>[\
 // the desktop's short subagent label ("description") lives next to the transcript in agent-<id>.meta.json
 const desc = (path: string) => { try { return JSON.parse(readFileSync(path.replace(/\.jsonl$/, '.meta.json'), 'utf8')).description || null; } catch { return null; } };
 const named = new Set<string>(); // files whose first typed prompt was already used this run
-const tool = db.prepare('insert or ignore into tool_uses (id, request_id, name) values (?, ?, ?)');
+const tool = db.prepare('insert or ignore into tool_uses (id, request_id, name, arg) values (?, ?, ?, ?)'); // arg: the skill name, Skill tool only
 const getOff = db.prepare('select offset from tail_offsets where path = ?');
 const setOff = db.prepare('insert into tail_offsets values (?, ?) on conflict (path) do update set offset = excluded.offset');
 
@@ -63,7 +63,7 @@ function line(l: string, path: string) {
   if (r.type !== 'assistant' || !r.requestId || !r.message) return;
   if (sub) agent.run({ id: sub[2], sk: sub[1], ts, force: null, name: null });
   const u = r.message.usage ?? {}, rid = r.requestId;
-  for (const b of r.message.content ?? []) if (b?.type === 'tool_use' && b.id && b.name) tool.run(b.id, rid, b.name);
+  for (const b of r.message.content ?? []) if (b?.type === 'tool_use' && b.id && b.name) tool.run(b.id, rid, b.name, b.name === 'Skill' && typeof b.input?.skill === 'string' ? b.input.skill : null);
   const p = {
     rid, in_tok: u.input_tokens ?? null, out_tok: u.output_tokens ?? null, cache_read: u.cache_read_input_tokens ?? null,
     cache_create: u.cache_creation_input_tokens ?? null, cache_1h: u.cache_creation?.ephemeral_1h_input_tokens ?? null,
