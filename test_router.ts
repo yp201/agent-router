@@ -409,6 +409,17 @@ test('fingerprints: hashes and counts per /v1/messages, tool names only when the
   assert.ok(a.context_est > 50); assert.equal(a.tool_names_json, '["Read","Bash"]');
   assert.equal(b.system_hash, a.system_hash); assert.equal(b.tool_names_json, null); assert.equal(b.ua_kind, 'cli');
   assert.equal(c.tools_count, 3); assert.equal(c.tool_names_json, '["Read","Bash","Grep"]');
+  assert.deepEqual([a.tools_loaded, a.tools_deferred, a.effort, a.speed, a.beta_hash, a.image_count, a.cli_version], [2, 0, null, null, null, 0, '2.1.281']);
+  // cache-key fields: a deferred definition (defer_loading) is in neither the hash, the names nor the loaded count; effort, speed,
+  // the sorted beta list (hashed), image blocks (also inside tool results) and the CLI version are recorded
+  const d0 = body('d', ['Read', 'Bash', 'Grep']);
+  await h.msg('f1', { ...d0, tools: [...d0.tools, { name: 'mcp__x__y', defer_loading: true, input_schema: {} }], output_config: { effort: 'high' }, speed: 'fast',
+    messages: [...d0.messages, { role: 'user', content: [{ type: 'image', source: {} }, { type: 'tool_result', tool_use_id: 't', content: [{ type: 'image', source: {} }] }] }] },
+    { 'anthropic-beta': 'b-2, a-1', 'user-agent': 'claude-cli/2.1.300 (external, cli)' });
+  const d = (await h.rows('select * from requests order by id'))[3];
+  assert.deepEqual([d.tools_count, d.tools_loaded, d.tools_deferred, d.tools_hash, d.tool_names_json, d.effort, d.speed, d.beta_hash, d.image_count, d.cli_version],
+    [4, 3, 1, c.tools_hash, null, 'high', 'fast', h16('a-1,b-2'), 2, '2.1.300']);
+  assert.ok(d.tools_tok > 0 && d.tools_tok < 40, 'size of the loaded definitions only');
   const dir = dirname(h.ledger);
   assert.ok(!readdirSync(dir).map((f) => readFileSync(`${dir}/${f}`, 'latin1')).join('').includes('secret-prompt-text'), 'request body text stored');
   assert.match(h.stdout(), /user-agent shape: claude-cli\/N\.N\.N \(external, claude-desktop\)/);
@@ -488,10 +499,11 @@ test('burst attribution: cold first turn and big growth turn are not bursts; too
   assert.equal(c.turns[0].burst.cause, 'first turn, cold cache');
   assert.equal(c.turns[1].burst, null, 'wrote 30k but added 40k: growth, not a burst');
   assert.deepEqual(c.bursts.map((b: any) => [b.i, b.cause, b.avoidable, b.delta]), [
-    [5, 'idle > 1h, cache TTL expired', false, 64000],
-    [3, 'MCP tool list changed (2 → 3 tools)', true, 30000],
+    [5, 'cache lifetime expired (1h cache, idle 120 min)', false, 64000],
+    [3, 'tool set changed (2 → 3 loaded tools)', true, 30000],
   ]);
-  assert.deepEqual(c.avoidable, { count: 1, total: 2 });
+  assert.deepEqual(c.bursts.map((b: any) => [b.kind, b.usd, b.ttl]), [['expired', null, '1h'], ['tools', null, '1h']], 'claude-haiku-4 is not in the price table: no dollars, never a guess');
+  assert.deepEqual(c.avoidable, { count: 1, total: 2, usd: 0 });
   assert.equal(c.savings_if_avoided_tokens, 30000);
   assert.equal(c.hit_rate, 113990 / (113990 + 145000 + 10040));
 
@@ -501,10 +513,11 @@ test('burst attribution: cold first turn and big growth turn are not bursts; too
   assert.equal(o.live.length, 5); assert.equal(o.live[0].cache, 'write');
   assert.match(o.policy_line, /^new sessions start on home — /);
   const cost = await h.api('cost');
-  assert.ok(Array.isArray(cost.windows['5h'])); assert.equal(cost.dollars, null, 'no rate card -> no dollars');
+  assert.ok(Array.isArray(cost.windows['5h']));
+  assert.deepEqual([cost.usd, cost.unpriced, cost.prices_as_of], [0, 5, '2026-10-01'], 'unpriced requests are counted, not summed');
   const ins = await h.api('insights');
   assert.deepEqual([ins.totals.bursts_avoidable, ins.totals.tokens_saved_est], [1, 30000]);
-  assert.equal(ins.unused_tools.loaded, 3);
+  assert.equal(ins.unused_tools.loaded, 3); assert.equal(ins.unpriced_requests, 5);
   h.noLeak();
 });
 
@@ -690,37 +703,40 @@ test('stream usage: SSE, gzipped SSE, non-stream JSON at log time; malformed SSE
   assert.deepEqual({ ...(await row('sse')) }, { ...full, thinking_tok: 7 });
 });
 
-const B_USAGE = { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 1000, cache_creation_input_tokens: 300, cache_creation: { ephemeral_1h_input_tokens: 200, ephemeral_5m_input_tokens: 100 } };
-const B_UNITS = 100 + 0.1 * 1000 + 1.25 * 100 + 2 * 200 + 5 * 20; // 825
+// one turn on Haiku 4.5 ($/MTok: input 1, 5m write 1.25, 1h write 2, read 0.1, output 5)
+const B_USAGE = { input_tokens: 100e3, output_tokens: 20e3, cache_read_input_tokens: 1e6, cache_creation_input_tokens: 300e3, cache_creation: { ephemeral_1h_input_tokens: 200e3, ephemeral_5m_input_tokens: 100e3 } };
+const B_USD = 0.1 * 1 + 1 * 0.1 + 0.1 * 1.25 + 0.2 * 2 + 0.02 * 5; // $0.825
+const close = (a: number, b: number, what?: string) => assert.ok(Math.abs(a - b) < 1e-9, `${what ?? 'dollars'}: ${a} vs ${b}`);
 async function budgetSetup(t: TestContext) {
   const log = `${mkdtempSync(`${tmpdir()}/router-notify-`)}/notify.log`, proj = mkdtempSync(`${tmpdir()}/router-proj-`);
   const h = await setup(t, { DRILLS: '1', NOTIFY: '0', NOTIFY_LOG: log, CLAUDE_PROJECTS_DIR: proj });
   h.s.usage = B_USAGE;
   // a real turn (tools, so /router/cost does not file it under one-shots); the row and the budget check land just after the response ends
-  const turn = async (session: string) => { const r = await h.msg(session, { tools: [{ name: 'Read', input_schema: {} }] }); await new Promise((ok) => setTimeout(ok, 40)); return r; };
+  const turn = async (session: string) => { const r = await h.msg(session, { model: 'claude-haiku-4-5', tools: [{ name: 'Read', input_schema: {} }] }); await new Promise((ok) => setTimeout(ok, 40)); return r; };
   return { ...h, proj, turn, notes: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []),
     put: (b: unknown) => fetch(`${h.base}/router/settings`, { method: 'PUT', body: JSON.stringify(b) }) };
 }
 
-test('budgets: units formula, project/day budget notifies once at 80% and once at 100%, re-arms when the period rolls', async (t) => {
+test('budgets in dollars: list price per turn, project/day budget notifies once at 80% and once at 100%, rate_card override, re-arms when the period rolls', async (t) => {
   const h = await budgetSetup(t);
   assert.deepEqual((await h.api('settings')).budgets, [], 'no budgets (so no stop) until the user adds one');
   // the session's project comes from its transcript cwd
   mkdirSync(`${h.proj}/-p`);
   writeFileSync(`${h.proj}/-p/b1.jsonl`, JSON.stringify({ type: 'user', sessionId: 'b1', cwd: '/tmp/climatefluent', timestamp: new Date().toISOString(), message: { role: 'user', content: 'hi' } }) + '\n');
   await until(async () => (await h.rows(`select cwd from sessions where session_key = 'b1'`))[0]?.cwd, 'cwd from transcript');
-  const budget = { id: 'cf', name: 'climatefluent / day', scope: 'project', match: 'climatefluent', period: 'day', limit: 2000, action: 'notify', thresholds: [0.8, 1] };
+  const budget = { id: 'cf', name: 'climatefluent / day', scope: 'project', match: 'climatefluent', period: 'day', limit: 2, action: 'notify', thresholds: [0.8, 1] };
   assert.equal((await h.put({ budgets: [budget] })).status, 200);
   const status = async () => (await h.api('budgets'))[0];
 
   await h.turn('b1');
-  h.s.usage = { ...B_USAGE, cache_creation: undefined }; // no 1h/5m split -> the whole cache write at 1.25×
+  h.s.usage = { ...B_USAGE, cache_creation: undefined }; // no 1h/5m split -> the whole cache write at the 5m price
   await h.turn('other');
-  const cost = Object.fromEntries((await h.api('cost')).per_session.map((s: any) => [s.session_key, s.units]));
-  assert.deepEqual(cost, { b1: B_UNITS, other: 100 + 0.1 * 1000 + 1.25 * 300 + 5 * 20 });
+  const cost = Object.fromEntries((await h.api('cost')).per_session.map((s: any) => [s.session_key, s.usd]));
+  close(cost.b1, B_USD); close(cost.other, 0.1 + 0.1 + 0.3 * 1.25 + 0.1);
   h.s.usage = B_USAGE;
   let st = await status();
-  assert.deepEqual([st.spent, st.limit, st.pct, st.state, st.dollars, st.period_end > Date.now()], [B_UNITS, 2000, B_UNITS / 2000, 'ok', null, true], 'only the project counts');
+  close(st.spent, B_USD, 'only the project counts'); close(st.pct, B_USD / 2);
+  assert.deepEqual([st.limit, st.state, st.unpriced, st.period_end > Date.now()], [2, 'ok', 0, true]);
   assert.deepEqual(h.notes(), []);
 
   await h.turn('b1'); // 1650 = 82%
@@ -728,13 +744,21 @@ test('budgets: units formula, project/day budget notifies once at 80% and once a
   await h.turn('b1'); // 2475 = 123%
   await h.turn('b1'); await h.turn('other');
   assert.equal(h.notes().length, 2, 'one per threshold, none repeated');
-  assert.match(h.notes()[0], /^Budget ‘climatefluent \/ day’ at 82% — 1\.\dk of 2k units$/);
-  assert.match(h.notes()[1], /^Budget ‘climatefluent \/ day’ at 123% — 2\.5k of 2k units$/);
+  assert.match(h.notes()[0], /^Budget ‘climatefluent \/ day’ at 82% — \$1\.65 of \$2\.00$/);
+  assert.match(h.notes()[1], /^Budget ‘climatefluent \/ day’ at 123% — \$2\.4[78] of \$2\.00$/);
   st = await status();
-  assert.deepEqual([st.spent, st.state, st.top], [4 * B_UNITS, 'over', [{ label: 'hi', units: 4 * B_UNITS }]]);
-  assert.deepEqual((await h.api('overview')).budgets, [{ name: 'climatefluent / day', pct: 4 * B_UNITS / 2000, state: 'over' }]);
-  await h.put({ rate_card: { 'claude-haiku': { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 } } });
-  assert.ok(Math.abs((await status()).dollars - 4 * (100 + 5 * 20 + 0.1 * 1000 + 1.25 * 300) / 1e6) < 1e-12, 'dollars only from the rate card');
+  close(st.spent, 4 * B_USD); close(st.top[0].usd, 4 * B_USD);
+  assert.deepEqual([st.state, st.top.map((x: any) => x.label)], ['over', ['hi']]);
+  const [ob] = (await h.api('overview')).budgets;
+  close(ob.pct, 4 * B_USD / 2); assert.deepEqual([ob.name, ob.state], ['climatefluent / day', 'over']);
+  // a rate_card entry overrides the built-in price of the fields it names, for model ids containing its key
+  await h.put({ rate_card: { 'haiku-4-5': { output: 10 } } });
+  close((await status()).spent, 4 * (B_USD + 0.02 * 5), 'output at $10/MTok');
+  await h.put({ rate_card: {} });
+  // a request on a model with no price is counted apart and never guessed into the sum
+  await h.msg('b1', { tools: [{ name: 'Read', input_schema: {} }] }); // claude-haiku-4: not in the table
+  st = await status();
+  close(st.spent, 4 * B_USD); assert.equal(st.unpriced, 1);
   assert.deepEqual((await h.rows('select threshold from budget_events order by ts')).map((r) => r.threshold), [0.8, 1]);
 
   assert.equal((await h.api('clock', { skew_ms: 864e5 })).ok, true); // tomorrow: a new period
@@ -747,7 +771,7 @@ test('budgets: units formula, project/day budget notifies once at 80% and once a
 
 test('budgets: stop answers 400 without dialing upstream; count_tokens passes; per-session cap is per session; bad shapes -> 400', async (t) => {
   const h = await budgetSetup(t);
-  const b = { id: 'all', name: 'everything today', scope: 'all', match: null, period: 'day', limit: 800, action: 'stop', thresholds: [1] };
+  const b = { id: 'all', name: 'everything today', scope: 'all', match: null, period: 'day', limit: 0.8, action: 'stop', thresholds: [1] };
   for (const bad of [{ ...b, scope: 'galaxy' }, { ...b, limit: '2M' }, { ...b, limit: 0 }, { ...b, scope: 'project' }, { ...b, scope: 'session' }, { ...b, action: 'explode' }, { ...b, thresholds: [2] }, { ...b, id: undefined }])
     assert.equal((await h.put({ budgets: [bad] })).status, 400, JSON.stringify(bad));
   assert.equal((await h.put({ budgets: [b, b] })).status, 400, 'duplicate id');
@@ -756,19 +780,19 @@ test('budgets: stop answers 400 without dialing upstream; count_tokens passes; p
   assert.equal((await h.turn('c1')).who, 'home', 'under the limit: passes');
   const seen = h.s.seen.length, r = await h.turn('c1');
   assert.equal(r.status, 400); assert.equal(r.type, 'error'); assert.equal(r.error.type, 'invalid_request_error');
-  assert.match(r.error.message, /budget ‘everything today’ is spent: 825 of 800 input-equivalent tokens today\. It resets \w{3} 00:00\. Raise or remove it at http:\/\/localhost:\d+\/router\/#cost/);
+  assert.match(r.error.message, /budget ‘everything today’ is spent: \$0\.8[23] of \$0\.80 at list price today\. It resets \w{3} 00:00\. Raise or remove it at http:\/\/localhost:\d+\/router\/#cost/);
   assert.equal(h.s.seen.length, seen, 'not dialed');
   const [row] = await h.rows('select session_key, account_id, status, request_id, in_tok from requests order by id desc limit 1');
   assert.deepEqual({ ...row }, { session_key: 'c1', account_id: 'home', status: 400, request_id: null, in_tok: null });
-  assert.deepEqual(h.notes(), ['Budget ‘everything today’ at 103% — 825 of 800 units — requests are now stopped']);
+  assert.equal(h.notes().length, 1); assert.match(h.notes()[0], /^Budget ‘everything today’ at 103% — \$0\.8[23] of \$0\.80 — requests are now stopped$/);
   const ct = await fetch(`${h.base}/v1/messages/count_tokens`, { method: 'POST', headers: { authorization: 'Bearer tok-home-fake' }, body: '{"model":"claude-haiku-4","messages":[]}' });
   assert.equal(ct.status, 200); assert.equal(h.s.seen.length, seen + 1, 'count_tokens is never blocked');
 
   // the runaway-agent guard: one cap, measured per session
-  await h.put({ budgets: [{ id: 'cap', name: 'per-session cap', scope: 'session', match: null, period: 'session', limit: 800, action: 'stop', thresholds: [1] }] });
-  assert.equal((await h.turn('c1')).status, 400, 'c1 already spent 825');
+  await h.put({ budgets: [{ id: 'cap', name: 'per-session cap', scope: 'session', match: null, period: 'session', limit: 0.8, action: 'stop', thresholds: [1] }] });
+  assert.equal((await h.turn('c1')).status, 400, 'c1 already spent $0.825');
   assert.equal((await h.turn('c2')).status, 200, 'a second session has its own allowance');
-  assert.match((await h.turn('c2')).error.message, /‘per-session cap’ is spent: 825 of 800 .* in this session/);
+  assert.match((await h.turn('c2')).error.message, /‘per-session cap’ is spent: \$0\.8[23] of \$0\.80 .* in this session/);
   assert.equal((await h.turn('c3')).status, 200);
   assert.equal((await h.api('budgets'))[0].top.length, 3);
   await h.put({ budgets: [] });
@@ -844,7 +868,7 @@ test('brain capture: note from the transcript, secret redacted, failed command a
   const day = new Date().toLocaleDateString('sv'), logs = () => readdirSync(`${b.vault}/wiki/logs`);
   assert.deepEqual(logs(), [`${day} deploy the worker.md`]);
   let note = b.read(`wiki/logs/${logs()[0]}`);
-  assert.match(note, /^---\nsession: bs\ntitle: deploy the worker\nproject: proj-x\nstarted: "\d{4}-.*"\nended: ".*"\nturns: 1\nmodels: \[claude-haiku-4\]\naccounts: \[home\]\nunits: \d+\n/);
+  assert.match(note, /^---\nsession: bs\ntitle: deploy the worker\nproject: proj-x\nstarted: "\d{4}-.*"\nended: ".*"\nturns: 1\nmodels: \[claude-haiku-4\]\naccounts: \[home\]\nusd: 0\n/);
   assert.match(note, /tags: \[session, proj-x\]\n---\n<!-- agent-router:begin -->\n# deploy the worker\n/);
   assert.match(note, /## Asked\n\n- deploy the worker\n\n## Files touched\n\n- `wrangler\.toml`\n\n## Commands run\n\n- `npm run deploy`\n- `curl -H "Authorization: \[redacted\]" https:\/\/api\.example\.com\/deploy`\n- `GH=\[redacted\] PAT=\[redacted\] AWS=\[redacted\] mysql --password=\[redacted\] "api_key": "\[redacted\]" AWS_SECRET_ACCESS_KEY=\[redacted\] \[redacted\] echo done`\n\n## Tools\n\n- Bash × 4\n- Write × 1\n/);
   for (const x of [SECRET, ...MORE, 'depoly', 'TOOL-OUTPUT', 'INJECTED', 'task-notification']) assert.ok(!note.includes(x), `${x} in the note`);
@@ -867,7 +891,7 @@ test('brain capture: note from the transcript, secret redacted, failed command a
   assert.match(b.read('index.md'), /Worker deploy fix\]\]/); assert.ok(!b.read('index.md').includes('deploy the worker'));
   assert.equal((await b.call('GET', 'stats'))[1].sessions_captured, 1);
   // a transcript the router never routed (it is older than the ledger): found by its file name
-  writeFileSync(`${b.proj}/-tmp-proj-x/old.jsonl`, worked('old', 'req_none', 1));
+  writeFileSync(`${b.proj}/-tmp-proj-x/old.jsonl`, worked('old', 'req_none', 2));
   await until(async () => (await b.rows(`select 1 from sessions where session_key = 'old'`)).length, 'transcript-only session seen');
   assert.equal((await b.call('POST', 'capture', {}))[1].notes, 2);
   assert.deepEqual(logs(), [`${day} Worker deploy fix.md`, `${day} deploy the worker old.md`]);
@@ -976,15 +1000,16 @@ test('brain classifier: Jev request and answers follow the TypeSafe docs; a 500 
   b.noLeak();
 });
 
-test('brain daily cap: spend tagged source=brain over brain_daily_units queues the distill and makes no model call', async (t) => {
+test('brain daily cap: spend tagged source=brain over brain_daily_usd queues the distill and makes no model call', async (t) => {
   const b = await brainSetup(t);
-  await b.put({ brain_daily_units: 500 });
+  assert.equal((await b.api('settings')).brain_daily_usd, 1, 'default cap: $1 a day at list price');
+  await b.put({ brain_daily_usd: 0.5 });
   await b.session('bc', (rid) => worked('bc', rid));
-  b.s.usage = B_USAGE; // 825 units, on a request the brain's own subprocess made
-  await b.msg('own', {}, { 'x-agent-router-source': 'brain' });
-  await b.msg('adv', {}, { 'x-agent-router-source': 'advisor' }); // the advisor's calls are tagged too, and are not brain spend
-  let st = await until(async () => { const s = (await b.call('GET', 'stats'))[1]; return s.spend_today_units && s; }, 'brain spend logged');
-  assert.deepEqual([st.spend_today_units, st.cap_units, st.queued], [B_UNITS, 500, 0]);
+  b.s.usage = B_USAGE; // $0.825 on Haiku 4.5, on a request the brain's own subprocess made
+  await b.msg('own', { model: 'claude-haiku-4-5' }, { 'x-agent-router-source': 'brain' });
+  await b.msg('adv', { model: 'claude-haiku-4-5' }, { 'x-agent-router-source': 'advisor' }); // the advisor's calls are tagged too, and are not brain spend
+  let st = await until(async () => { const s = (await b.call('GET', 'stats'))[1]; return s.spend_today_usd && s; }, 'brain spend logged');
+  close(st.spend_today_usd, B_USD); assert.deepEqual([st.cap_usd, st.queued], [0.5, 0]);
   assert.deepEqual(await b.call('POST', 'distill', { session: 'bc' }), [200, { queued: true }]);
   assert.deepEqual(b.calls(), [], 'no subprocess call over the cap');
   assert.deepEqual({ ...(await b.rows(`select queued, gated_ts, distilled_ts from brain_sessions where session_key = 'bc'`))[0] }, { queued: 1, gated_ts: null, distilled_ts: null });
@@ -992,7 +1017,7 @@ test('brain daily cap: spend tagged source=brain over brain_daily_units queues t
   assert.deepEqual([st.queued, st.distilled], [1, 0]);
   assert.equal((await b.api('cost')).one_shots.count, 1, 'own calls are not counted with the one-shots (only bc\'s request is)');
   // raise the cap: the same request goes through and clears the queue flag
-  await b.put({ brain_daily_units: 100000 });
+  await b.put({ brain_daily_usd: 100 });
   assert.equal((await b.call('POST', 'distill', { session: 'bc' }))[1].distilled, true);
   assert.equal((await b.rows(`select queued from brain_sessions where session_key = 'bc'`))[0].queued, 0);
   b.noLeak();
@@ -1048,8 +1073,8 @@ test('brain skills: import by URL (https only, 200 KB, text, must be a skill), p
   const st = await until(async () => { const s = (await b.call('GET', 'stats'))[1]; return s.skills[0].uses && s; }, 'skill use counted');
   assert.deepEqual([st.promoted, st.candidates], [1, 1]);
   assert.deepEqual(st.skills.map(({ last_used, promoted_ts, ...k }: any) => k), [
-    { name: 'pdf-tools', status: 'promoted', uses: 1, sessions: 1, projects: 1, source: url('/a/SKILL.md'), source_session: null, source_units: null },
-    { name: 'second-skill', status: 'candidate', uses: 0, sessions: 0, projects: 0, source: url('/redir'), source_session: null, source_units: null }]);
+    { name: 'pdf-tools', status: 'promoted', uses: 1, sessions: 1, projects: 1, source: url('/a/SKILL.md'), source_session: null, source_usd: null },
+    { name: 'second-skill', status: 'candidate', uses: 0, sessions: 0, projects: 0, source: url('/redir'), source_session: null, source_usd: null }]);
   assert.ok(st.skills[0].last_used > 0 && st.skills[0].promoted_ts > 0);
   assert.deepEqual((await b.rows(`select name, arg from tool_uses where name = 'Skill' order by id`)).map((r) => r.arg), ['pdf-tools', 'other']);
   assert.match(b.read('skills/pdf-tools.md'), /Status: promoted since \d{4}-\d\d-\d\d · Source: http:\/\/127\.0\.0\.1/);
@@ -1078,7 +1103,7 @@ test('brain safety: writes are 409 until enabled, API paths cannot leave the vau
     assert.deepEqual(await b.call(m, p, { session: 's', url: 'https://example.com/SKILL.md', text: 'x' }), [409, { error: { type: 'brain_disabled' } }], p);
   assert.ok(!existsSync(b.vault) && !existsSync(b.skills), 'nothing is written while disabled');
   assert.deepEqual([(await b.call('GET', 'stats'))[1].enabled, (await b.call('GET', 'tree'))[1].files], [false, []]);
-  for (const bad of [{ brain_distill: 'always' }, { classifier: 'gpt' }, { brain_confidence: 2 }, { brain_daily_units: '200k' }, { brain_enabled: 'yes' }, { brain_dir: 'relative/dir' }]) assert.equal((await b.put(bad)).status, 400, JSON.stringify(bad));
+  for (const bad of [{ brain_distill: 'always' }, { classifier: 'gpt' }, { brain_confidence: 2 }, { brain_daily_usd: '1' }, { brain_daily_units: 200000 }, { brain_enabled: 'yes' }, { brain_dir: 'relative/dir' }]) assert.equal((await b.put(bad)).status, 400, JSON.stringify(bad));
   assert.equal((await b.put({ brain_enabled: true, brain_distill: 'on_idle', brain_dir: null })).status, 200);
 
   assert.deepEqual(await b.call('PUT', 'facts', { text: '# Facts\n\nDeploys go through wrangler.\n' }), [200, { ok: true }]);
@@ -1105,5 +1130,234 @@ test('brain safety: writes are 409 until enabled, API paths cannot leave the vau
     '<a href="#brain" data-wl="wiki/projects/proj-x">', '<a href="#brain" data-wl="2026-10-01 note">', '<a href="#brain" data-wl="a&#34; onclick=&#34;alert(7)">']);
   assert.match(html, /<li>item <b>bold<\/b> <code>code &#60;b&#62;<\/code><\/li>/);
   assert.ok(html.includes('[x](javascript:alert(3))') && !html.includes('agent-router:begin'), 'a refused link stays visible as text; our markers are hidden');
+  b.noLeak();
+});
+
+// ---- cost insights (docs/COST-INSIGHTS.md): dollars at list price, rewrite causes, lifetime fit, going cold, carrying cost, safe switches ----
+// The arithmetic is tested directly: console.ts imported in this process against a throwaway ledger (never the default one).
+const arith = async () => { process.env.LEDGER_PATH ??= `${mkdtempSync(`${tmpdir()}/router-arith-`)}/ledger.sqlite`; return import('./console.ts'); };
+
+test('cost(): list price per model, the 0.05× and 0.025× cache-read cases, rate_card override, unknown model -> null', async () => {
+  const { cost, rates, PRICES_AS_OF } = await arith();
+  const u = { in_tok: 1e6, out_tok: 1e6, cache_read: 1e6, cache_5m: 1e6, cache_1h: 1e6 }; // $/MTok: input + output + read + 5m write + 1h write
+  for (const [model, want] of [['claude-fable-5-1', 10 + 50 + 0.25 + 12.5 + 20], ['claude-opus-5-5', 4 + 20 + 0.2 + 5 + 8], ['claude-opus-5', 5 + 25 + 0.5 + 6.25 + 10],
+    ['claude-sonnet-5-5', 2 + 10 + 0.2 + 2.5 + 4], ['claude-sonnet-5', 2 + 10 + 0.2 + 2.5 + 4], ['claude-haiku-4-5-20251001', 1 + 5 + 0.1 + 1.25 + 2]] as [string, number][]) close(cost({ ...u, model }, {})!, want, model);
+  const mult = (m: string) => rates(m, {})!.read / rates(m, {})!.input;
+  close(mult('claude-opus-5-5'), 0.05); close(mult('claude-fable-5-1'), 0.025); close(mult('claude-opus-5'), 0.1); close(mult('claude-sonnet-5-5'), 0.1); close(mult('claude-haiku-4-5'), 0.1);
+  close(cost({ model: 'claude-opus-5-5', cache_create: 1e6 }, {})!, 5, 'a write without the 1h/5m split is priced at the 5m rate');
+  close(cost({ model: 'claude-opus-5-5', in_tok: 1e6, out_tok: 1e6, cache_read: 1e6, speed: 'fast' }, {})!, 2 * 4 + 2 * 20 + 0.2, 'fast mode doubles input and output on Opus 5.5');
+  close(cost({ model: 'claude-sonnet-5-5', in_tok: 1e6, speed: 'fast' }, {})!, 2);
+  close(cost({ ...u, model: 'claude-opus-5-5' }, { 'opus-5-5': { read: 1 } })!, 4 + 20 + 1 + 5 + 8, 'rate_card overrides the fields it names');
+  close(cost({ model: 'claude-opus-4-6', in_tok: 1e6 }, { 'opus-4-6': { input: 15 } })!, 15, 'rate_card can price a model the table does not know');
+  assert.deepEqual([cost({ ...u, model: 'claude-opus-4-6' }, {}), cost({ ...u, model: null }, {}), cost({ ...u, model: 'gpt-9' }, {})], [null, null, null], 'unknown model: no price, never a guess');
+  assert.equal(PRICES_AS_OF, '2026-10-01');
+});
+
+test('rewrite causes: model, fast mode, effort (not on Opus 5.5), tool set (not a deferred tool), images, compaction, lifetime at 5m and 1h, CLI upgrade; avoidable flags and dollars', async (t) => {
+  const h = await setup(t);
+  const wdb = new DatabaseSync(h.ledger, { timeout: 2000 });
+  t.after(() => wdb.close());
+  const use = (create: number, ttl: string) => ({ input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: create,
+    cache_creation: { ephemeral_1h_input_tokens: ttl === '1h' ? create : 0, ephemeral_5m_input_tokens: ttl === '5m' ? create : 0 } });
+  const tools = [{ name: 'A' }, { name: 'B' }], img = [{ role: 'user', content: [{ type: 'text', text: 'hi' }, { type: 'image', source: {} }] }];
+  // each case is one session: a cold first turn (20k written), then a turn that writes the whole context again (20.5k, nothing read)
+  const pair = async (sk: string, a: any, b: any, o: { ttl?: string; gapMin?: number; ha?: any; hb?: any } = {}) => {
+    h.s.usage = use(20000, o.ttl ?? '1h'); await h.msg(sk, { model: 'claude-opus-5-5', tools, ...a }, o.ha);
+    h.s.usage = use(20500, o.ttl ?? '1h'); await h.msg(sk, { model: 'claude-opus-5-5', tools, ...b }, o.hb);
+    await until(async () => (await h.rows('select count(*) n from requests where session_key = ?', sk))[0].n === 2, `${sk} logged`);
+    if (o.gapMin) wdb.prepare('update requests set ts = ts - ? where id = (select min(id) from requests where session_key = ?)').run(o.gapMin * 60_000, sk);
+  };
+  await pair('m', {}, { model: 'claude-sonnet-5-5' });
+  await pair('f', {}, { speed: 'fast' });
+  await pair('e', { model: 'claude-opus-5', output_config: { effort: 'high' } }, { model: 'claude-opus-5', output_config: { effort: 'low' } });
+  await pair('e55', { output_config: { effort: 'low' } }, { output_config: { effort: 'high' } });
+  await pair('s', { messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'a long answer that the client later clears out of the history' }] },
+    { messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: '[cleared]' }, { role: 'user', content: 'more' }] });
+  await pair('t', {}, { tools: [...tools, { name: 'C' }] });
+  await pair('td', {}, { tools: [...tools, { name: 'C', defer_loading: true }] });
+  await pair('i', { messages: img }, {});
+  await pair('c', { messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'more' }] }, {});
+  await pair('x1', {}, {}, { gapMin: 61 });
+  await pair('w1', {}, {}, { gapMin: 59 });
+  await pair('x5', {}, {}, { ttl: '5m', gapMin: 6 });
+  await pair('w5', {}, {}, { ttl: '5m', gapMin: 4 });
+  await pair('v', {}, {}, { ha: { 'user-agent': 'claude-cli/2.1.268 (external, cli)' }, hb: { 'user-agent': 'claude-cli/2.1.300 (external, cli)' } });
+
+  const c = await h.api('cache?days=1'), w = (perMTok: number) => +(20500 * perMTok / 1e6).toFixed(6);
+  assert.deepEqual(Object.fromEntries(c.bursts.map((b: any) => [b.session_key, [b.cause, b.avoidable, +b.usd.toFixed(6)]])), {
+    m: ['model changed (opus-5-5 → sonnet-5-5)', true, w(4)], // re-written on the new model, at its 1h write price
+    f: ['fast mode turned on', true, w(8)],
+    e: ['effort changed (high → low)', true, w(10)],
+    e55: ['unexplained', false, w(8)],                        // Opus 5.5 keeps its cache across an effort change: not the cause
+    t: ['tool set changed (2 → 3 loaded tools)', true, w(8)],
+    td: ['unexplained', false, w(8)],                         // a deferred definition is not part of the prefix: not the cause
+    i: ['images removed (1 → 0)', false, w(8)],
+    c: ['compaction or tool-result clearing (expected rebuild)', false, w(8)],
+    s: ['compaction or tool-result clearing (expected rebuild)', false, w(8)], // more messages, smaller body: something was cleared
+    x1: ['cache lifetime expired (1h cache, idle 61 min)', false, w(8)],
+    w1: ['unexplained', false, w(8)],                         // 59 minutes: still inside the 1h lifetime
+    x5: ['cache lifetime expired (5m cache, idle 6 min)', false, w(5)],
+    w5: ['unexplained', false, w(5)],
+    v: ['CLI upgraded (2.1.268 → 2.1.300)', false, w(8)],
+  });
+  assert.ok(c.bursts.every((b: any) => (b.fix != null) === !['rebuild', 'unexplained'].includes(b.kind)), 'every explained cause but an expected rebuild carries a fix');
+  assert.match(c.bursts.find((b: any) => b.kind === 'tools').fix, /ENABLE_TOOL_SEARCH=true/);
+  assert.equal(c.avoidable.count, 4); close(c.avoidable.usd, 20500 * (4 + 8 + 10 + 8) / 1e6);
+  // the same re-writes as ranked findings: avoidable ones and 1h caches that went cold; 5m expiries are the lifetime fit's business
+  const ins = await h.api('insights?days=1'), a1 = ins.findings.filter((f: any) => f.id.startsWith('a1:'));
+  assert.deepEqual(a1.map((f: any) => f.id).sort(), ['a1:effort:e', 'a1:expired:x1', 'a1:fast:f', 'a1:model:m', 'a1:tools:t']);
+  assert.ok(a1.every((f: any) => f.tier === 'A' && f.quality === 'none' && f.fix && f.evidence.length && f.session_key));
+  assert.deepEqual([a1.find((f: any) => f.id === 'a1:model:m').title, +a1.find((f: any) => f.id === 'a1:model:m').usd.toFixed(6)], ['Model switched mid-session once in ‘m’', w(4)]);
+  assert.deepEqual(ins.findings.map((f: any) => f.usd ?? 0), ins.findings.map((f: any) => f.usd ?? 0).sort((x: number, y: number) => y - x), 'ranked by dollars');
+  h.noLeak();
+});
+
+test('cache lifetime fit: a hand-built gap sequence replayed under 5m and 1h', async () => {
+  const { ttlFit, cost } = await arith(), M = 60_000;
+  const row = (o: any) => { const r = { model: 'claude-opus-5-5', in_tok: 0, out_tok: 0, cache_read: 0, cache_1h: 0, cache_5m: 0, agent_id: null, gap: null, prev_ctx: null, ...o };
+    r.cache_create = r.cache_1h + r.cache_5m; r.usd = cost(r, {}); return r; };
+  // a subagent on 5m: cold start 200k; re-written after a 10 min pause; a turn a minute later; re-written after a 20 min pause; cold again after 2 h
+  const sub = (agent_id: string) => [row({ agent_id, cache_5m: 200e3 }), row({ agent_id, cache_5m: 210e3, gap: 10 * M, prev_ctx: 200e3 }), row({ agent_id, cache_read: 210e3, cache_5m: 5e3, gap: M, prev_ctx: 210e3 }),
+    row({ agent_id, cache_5m: 220e3, gap: 20 * M, prev_ctx: 215e3 }), row({ agent_id, cache_5m: 225e3, gap: 120 * M, prev_ctx: 220e3 })];
+  const [main, subs] = ttlFit([
+    // the main conversation on 1h: cold start 1M; a turn 2 min later; a turn after a 30 min pause (read on 1h, written again on 5m)
+    row({ cache_1h: 1e6 }), row({ cache_read: 1e6, cache_1h: 10e3, gap: 2 * M, prev_ctx: 1e6 }), row({ cache_read: 1.01e6, cache_1h: 10e3, gap: 30 * M, prev_ctx: 1.01e6 }),
+    ...sub('a'), ...sub('b')], 7, {});
+  // Opus 5.5 $/MTok: read 0.2, 5m write 5, 1h write 8
+  assert.deepEqual([main.bucket, main.setting, main.current, main.turns, main.turns_5_60, main.switch_to], ['main', 'promptCacheTtl', '1h', 3, 1, null]);
+  close(main.actual_usd, 8 + (0.2 + 0.08) + (0.202 + 0.08)); close(main.usd_1h, main.actual_usd);
+  close(main.usd_5m, 5 + (0.2 + 0.05) + 1.02 * 5, 'the 30-minute pause re-writes the whole 1.02M prefix at the 5m price');
+  assert.equal(main.recommend, 'Keep the current lifetime (1h): 5m would have cost $1.79 more (+21%).');
+  assert.deepEqual([subs.bucket, subs.setting, subs.current, subs.turns, subs.turns_5_60, subs.switch_to], ['subagents', 'subagentPromptCacheTtl', '5m', 10, 4, '1h']);
+  close(subs.actual_usd, 2 * (1 + 1.05 + (0.042 + 0.025) + 1.1 + 1.125)); close(subs.usd_5m, subs.actual_usd);
+  // on 1h: the 10 and 20 minute pauses read the previous context (200k, 215k) and write only what is new; every write costs 8 instead of 5
+  close(subs.usd_1h, 2 * (1.6 + (0.04 + 0.08) + (0.042 + 0.04) + (0.043 + 0.04) + 1.8));
+  assert.equal(subs.recommend, 'Set `subagentPromptCacheTtl` to `1h`: about $1.31 less over these 7 days (15%).');
+  // one subagent alone saves $0.66: under the $1 bar, so no switch is suggested
+  assert.equal(ttlFit(sub('a'), 7, {})[1].recommend, 'Keep the current lifetime (5m): 1h would save $0.66 (15%), under the $1 and 5% bar.');
+});
+
+test('going cold: one notification before a large 1h cache lapses, not again until the session is active again; sessions carry cold_at and rebuild_usd', async (t) => {
+  const log = `${mkdtempSync(`${tmpdir()}/router-notify-`)}/notify.log`;
+  const h = await setup(t, { DRILLS: '1', NOTIFY: '0', NOTIFY_LOG: log, COLD_TICK_MS: '40' });
+  const notes = () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []), wait = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
+  const turn = async (sk: string, read: number, create: number, ttl = '1h') => {
+    h.s.usage = { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: read, cache_creation_input_tokens: create,
+      cache_creation: { ephemeral_1h_input_tokens: ttl === '1h' ? create : 0, ephemeral_5m_input_tokens: ttl === '5m' ? create : 0 } };
+    await h.msg(sk, { model: 'claude-opus-5-5', tools: [{ name: 'Read' }] });
+  };
+  await turn('gc', 0, 200e3);         // 200k on the 1h cache: a rebuild is 200k × $8/MTok = $1.60
+  await turn('small', 0, 50e3);       // under cold_min_context
+  await turn('five', 0, 200e3, '5m'); // a 5m cache: never warned about
+  const ts = Object.fromEntries((await h.rows('select session_key k, ts from requests')).map((r) => [r.k, r.ts]));
+  const ss = Object.fromEntries((await h.api('sessions')).map((s: any) => [s.session_key, s]));
+  assert.deepEqual([ss.gc.cold_at - ts.gc, ss.five.cold_at - ts.five], [3600_000, 300_000]);
+  close(ss.gc.rebuild_usd, 200010 * 8 / 1e6); close(ss.five.rebuild_usd, 200010 * 5 / 1e6);
+  await wait(150);
+  assert.deepEqual(notes(), [], 'an hour to go: nothing yet');
+  await h.api('clock', { skew_ms: 56 * 60_000 });
+  await until(() => notes().length === 1, 'warned inside the last 5 minutes');
+  assert.equal(notes()[0], '‘gc’ goes cold in 4 min — a message now costs about $0.04, after that the next turn costs about $1.60');
+  await wait(200);
+  assert.equal(notes().length, 1, 'once per idle period');
+  await turn('gc', 200e3, 500); // active again, 56 minutes in: the lifetime starts over
+  await wait(200);
+  assert.equal(notes().length, 1);
+  await h.api('clock', { skew_ms: 112 * 60_000 });
+  await until(() => notes().length === 2, 'warned again for the new idle period');
+  assert.match(notes()[1], /^‘gc’ goes cold in 4 min/);
+  assert.equal(h.s.seen.length, 4, 'the router sent nothing upstream for any of this');
+  h.noLeak();
+});
+
+test('carrying cost: each tool result × the turns that re-read it × the read price, cut at compaction; sizes and targets only', async (t) => {
+  const proj = mkdtempSync(`${tmpdir()}/router-proj-`);
+  const h = await setup(t, { CLAUDE_PROJECTS_DIR: proj });
+  for (let i = 0; i < 5; i++) await h.msg('cc'); // req_1..5
+  const A = (rid: string, content?: any[]) => arow(rid, { in: 10, read: 1000, create: 100 }, content, 'cc').replace('claude-haiku-4', 'claude-opus-5-5'); // read: $0.20/MTok
+  const use = (rid: string, id: string, name: string, input: any) => A(rid, [{ type: 'tool_use', id, name, input }]);
+  const result = (id: string, chars: number) => JSON.stringify({ type: 'user', sessionId: 'cc', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'TOOL-OUTPUT-' + 'x'.repeat(chars - 12) }] } }) + '\n';
+  mkdirSync(`${proj}/p`);
+  writeFileSync(`${proj}/p/cc.jsonl`, JSON.stringify({ type: 'user', sessionId: 'cc', message: { role: 'user', content: 'fix the parser' } }) + '\n'
+    + use('req_1', 'r1', 'Read', { file_path: '/src/big.ts' }) + result('r1', 40_000)                       // 10k tokens, re-read by req_2 and req_3
+    + use('req_2', 'b1', 'Bash', { command: 'npm test', description: 'run tests' }) + result('b1', 100_000) // 25k tokens, re-read by req_3
+    + A('req_3') + JSON.stringify({ type: 'system', subtype: 'compact_boundary', sessionId: 'cc' }) + '\n'  // compaction: both stop being carried
+    + use('req_4', 'r2', 'Read', { file_path: '/src/big.ts' }) + result('r2', 4_000)                        // 1k tokens, re-read by req_5
+    + A('req_5'));
+  await until(async () => (await h.rows(`select jsonl_path p from requests where request_id = 'req_5'`))[0]?.p, 'joined');
+  const tl = await h.api('sessions/cc/timeline');
+  assert.deepEqual(tl.carrying.map((c: any) => [c.tool, c.target, c.tokens, c.turns, +c.usd.toFixed(6)]),
+    [['Bash', 'npm test', 25000, 1, 0.005], ['Read', '/src/big.ts', 10000, 2, 0.004], ['Read', '/src/big.ts', 1000, 1, 0.0002]]);
+  assert.match(tl.carrying[0].suggestion, /PreToolUse hook/);
+  assert.match(tl.carrying[1].suggestion, /^Read it once: this file was read 2 times/);
+  const a4 = (await h.api('insights')).findings.filter((f: any) => f.id.startsWith('a4:'));
+  assert.deepEqual(a4.map((f: any) => [f.tier, f.quality, f.session_key, +f.usd.toFixed(6)]), [['A', 'none', 'cc', 0.005], ['A', 'none', 'cc', 0.004], ['A', 'none', 'cc', 0.0002]]);
+  assert.equal(a4[0].title, 'Bash npm test: one result re-read on 1 turn in ‘fix the parser’');
+  assert.ok(!JSON.stringify([tl, a4]).includes('TOOL-OUTPUT'), 'tool result content left the transcript');
+  const dir = dirname(h.ledger);
+  assert.ok(!readdirSync(dir).map((x) => readFileSync(`${dir}/${x}`, 'latin1')).join('').includes('TOOL-OUTPUT'), 'tool result content stored');
+  h.noLeak();
+});
+
+test('model choices: read-only subagent above Haiku (docs-recommended), newer same-family sibling (no quality change), step-down (unverified), switch-now break-even', async (t) => {
+  const proj = mkdtempSync(`${tmpdir()}/router-proj-`);
+  const h = await setup(t, { CLAUDE_PROJECTS_DIR: proj });
+  await h.msg('ro', { model: 'claude-sonnet-5-5', tools: [{ name: 'Agent' }] });                               // req_1: the session itself
+  await h.msg('ro', { model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'find the parser' }] }); // req_2: subagent x, which only reads
+  await h.msg('ro', { model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'run the tests' }] });   // req_3: subagent y, which runs Bash
+  await h.msg('o5', { model: 'claude-opus-5', tools: [{ name: 'Read' }] });                                    // req_4: a session on Opus 5
+  const U = { in: 1000, read: 100e3, create: 10e3 }, uses = (...names: string[]) => names.map((name, i) => ({ type: 'tool_use', id: `${name}${i}`, name, input: {} }));
+  mkdirSync(`${proj}/-tmp-proj-x/ro/subagents`, { recursive: true });
+  writeFileSync(`${proj}/-tmp-proj-x/ro.jsonl`, arow('req_1', U, undefined, 'ro'));
+  writeFileSync(`${proj}/-tmp-proj-x/ro/subagents/agent-x.jsonl`, arow('req_2', U, uses('Read', 'Grep'), 'ro'));
+  writeFileSync(`${proj}/-tmp-proj-x/ro/subagents/agent-y.jsonl`, arow('req_3', U, uses('Read', 'Bash'), 'ro'));
+  writeFileSync(`${proj}/-tmp-proj-x/o5.jsonl`, arow('req_4', U, undefined, 'o5'));
+  await until(async () => (await h.rows('select count(*) n from requests where cache_create is not null'))[0].n === 4 && (await h.rows('select count(*) n from requests where agent_id is not null'))[0].n === 2, 'joined');
+  // one turn = 1k in, 50 out, 100k read, 10k written (1h), in dollars per model
+  const usd = { sonnet: (1000 * 2 + 50 * 10 + 100e3 * 0.2 + 10e3 * 4) / 1e6, haiku: (1000 + 50 * 5 + 100e3 * 0.1 + 10e3 * 2) / 1e6, opus5: (1000 * 5 + 50 * 25 + 100e3 * 0.5 + 10e3 * 10) / 1e6, opus55: (1000 * 4 + 50 * 20 + 100e3 * 0.2 + 10e3 * 8) / 1e6 };
+  const f = Object.fromEntries((await h.api('insights')).findings.map((x: any) => [x.id, x]));
+  assert.deepEqual([f['b2:haiku-subagents'].tier, f['b2:haiku-subagents'].quality, f['b2:haiku-subagents'].title, f['b2:haiku-subagents'].evidence[1]],
+    ['B', 'docs-recommended', '1 read-only subagent run on a larger model than the docs suggest', 'tools called: Grep, Read'], 'the Bash subagent is not read-only');
+  close(f['b2:haiku-subagents'].usd, usd.sonnet - usd.haiku); assert.match(f['b2:haiku-subagents'].fix, /`model: haiku`/);
+  assert.deepEqual([f['b2:opus-5'].quality, f['b2:opus-5'].title], ['none', 'Opus 5 → Opus 5.5: same family, newer and cheaper']); close(f['b2:opus-5'].usd, usd.opus5 - usd.opus55);
+  assert.deepEqual([f['b1:sonnet-5-5'].quality, f['b1:sonnet-5-5'].title, f['b1:sonnet-5-5'].evidence[2]], ['unverified', 'The same tokens on Haiku 4.5 instead of Sonnet 5.5', 'saving if quality holds — unverified']);
+  close(f['b1:sonnet-5-5'].usd, 3 * (usd.sonnet - usd.haiku)); assert.equal(f['b1:opus-5'], undefined, 'Opus 5 has a safe switch, not an unverified one');
+  // /router/cost: the same tokens on every model; for one session, what switching now costs and when it pays back
+  const all = (await h.api('cost')).model_whatif, one = (await h.api('cost?session=o5')).model_whatif;
+  assert.deepEqual([all.label, all.rows.map((r: any) => [r.from, r.turns]), all.switch_now], ['saving if quality holds — unverified', [['sonnet-5-5', 3], ['opus-5', 1]], null]);
+  close(all.rows[0].on['haiku-4-5'], 3 * usd.haiku); close(one.rows[0].on['opus-5-5'], usd.opus55);
+  const to = Object.fromEntries(one.switch_now.to.map((x: any) => [x.model, x]));
+  assert.deepEqual([one.switch_now.from, one.switch_now.context, to['opus-5-5'].breakeven_turns, to['fable-5-1'].breakeven_turns], ['opus-5', 111000, 18, null]);
+  close(to['opus-5-5'].rewrite_usd, 111000 * 8 / 1e6, 'the whole context re-written at the target model\'s 1h write price'); // 0.888 / (0.15625 − 0.105) = 17.3 turns
+  h.noLeak();
+});
+
+test('brain noise: a probe one-shot gets no note; a note from before that rule is removed unless the user wrote in it, and leaves every list', async (t) => {
+  const b = await brainSetup(t), day = new Date().toLocaleDateString('sv');
+  await b.session('tv', (rid) => worked('tv', rid, 1)); // 1 prompt, 2 tool calls: a one-shot
+  await b.session('ok', (rid) => worked('ok', rid, 2)); // 3 tool calls: kept
+  await b.session('lg', (rid) => worked('lg', rid, 0)); // one-shots that already have a note from an earlier version:
+  await b.session('ed', (rid) => worked('ed', rid, 0)); // …lg's is as generated, ed's has the user's own text below the block
+  const gen = (sk: string) => `---\nsession: ${sk}\ntitle: old ${sk}\n---\n<!-- agent-router:begin -->\n# old ${sk}\n<!-- agent-router:end -->\n\n<!-- agent-router:begin distilled -->\n## Distilled\n<!-- agent-router:end distilled -->\n`;
+  mkdirSync(`${b.vault}/wiki/logs`, { recursive: true });
+  writeFileSync(`${b.vault}/wiki/logs/${day} old lg.md`, gen('lg'));
+  writeFileSync(`${b.vault}/wiki/logs/${day} old ed.md`, gen('ed') + '\nMY OWN NOTE\n');
+  const wdb = new DatabaseSync(b.ledger, { timeout: 2000 });
+  t.after(() => wdb.close());
+  for (const sk of ['lg', 'ed']) wdb.prepare('insert into brain_sessions (session_key, last_captured_ts, note_path) values (?, 1, ?)').run(sk, `wiki/logs/${day} old ${sk}.md`);
+
+  const r = (await b.call('POST', 'capture', {}))[1];
+  assert.deepEqual([r.notes, r.removed], [1, 1]);
+  assert.deepEqual(readdirSync(`${b.vault}/wiki/logs`).sort(), [`${day} deploy the worker ok.md`, `${day} old ed.md`], 'lg removed, ed kept, tv never written');
+  assert.equal(b.read(`wiki/logs/${day} old ed.md`), gen('ed') + '\nMY OWN NOTE\n', 'a note the user edited is not touched');
+  assert.deepEqual((await b.rows('select session_key k, note_path is not null p, trivial from brain_sessions order by 1')).map((x) => [x.k, x.p, x.trivial]), [['ed', 1, 1], ['lg', 0, 1], ['ok', 1, 0], ['tv', 0, 1]]);
+  for (const f of ['index.md', `wiki/daily/${day}.md`, 'wiki/projects/proj-x.md']) {
+    assert.ok(b.read(f).includes(`[[${day} deploy the worker ok]]`), `${f} lists the real session`);
+    assert.ok(!b.read(f).includes('old ed') && !b.read(f).includes('old lg') && !b.read(f).includes('worker tv'), `${f} lists a one-shot`);
+  }
+  assert.match(b.read('log.md'), /remove wiki\/logs\/.* old lg\.md \(one-shot session\)/);
+  assert.equal((await b.call('GET', 'stats'))[1].sessions_captured, 1);
+  assert.deepEqual((await b.call('POST', 'capture', {}))[1].removed, 0, 'nothing left to remove');
+  assert.deepEqual(b.calls(), [], 'no model call');
   b.noLeak();
 });

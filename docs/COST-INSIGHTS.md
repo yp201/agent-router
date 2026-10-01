@@ -32,7 +32,8 @@ Sources: Claude Code [costs](https://code.claude.com/docs/en/costs) and
    Remove that cause and fix text everywhere.
 3. **Tool search.** A custom `ANTHROPIC_BASE_URL` turns tool search off, so every tool definition loads upfront.
    Observed here: terminal sessions through the explicit port send 68 definitions with no ToolSearch tool; desktop
-   sessions (transparent mode) have it. README and `install --explicit` must set `ENABLE_TOOL_SEARCH=true`.
+   sessions (transparent mode) have it. The README's CLI-only snippet and the Homebrew caveat set `ENABLE_TOOL_SEARCH=true`
+   (there is no `install --explicit` command yet).
 4. **Unused tools insight.** Count only tools actually loaded (not `defer_loading`), or it overstates.
 
 | $/MTok | input | 5m write | 1h write | read | output |
@@ -82,6 +83,36 @@ Until B4 has data, B1 and B3 carry the label **"saving if quality holds — unve
 Insights tab becomes a ranked list of dollar findings for the week, each with cause, evidence, the exact setting or
 command, and a quality label (none / unverified). Cache tab gains the A1 causes. Sessions rows show carrying cost.
 `agent-router report` prints the same list.
+
+## Built on 2026-10-01, and where it differs from the plan above
+
+Built: the corrections, A1–A4, A7, B1, B2, `GET /router/insights` findings, the Cache / Cost / Insights / Sessions views and
+`agent-router report`. Measurements and field names: NOTES.md "Cost insights".
+
+- **A1.** "Tool set" means the *loaded* definitions: a `defer_loading: true` entry can appear mid-session without touching the cache
+  (observed), so it is in neither the hash nor the cause. One signal was added to "compaction or tool-result clearing": a request
+  body smaller than the previous one of its thread while the message count grew (4 real re-writes here had only that). It is
+  checked after the lifetime, so a cold cache is never called a rebuild. "Cache went cold" findings cover 1h caches only; 5m
+  expiries are A3's subject.
+- **A2.** One notification per idle period, kept in memory: a restart inside the 5-minute lead can repeat one.
+- **A3.** A turn already on the lifetime in question keeps its actual cost. Under 1h a 5m turn's re-write becomes a read up to the
+  size of the previous context; the rest is still written, at the 1h price. Today's numbers: main +61% on 5m, subagents −3% on 1h
+  (under the 5% bar, so no switch is suggested).
+- **A4.** Turns are counted from the request after the result, over the whole transcript of the session (not only the window), at
+  the read price of the model each turn ran on. The first of those turns actually writes the result, so the figure is a floor.
+  It is shown in the session's timeline panel and as the top ten on Insights, not as a column in the Sessions table.
+- **A5 task boundaries: not built.** It needs a classifier call, and this pass makes no model calls.
+- **A6 idle fires: not built.** No reliable marker for scheduled, loop or check-in turns exists in this machine's transcripts
+  (NOTES.md lists what was looked for). A heuristic from gaps was not shipped.
+- **A7.** The dollar figure is the loaded tool definitions (JSON bytes / 4) × the read price over the flagged requests: an upper
+  bound on the saving, since about a dozen core tools stay loaded with tool search on. Definition sizes are recorded from this
+  version on, so older requests are counted but carry no dollars.
+- **B1.** One finding per model, one step down (Fable 5.1 → Opus 5.5 → Sonnet 5.5 → Haiku 4.5), always labelled unverified; the
+  Cost tab has the full matrix and, per session, the one-time re-write and break-even turns of switching now.
+- **B2.** Opus 5 → Opus 5.5 is the only same-family pair that is cheaper (Sonnet 5 and 5.5 cost the same). A subagent run counts as
+  read-only when every tool it called is in `console.ts READ_ONLY`; the finding sums all such runs above Haiku.
+- **B3, B4: not built.**
+- Fast mode: `cost()` doubles input and output for Opus 5.5 requests whose body says `speed: "fast"`; none has been seen yet.
 
 ## Overlap with Claude Code itself
 

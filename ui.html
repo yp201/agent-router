@@ -95,8 +95,14 @@ const $ = (s) => document.querySelector(s);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const NA = '<span class="muted">—</span>';
 const tok = (n) => n == null ? NA : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(Math.round(n));
-const units = (n) => n >= 1e6 ? `${+(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${+(n / 1e3).toFixed(1)}k` : String(Math.round(n)); // budgets: 1.6M / 2M
-const parseUnits = (v) => { const m = /^\s*(\d*\.?\d+)\s*([km]?)\s*$/i.exec(v); return m ? Number(m[1]) * ({ k: 1e3, m: 1e6 }[m[2].toLowerCase()] ?? 1) : NaN; };
+const usd = (n) => n == null ? NA : `$${n >= 1000 ? Math.round(n).toLocaleString() : n.toFixed(2)}`; // dollars at list price
+const code = (t) => esc(t).replace(/`([^`]+)`/g, '<span class="mono" style="color:var(--fg)">$1</span>'); // a fix line: `setting` in mono
+const snippet = (t) => (t.match(/`([^`]+)`/) ?? t.match(/("[\w.]+": "[^"]+")/) ?? [0, t])[1]; // what Copy puts on the clipboard: the setting or command
+const QUAL = { none: ['ok', 'no quality change'], unverified: ['warn', 'unverified'], 'docs-recommended': ['', 'docs-recommended'] };
+const nice = (k) => k.replace(/^([a-z])([a-z]+)-(\d+)(?:-(\d+))?$/, (_, a, b, x, y) => `${a.toUpperCase()}${b} ${x}${y ? `.${y}` : ''}`); // opus-5-5 -> Opus 5.5
+// prompt-cache state of a session's main conversation: warm until cold_at, then the next turn re-writes the context
+const warmChip = (s) => s.cold_at == null ? '' : s.cold_at > Date.now() ? `<span class="chip ok" title="After that the next turn re-writes the context${s.rebuild_usd == null ? '' : `: about $${s.rebuild_usd.toFixed(2)}`}">warm · cold in ${dur((s.cold_at - Date.now()) / 1000)}</span>`
+  : `<span class="chip" title="The cache lifetime has passed${s.rebuild_usd == null ? '' : `: the next turn re-writes the context, about $${s.rebuild_usd.toFixed(2)}`}">cold</span>`;
 const bColor = (b) => b.state === 'over' ? 'var(--clay)' : b.state === 'warn' ? 'var(--amber)' : 'var(--teal)'; // teal < 80%, amber >= 80%, clay >= 100%
 const pct = (x) => x == null ? NA : `${Math.round(x * 100)}%`;
 const two = (n) => String(n).padStart(2, '0');
@@ -115,7 +121,7 @@ const model = (m) => esc((m ?? '—').replace(/^claude-/, '').replace(/-\d{8}$/,
 const get = (p) => fetch(`/router/${p}`).then((r) => r.json());
 const send = (method, p, body) => fetch(`/router/${p}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) }).then((r) => r.json());
 let S = {};            // last settings
-const ui = { cacheSession: 'all', cacheDays: 7, dollars: false, open: {}, added: null, tl: null, busy: {}, b: {}, note: 'index.md', bq: '', bedit: false, files: [] }; // view state that survives re-renders
+const ui = { cacheSession: 'all', cacheDays: 7, whatif: 'all', open: {}, added: null, tl: null, busy: {}, b: {}, note: 'index.md', bq: '', bedit: false, files: [] }; // view state that survives re-renders
 const kt = (n) => n == null ? '—' : `${Math.round(n / 1000)}k`;
 const ctxColor = (s) => s.context_pct >= s.urgent_pct ? 'clay' : s.context_pct >= s.warn_pct ? 'amber' : 'muted';
 // Session timeline: x = turn, one lane per account (first appearance order), bar = context (teal read + clay write cap)
@@ -261,12 +267,15 @@ const views = {
         <div class="tr th" style="${SC}"><span>session · project</span><span>model</span><span>requests</span><span>account</span><span>context</span><span>switch cost</span><span>route to</span></div>
         ${sessions.map((s) => `<div class="tr" style="${SC}">
           <span class="nm"><button class="plain nm" data-tl="${esc(s.session_key)}" aria-expanded="${ui.tl === s.session_key}" title="Show timeline">${sname(null, s.session_key, s)}</button></span>
-          <span>${model(s.last_model)} ${s.source ? `<span class="chip">${s.source === 'cli' ? 'terminal' : 'desktop'}</span>` : ''}</span>
+          <span>${model(s.last_model)} ${s.source ? `<span class="chip">${s.source === 'cli' ? 'terminal' : 'desktop'}</span>` : ''} ${warmChip(s)}</span>
           <span>${s.request_count}</span><span${s.account_id !== 'home' ? ' class="amber"' : ''}>${esc(s.account_id)}</span><div class="col meter" style="gap:3px"><span>${tok(s.context_main ?? s.context_est)} <span class="${ctxColor(s)}">${pct(s.context_pct)}</span></span>${s.context_pct == null ? '' : bar([[s.context_pct, `var(--${ctxColor(s) === 'muted' ? 'teal' : ctxColor(s)})`]])}</div>
           <span>${s.last_switch_cost_actual != null ? `<span title="last switch, actual cache write">${tok(s.last_switch_cost_actual)}</span>` : s.switch_cost_est == null ? NA : '≈' + tok(s.switch_cost_est)}</span>
           <div class="row"><select class="sm" aria-label="Route session ${short(s.session_key)} to account" data-s="${esc(s.session_key)}">${accts.map((a) => `<option ${a.id === (ui.open[`pin-${s.session_key}`] ?? s.account_id) ? 'selected' : ''}>${esc(a.id)}</option>`).join('')}</select>
             <button class="sm" data-pin="${esc(s.session_key)}" data-cost="${s.switch_cost_est ?? ''}" data-actual="${s.last_switch_cost_actual ?? ''}">Switch</button></div></div>`
-          + (ui.tl === s.session_key && tl?.turns ? `<div class="inset" style="margin:2px 0 8px"><div class="between"><b>Timeline — ${esc(tl.title)}</b><span class="small muted">${tl.turns.length} turns · hover a bar for its numbers</span></div>${timelineSvg(tl)}</div>` : '')
+          + (ui.tl === s.session_key && tl?.turns ? `<div class="inset" style="margin:2px 0 8px"><div class="between"><b>Timeline — ${esc(tl.title)}</b><span class="small muted">${tl.turns.length} turns · hover a bar for its numbers</span></div>${timelineSvg(tl)}
+            ${tl.carrying?.length ? `<div class="col small"><span class="muted">Carrying cost — tool results that every later turn re-read (tokens × turns × the model's read price)</span>
+              ${tl.carrying.map((c) => `<div class="between mono"><span class="nm">${esc(c.tool)}${c.target !== c.tool ? ` <span class="muted">${esc(c.target)}</span>` : ''}</span><span>${tok(c.tokens)} × ${c.turns} turns · ${usd(c.usd)}</span></div>`).join('')}
+              <span class="muted">Top one: ${code(tl.carrying[0].suggestion)}</span></div>` : ''}</div>` : '')
           + (s.advice ? adviceCard(s) : '')
           + s.agents.map((a) => `<div class="tr" style="${SC}"><span class="nm muted" style="padding-left:14px" title="${esc(a.agent_id)}">↳ ${esc(a.name)}</span>
             <span class="small muted">read ${tok(a.cache_read)} · write ${tok(a.cache_create)}</span><span>${a.requests}</span><span></span><span></span><span></span><span></span></div>`).join('')).join('') || '<div class="note">No sessions yet.</div>'}
@@ -295,19 +304,21 @@ const views = {
     const bars = t.map((r, k) => { const x = 44 + k * step; let top = 260; const seg = (v, fill) => { const h = y(v ?? 0); top -= h; return h > 0 ? `<rect x="${x.toFixed(1)}" y="${top.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${fill}"/>` : ''; };
       return `<g><title>turn ${r.i}${ui.cacheSession === 'all' ? ` (${esc(m.get(r.session_key)?.title ?? (r.session_key ?? '').slice(0, 8))})` : ''} · ${hms(r.ts)}\nread ${r.cache_read ?? '—'} · write ${r.cache_create ?? '—'} · uncached ${r.in_tok ?? '—'}${r.burst ? `\nburst: ${r.burst.cause}` : ''}</title>${seg(r.cache_read, '#5FB3A1')}${seg(r.cache_create, '#D97757')}${seg(r.in_tok, '#4A453D')}
         ${r.burst ? `<text x="${(x + bw / 2).toFixed(1)}" y="276" text-anchor="middle" font-family="IBM Plex Mono" font-size="10" fill="#D97757">${r.i}</text>` : ''}</g>`; }).join('');
-    const DESC = { 'account switch': 'Cache is per account, so the full context was re-written.', 'MCP tool list': 'Tools sit before the conversation in the prefix, so everything after them was invalidated.',
-      'system prompt': 'Anything in the system block invalidates the entire cache.', 'first turn': 'First request of this thread: nothing to reuse yet.',
-      'context growth': 'No prefix change detected: the context grew, or the cache was evicted.' };
-    const desc = (b) => b.cause.startsWith('idle') ? `Gap of ${dur(b.gap_s)} between turns. The 1h cache lapsed. Not avoidable unless you keep the session warm.` : Object.entries(DESC).find(([k]) => b.cause.startsWith(k))?.[1] ?? '';
+    const DESC = { account: 'The cache is per account, so the whole context was written again.', model: 'The cache is per model: a switch writes the whole context again on the new one.',
+      fast: 'Fast mode is part of the cache key: turning it on writes the context again.', effort: 'On this model a change of effort re-writes the conversation.',
+      tools: 'Loaded tool definitions sit before the conversation in the prefix, so everything after them was written again.', system: 'The system prompt comes first in the prefix: a change re-writes everything after it.',
+      images: 'An image left the context, which changes the prefix after it.', rebuild: 'Expected: after compaction or clearing, the shorter context is cached afresh. Not a miss.',
+      cli: 'A new CLI version brings a new system prompt and tool definitions.', unexplained: 'No fingerprint changed and the gap was inside the cache lifetime.' };
+    const desc = (b) => b.kind === 'expired' ? `Gap of ${dur(b.gap_s)} between turns: longer than the ${b.ttl} cache lifetime, so the context was written again.` : DESC[b.kind] ?? '';
     const label = ui.cacheSession === 'all' ? 'all sessions' : sname(m, ui.cacheSession);
     return head('Cache', 'Every turn re-sends the whole conversation. What\'s cached is nearly free; what isn\'t is the bill.',
       `<div class="row"><label class="sr" for="cs">Session</label><select id="cs" data-act="cache-session"><option value="all">All sessions</option>${sessions.map((s) => `<option value="${esc(s.session_key)}" title="${esc(s.session_key)}" ${s.session_key === ui.cacheSession ? 'selected' : ''}>${esc(s.title)}${s.project ? ` · ${esc(s.project)}` : ''}</option>`).join('')}</select>
        <label class="sr" for="cd">Days</label><select id="cd" data-act="cache-days">${[1, 7, 30].map((d) => `<option value="${d}" ${d === ui.cacheDays ? 'selected' : ''}>${d === 1 ? '24 hours' : d + ' days'}</option>`).join('')}</select></div>`)
     + `<section class="grid4">
         ${kpi('Hit rate', pct(c.hit_rate), 'of input tokens read from cache', 'teal')}
-        ${kpi('Cache reads', tok(c.reads_per_turn), 'per turn · 1h TTL · billed at 0.1×')}
-        ${kpi('Cache writes', tok(c.last_write), 'last turn · billed at 2× for 1h TTL', 'clay')}
-        ${kpi('Avoidable writes', c.avoidable.total ? `${c.avoidable.count} of ${c.avoidable.total}` : NA, 'bursts with a known cause you control')}
+        ${kpi('Cache reads', tok(c.reads_per_turn), 'per turn · 0.025–0.1× the input price, by model')}
+        ${kpi('Cache writes', tok(c.last_write), 'last turn · 1.25× input (5m) or 2× (1h)', 'clay')}
+        ${kpi('Avoidable writes', c.avoidable.total ? `${c.avoidable.count} of ${c.avoidable.total}` : NA, `${usd(c.avoidable.usd)} of ${usd(c.bursts_usd)} spent on re-writes`)}
       </section>
       <section class="grid2" style="grid-template-columns:1.4fr 1fr">
         <div class="panel">
@@ -321,25 +332,27 @@ const views = {
         </div>
         <div class="panel">
           <h2>Cache bursts — why the cache was rewritten</h2>
+          <div class="row small" style="flex-wrap:wrap">${c.by_cause.map((k) => `<span class="chip">${esc(k.kind)} ${k.count} · ${usd(k.usd)}</span>`).join('')}</div>
           ${c.bursts.slice(0, 12).map((b) => `<div class="inset" style="${b.avoidable ? 'border-color:#4A3A2E' : ''}">
-              <div class="between"><span class="row" style="font-weight:600">Turn ${b.i}${ui.cacheSession === 'all' ? ` <span class="small muted">${sname(m, b.session_key)}</span>` : ''} · ${esc(b.cause)}${b.avoidable ? '<span class="chip warn">avoidable</span>' : ''}</span><span class="mono small clay">+${tok(b.delta)} written</span></div>
-              <div class="note">${esc(desc(b))}</div>${b.fix && b.avoidable ? `<div class="small">Fix: ${esc(b.fix)}</div>` : ''}</div>`).join('') || '<div class="note">No bursts in this range.</div>'}
-          <div class="note">If the avoidable bursts had not happened, ${label} would have written <span class="mono" style="color:var(--fg)">${tok(c.savings_if_avoided_tokens)}</span> fewer tokens — about <span class="mono" style="color:var(--fg)">${pct(c.savings_pct_of_5h)}</span> of a 5-hour window.</div>
+              <div class="between"><span class="row" style="font-weight:600;flex-wrap:wrap">Turn ${b.i}${ui.cacheSession === 'all' ? ` <span class="small muted">${sname(m, b.session_key)}</span>` : ''} · ${esc(b.cause)}${b.avoidable ? '<span class="chip warn">avoidable</span>' : ''}</span><span class="mono small clay" style="white-space:nowrap">+${tok(b.delta)} · ${usd(b.usd)}</span></div>
+              <div class="note">${esc(desc(b))}</div>${b.fix ? `<div class="small">${b.avoidable ? 'Fix: ' : ''}${code(b.fix)}</div>` : ''}</div>`).join('') || '<div class="note">No bursts in this range.</div>'}
+          <div class="note">If the avoidable bursts had not happened, ${label} would have written <span class="mono" style="color:var(--fg)">${tok(c.savings_if_avoided_tokens)}</span> fewer tokens: <span class="mono" style="color:var(--fg)">${usd(c.avoidable.usd)}</span> at list price (as of ${esc(c.prices_as_of)}), about <span class="mono" style="color:var(--fg)">${pct(c.savings_pct_of_5h)}</span> of a 5-hour window.</div>
         </div>
       </section>`;
   }],
 
-  cost: [['cost', 'accounts', 'sessions', 'budgets'], (c, accts, sessions, budgets) => {
+  cost: [[() => `cost?days=7&session=${encodeURIComponent(ui.whatif)}`, 'accounts', 'sessions', 'budgets'], (c, accts, sessions, budgets) => {
     const m = byKey(sessions), nb = { scope: 'all', period: 'day', action: 'notify', ...ui.b }, sel = (k, opts) => `<select name="${k}" data-b>${opts.map(([v, l]) => `<option value="${v}" ${nb[k] === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
-    const w5 = c.windows['5h'], w7 = c.windows['7d'], st = c.settings, rc = st.rate_card ?? {};
+    const w5 = c.windows['5h'], w7 = c.windows['7d'], st = c.settings, rc = st.rate_card ?? {}, RC = ['input', 'write_5m', 'write_1h', 'read', 'output'];
     const resets = w5.map((w) => w.reset).filter(Boolean), firstReset = resets.length ? new Date(Math.min(...resets) * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '—';
     const warnings = [...w7.filter((w) => (w.projected_at_reset ?? 0) > 1 - st.weekly_reserve_pct).map((w) => `${w.account} will reach its ${pct(st.weekly_reserve_pct)} weekly reserve before reset at the current rate (${pct(w.projected_at_reset)} projected).`),
       ...w5.filter((w) => (w.util ?? 0) >= st.warn_pct).map((w) => `${w.account} is past the ${pct(st.warn_pct)} warning on its 5-hour window.`)];
     const maxShare = Math.max(0.0001, ...c.per_session.map((s) => s.share ?? 0));
     const cols = 'grid-template-columns:minmax(0,1.3fr) 1fr 80px 100px 100px 90px 120px';
-    const cell = (s) => ui.dollars ? (s.dollars == null ? NA : `$${s.dollars.toFixed(2)}`) : tok(s.switch_overhead || null);
-    return head('Cost &amp; budgets', 'On a subscription the currency is window headroom. Dollar equivalents use the rate card you set.',
-      `<div class="seg" role="group" aria-label="Units"><button data-act="units" data-v="0" aria-pressed="${!ui.dollars}">Windows</button><button data-act="units" data-v="1" aria-pressed="${ui.dollars}">Dollars (est.)</button></div>`)
+    const wi = c.model_whatif, MODELS = Object.keys(c.prices), sn = wi.switch_now, unit = `list-price dollars (as of ${esc(c.prices_as_of)}) — on a subscription this is an equivalent, not a bill`;
+    const FC = 'grid-template-columns:minmax(0,1.4fr) 60px 70px 150px 90px 90px 90px', WC = `grid-template-columns:110px 60px 90px repeat(${MODELS.length}, minmax(96px, 1fr))`;
+    const alt = (v, base) => v == null ? NA : `<span class="${v < base ? 'teal' : 'muted'}">${usd(v)} <span class="small">${base ? `${v < base ? '−' : '+'}${Math.round(Math.abs(1 - v / base) * 100)}%` : ''}</span></span>`;
+    return head('Cost &amp; budgets', `On a subscription the currency is window headroom. Dollars are list prices as of ${esc(c.prices_as_of)}: an equivalent, not a bill.`)
     + `<section class="grid2" style="grid-template-columns:1.3fr 1fr">
       <div class="panel">
         <div class="between"><h2>Pooled 5-hour window</h2><span class="small muted">first reset ${firstReset}</span></div>
@@ -356,23 +369,25 @@ const views = {
           ['proactive_switch_pct', 'Move a pinned session off an account above'], ['proactive_min_gain', '…to one with at least this much more headroom']].map(([k, l]) =>
           `<label class="between"><span>${l}</span><span class="row"><input type="number" min="0" max="100" step="1" name="${k}" value="${Math.round(st[k] * 100)}">%</span></label>`).join('')}
         <label class="row"><input type="checkbox" name="notify" ${st.notify ? 'checked' : ''}><span>macOS notification on every account switch and warning</span></label>
-        <details ${ui.open.rate ? 'open' : ''} data-k="rate"><summary>Rate card for dollar estimates (${Object.keys(rc).length ? Object.keys(rc).length + ' models' : 'not set'})</summary>
+        <details ${ui.open.rate ? 'open' : ''} data-k="rate"><summary>List prices as of ${esc(c.prices_as_of)} (${Object.keys(rc).length ? Object.keys(rc).length + ' overridden' : 'no overrides'})</summary>
           <div class="col" style="gap:8px;margin-top:8px">
-            ${Object.entries(rc).map(([m, r]) => `<div class="between small mono"><span>${esc(m)}: in ${r.input} · out ${r.output} · read ${r.cache_read} · write ${r.cache_write} $/Mtok</span><button type="button" class="sm" data-act="rate-del" data-m="${esc(m)}">Remove</button></div>`).join('')}
-            <label class="col small muted">Model prefix<input name="rc_model" placeholder="claude-opus-5"></label>
-            <div class="row" style="flex-wrap:wrap">${['input', 'output', 'cache_read', 'cache_write'].map((k) => `<label class="col small muted">${k.replace('_', ' ')} $/Mtok<input type="number" min="0" step="0.01" name="rc_${k}"></label>`).join('')}</div>
-            <button type="button" class="sm" data-act="rate-add">Save rate</button>
+            <div class="small muted">$/MTok: input · 5m write · 1h write · read · output. A model that is not listed has no price and is left out of every sum.</div>
+            ${Object.entries(c.prices).map(([m, r]) => `<div class="small mono">${esc(m)}: ${r.join(' · ')}</div>`).join('')}
+            ${Object.entries(rc).map(([m, r]) => `<div class="between small mono"><span class="amber">override ${esc(m)}: ${RC.map((k) => `${k} ${r[k] ?? '—'}`).join(' · ')}</span><button type="button" class="sm" data-act="rate-del" data-m="${esc(m)}">Remove</button></div>`).join('')}
+            <label class="col small muted">Override for model ids containing<input name="rc_model" placeholder="opus-5-5"></label>
+            <div class="row" style="flex-wrap:wrap">${RC.map((k) => `<label class="col small muted">${k.replace('_', ' ')}<input type="number" min="0" step="0.01" name="rc_${k}"></label>`).join('')}</div>
+            <button type="button" class="sm" data-act="rate-add">Save override</button>
           </div></details>
         ${warnings.map((x) => `<div class="inset warnbox"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#E0A458" stroke-width="2" style="flex-shrink:0" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg><span class="small">${esc(x)}</span></div>`).join('')}
       </form>
     </section>
     <section class="panel">
-      <div class="between"><h2>Budgets</h2><span class="small muted">input-equivalent tokens (cache read 0.1×, cache write 1.25×/2×, output 5×)</span></div>
+      <div class="between"><h2>Budgets</h2><span class="small muted">${unit}</span></div>
       ${budgets.map((b) => `<div class="row" style="gap:12px">
-        <span class="nm" style="width:190px;font-weight:600" title="${esc(b.top.map((x) => `${x.label}: ${units(x.units)}`).join('\n'))}">${esc(b.name)}</span>
+        <span class="nm" style="width:190px;font-weight:600" title="${esc(b.top.map((x) => `${x.label}: $${x.usd.toFixed(2)}`).join('\n'))}">${esc(b.name)}</span>
         <span class="small muted nm" style="width:190px">${esc([b.scope, b.match, b.period === 'week' ? 'rolling 7 days' : b.period === 'session' ? 'per session' : 'today'].filter(Boolean).join(' · '))}</span>
         ${bar([[b.pct, bColor(b)]])}
-        <span class="mono small" style="width:210px">${units(b.spent)} / ${units(b.limit)} units${b.dollars == null ? '' : ` · $${b.dollars.toFixed(2)}`}</span>
+        <span class="mono small" style="width:210px" ${b.unpriced ? `title="${b.unpriced} requests on unpriced models are not counted"` : ''}>${usd(b.spent)} / ${usd(b.limit)}${b.unpriced ? ` · ${b.unpriced} unpriced` : ''}</span>
         <span class="chip ${b.action === 'stop' ? 'bad' : ''}">${esc(b.action)}</span>
         <button class="sm" data-act="budget-del" data-id="${esc(b.id)}" aria-label="Delete budget ${esc(b.name)}">Delete</button></div>`).join('')
         || '<div class="note">No budgets yet. A budget is a spend limit over a scope and a period: it notifies at 80% and 100%, and with action “stop” the router refuses further requests in that scope until the period resets.</div>'}
@@ -383,21 +398,45 @@ const views = {
         <datalist id="bm-project">${[...new Set(sessions.map((s) => s.project).filter(Boolean))].map((p) => `<option value="${esc(p)}">`).join('')}</datalist>
         <datalist id="bm-account">${accts.map((a) => `<option value="${esc(a.id)}">`).join('')}</datalist>
         <label class="col small muted">Period${sel('period', [['day', 'day (since midnight)'], ['week', 'week (rolling 7 days)'], ['session', 'session (per session)']])}</label>
-        <label class="col small muted">Limit (units)<input name="limit" required placeholder="2M" style="width:90px" class="mono"></label>
+        <label class="col small muted">Limit ($)<input name="limit" type="number" min="0.01" step="0.01" required placeholder="20" style="width:90px"></label>
         <label class="col small muted">At 100%${sel('action', [['notify', 'notify'], ['stop', 'stop requests']])}</label>
         <button class="sm">Add budget</button>
       </form>
       <div class="note">“Week” is the last 7×24 hours, rolling. A project is known once a session's transcript has been read, so a project budget starts counting a session a few seconds in. “Stop” answers the CLI with an error naming the budget; raise or delete it here to continue.</div>
     </section>
     <section class="panel">
-      <div class="between"><h2>Where the tokens went — today</h2><span class="small muted">from the response stream and session transcripts, not estimates</span></div>
+      <div class="between"><h2>Where the tokens went — today</h2><span class="small muted">${usd(c.usd)} at list price${c.unpriced ? ` · ${c.unpriced} requests on unpriced models not counted` : ''} · usage from the response stream and transcripts</span></div>
       <div class="table">
-        <div class="tr th" style="${cols}"><span>session</span><span>share of window</span><span>turns</span><span>cache read</span><span>cache write</span><span>output</span><span>${ui.dollars ? 'dollars (est.)' : 'switch overhead'}</span></div>
+        <div class="tr th" style="${cols}"><span>session</span><span>share of window</span><span>turns</span><span>cache read</span><span>cache write</span><span>output</span><span>list price</span></div>
         ${c.per_session.map((s) => `<div class="tr" style="${cols}"><span class="nm">${sname(m, s.session_key)}</span>${bar([[(s.share ?? 0) / maxShare, '#D97757']])}
-          <span>${s.turns}</span><span>${tok(s.joined ? s.cache_read : null)}</span><span>${tok(s.joined ? s.cache_create : null)}</span><span>${tok(s.joined ? s.out_tok : null)}</span><span>${cell(s)}</span></div>`).join('')}
+          <span>${s.turns}</span><span>${tok(s.joined ? s.cache_read : null)}</span><span>${tok(s.joined ? s.cache_create : null)}</span><span>${tok(s.joined ? s.out_tok : null)}</span><span>${s.unpriced === s.turns ? NA : usd(s.usd)}</span></div>`).join('')}
         <div class="tr" style="${cols}"><span>${c.one_shots.count} one-shots</span>${bar([[(c.one_shots.share ?? 0) / maxShare, '#A39E93']])}<span>${c.one_shots.count}</span><span>${NA}</span><span>${NA}</span><span>${tok(c.one_shots.out_tok || null)}</span><span>${NA}</span></div>
       </div>
       <div class="note">"One-shots" are single-message requests with no tools — the desktop's side requests: title generation, prompt suggestions, summaries. They never reach a transcript; their usage is read from the response stream.</div>
+    </section>
+    <section class="panel">
+      <div class="between"><h2>Cache lifetime fit — last ${c.days} days</h2><span class="small muted">each bucket's real pauses replayed under a 5-minute and a 1-hour cache</span></div>
+      <div class="table">
+        <div class="tr th" style="${FC}"><span>bucket · setting</span><span>now</span><span>turns</span><span>after a 5–60 min pause</span><span>actual</span><span>if 5m</span><span>if 1h</span></div>
+        ${c.ttl_fit.map((f) => `<div class="tr" style="${FC}"><span class="nm">${f.bucket === 'main' ? 'main conversation' : 'subagents'} <span class="muted">${f.setting}</span></span><span>${f.current}</span><span>${f.turns}</span><span>${f.turns_5_60}</span>
+          <span>${usd(f.actual_usd)}</span><span>${alt(f.usd_5m, f.actual_usd)}</span><span>${alt(f.usd_1h, f.actual_usd)}</span></div>
+          <div class="small" style="padding:0 10px 8px"><span class="chip ${f.switch_to ? 'ok' : ''}">${f.switch_to ? 'no quality change' : 'keep'}</span> ${code(f.recommend)}</div>`).join('')}
+      </div>
+      <div class="note">A pause of 5–60 minutes is where the two lifetimes differ: on 5m the whole context is written again, on 1h it is read. A 1h write costs 2× input, a 5m write 1.25×. A switch is only suggested when it saves at least 5% and $1.</div>
+    </section>
+    <section class="panel">
+      <div class="between" style="flex-wrap:wrap"><h2>Model what-if — the same tokens at another model's price</h2>
+        <div class="row"><span class="chip warn">${esc(wi.label)}</span><label class="sr" for="wi">Session</label><select id="wi" class="sm" data-act="whatif"><option value="all">All sessions · ${c.days} days</option>${sessions.map((s) =>
+          `<option value="${esc(s.session_key)}" ${s.session_key === ui.whatif ? 'selected' : ''}>${esc(s.title)}${s.project ? ` · ${esc(s.project)}` : ''}</option>`).join('')}</select></div></div>
+      <div class="table">
+        <div class="tr th" style="${WC}"><span>ran on</span><span>turns</span><span>actual</span>${MODELS.map((k) => `<span>on ${esc(nice(k))}</span>`).join('')}</div>
+        ${wi.rows.map((r) => `<div class="tr" style="${WC}"><span>${esc(nice(r.from))}</span><span>${r.turns}</span><span>${usd(r.usd)}</span>${MODELS.map((k) => `<span>${k === r.from ? NA : alt(r.on[k], r.usd)}</span>`).join('')}</div>`).join('')
+          || '<div class="note">No priced turns in this range.</div>'}
+      </div>
+      ${sn ? `<div class="col small"><span class="muted">Switch now: ${esc(nice(sn.from))} with ${tok(sn.context)} in context, ${usd(sn.per_turn_usd)} a turn over its last ${sn.turns_sampled} turns. A switch writes the whole context again on the new model first.</span>
+        ${sn.to.map((t) => `<div class="between mono"><span>→ ${esc(nice(t.model))}</span><span>re-write ${usd(t.rewrite_usd)} · then ${usd(t.per_turn_usd)} a turn · ${t.breakeven_turns == null ? 'never pays back' : `pays back after ${t.breakeven_turns} turns`}</span></div>`).join('')}</div>`
+        : '<div class="note">Pick a session to see what switching it now would cost: the one-time re-write and the turns it takes to earn that back.</div>'}
+      <div class="note">The arithmetic is exact (${wi.unpriced ? `${wi.unpriced} requests on unpriced models left out` : 'every request priced'}). Whether the cheaper model would have done the same work as well is not known: nothing here measures quality.</div>
     </section>`;
   }],
 
@@ -406,20 +445,25 @@ const views = {
       ...n.recurring_preambles.map((p) => [`The same ${tok(p.est_tokens)}-token preamble opens ${p.sessions} sessions`, 'make it a skill',
         `Pasted as the first message in ${p.sessions} sessions across ${p.projects} project${p.projects === 1 ? '' : 's'}. As a skill it lives in the cached system prefix instead of the uncached first turn.`, `≈${tok(p.est_tokens * p.sessions)} tok re-sent uncached`]),
       ...(n.unused_tools.loaded ? [[`${n.unused_tools.loaded} tools loaded, ${n.unused_tools.used} ever called`, 'context',
-        `${n.unused_tools.never_used.length} tool definitions were never called in any transcript. They sit in every request's prefix and cause bursts whenever a server reconnects.`,
+        `${n.unused_tools.never_used.length} loaded tool definitions were never called in any transcript, and every request re-reads them. Deferred definitions (tool search) are not counted${n.unused_tools.approx ? ' — except in this window, which only has requests logged before the router told the two apart' : ''}.`,
         `<details data-k="unused" ${ui.open.unused ? 'open' : ''}><summary>Show unused tools</summary><div class="mono small" style="margin-top:6px">${n.unused_tools.never_used.map(esc).join(', ')}</div></details>`]] : []),
       ...(n.big_context_sessions.length ? [[`${n.big_context_sessions.length} session${n.big_context_sessions.length === 1 ? '' : 's'} crossed 120k context`, 'context',
         `Each later turn re-reads all of it. ${n.big_context_sessions.map((b) => `${b.session_key.slice(0, 8)} peaked at ${tok(b.max_context_est)} (${b.turns_over_120k} turns over 120k)`).map(esc).join('; ')}. Starting fresh with a summary around 100k keeps the same work cheaper.`, '']] : []),
-      ...(n.burst_hours.length ? [[`Cache bursts cluster at ${two(n.burst_hours[0].hour)}:00–${two((n.burst_hours[0].hour + 1) % 24)}:00`, 'habit',
-        `${n.burst_hours[0].count} of ${n.totals.bursts} bursts this week started in that hour. Sessions left idle over 1h come back cold; one cheap turn before 60 minutes keeps the 1h cache alive.`, '']] : []),
+      ...(n.burst_hours.length ? [[`Cache re-writes cluster at ${two(n.burst_hours[0].hour)}:00–${two((n.burst_hours[0].hour + 1) % 24)}:00`, 'habit',
+        `${n.burst_hours[0].count} of ${n.totals.bursts} re-writes in this window started in that hour.`, '']] : []),
     ];
-    const rules = S.context_rules ?? [];
-    return head('Insights', 'Patterns across every session, and the context rules that come out of them.',
-      `<span class="small muted">Learned from ${n.window.days} days · ${n.window.turns.toLocaleString()} turns · ${n.window.sessions} sessions</span>`)
-    + `<section class="grid2" style="grid-template-columns:1.2fr 1fr">
-      <div class="panel"><h2>Recurring patterns</h2>
-        ${cards.map(([t, chip, body, foot]) => `<div class="inset"><div class="between"><b>${esc(t)}</b><span class="chip ${chip === 'habit' ? '' : 'warn'}">${chip}</span></div><div class="note">${body.startsWith('<') ? body : esc(body)}</div>${foot ? `<div class="small mono amber">${foot}</div>` : ''}</div>`).join('')
-          || '<div class="note">No recurring patterns yet. They show up once the ledger has a few days of joined sessions.</div>'}
+    const shown = n.findings.filter((f) => (f.usd ?? 0) >= 0.5), hidden = n.findings.length - shown.length;
+    return head('Insights', `Where the money went, ranked. Every number is arithmetic over the ledger at list prices (as of ${esc(n.prices_as_of)}); no model is asked.`,
+      `<span class="small muted">${n.window.days} days · ${n.window.turns.toLocaleString()} turns · ${n.window.sessions} sessions · ${usd(n.usd)}${n.unpriced_requests ? ` · ${n.unpriced_requests} requests on unpriced models` : ''}</span>`)
+    + `<section class="grid2" style="grid-template-columns:1.4fr 1fr">
+      <div class="panel"><div class="between"><h2>Findings</h2><span class="small muted">waste ${usd(n.totals.usd_a)} · model choices ${usd(n.totals.usd_b)}</span></div>
+        ${shown.map((f) => `<div class="inset"><div class="between"><b>${esc(f.title)}</b><span class="mono ${f.tier === 'A' ? 'clay' : 'amber'}" style="white-space:nowrap">${usd(f.usd)}</span></div>
+          <div class="note">${f.evidence.map(esc).join(' · ')}</div>
+          ${f.fix ? `<div class="between small"><span>${code(f.fix)}</span><button class="sm" data-fix="${esc(snippet(f.fix))}" title="Copy the setting or command">Copy</button></div>` : ''}
+          <div class="row"><span class="chip ${QUAL[f.quality][0]}">${QUAL[f.quality][1]}</span><span class="chip">${f.tier === 'A' ? 'waste' : 'model choice'}</span>${f.session_key ? `<a class="small muted" href="#accounts?tl=${encodeURIComponent(f.session_key)}">timeline →</a>` : ''}</div></div>`).join('')
+          || '<div class="note">No finding of $0.50 or more in this window.</div>'}
+        ${hidden ? `<div class="note">Not shown: ${hidden} finding${hidden === 1 ? '' : 's'} under $0.50.</div>` : ''}
+        <div class="note">“Waste” findings cost money without changing what the model did. “Model choice” findings are exact arithmetic on your own tokens; <span class="amber">unverified</span> means nothing here tells whether the cheaper model would have done the work as well. The two totals overlap and are not added up.</div>
       </div>
       <div class="col" style="gap:16px">
         <div class="panel"><div class="between"><h2>Context health</h2><span class="small muted">sessions past ${pct(S.context_warn_pct)} of their window</span></div>
@@ -428,21 +472,9 @@ const views = {
               <div class="note">${a.text ? esc(a.text.length > 280 ? a.text.slice(0, 280) + '…' : a.text) : top ? `Largest tool result: ${esc(top.tool)} ${esc(top.target)} (${tok(top.tokens)}).` : 'Breakdown only.'}</div>
               <div class="small muted">${ago(a.ts)} · <a href="#accounts">full breakdown in Sessions →</a></div></div>`; }).join('') || '<div class="note">No session has crossed the warning threshold yet.</div>'}
         </div>
-        <div class="panel">
-          <div class="between"><h2>Global context rules</h2><span class="small muted row"><span class="dot" style="background:${S.openvikings_endpoint ? 'var(--teal)' : 'var(--gray)'}"></span>${S.openvikings_endpoint ? 'OpenVikings endpoint set' : 'OpenVikings not connected'}</span></div>
-          <div class="note">Rules are stored locally. Syncing them to OpenVikings, so every harness applies them, is a placeholder until that endpoint exists.</div>
-          ${rules.map((r) => `<label class="inset" style="flex-direction:row;align-items:center;gap:10px"><input type="checkbox" data-rule="${esc(r.id)}" ${r.enabled ? 'checked' : ''}><span style="flex-grow:1">${esc(r.text)}</span><span class="chip ${r.state === 'synced' ? 'ok' : ''}">${esc(r.state)}</span></label>`).join('')}
-          <form id="rule-add" class="row"><label class="sr" for="rule-text">New rule</label><input id="rule-text" name="text" placeholder="New rule…" required style="flex-grow:1"><button class="sm">Add</button></form>
-          <form id="ov" class="row" style="flex-wrap:wrap"><label class="row small muted" style="flex-grow:1">Endpoint<input name="endpoint" value="${esc(S.openvikings_endpoint ?? '')}" placeholder="not set" style="flex-grow:1"></label><button class="sm">Save</button>
-            <button type="button" class="sm" disabled title="Placeholder: sync is not built yet">Sync now</button></form>
-        </div>
-        <div class="panel"><h2>This week, if you took every suggestion</h2>
-          <div class="grid4" style="grid-template-columns:repeat(3,minmax(0,1fr))">
-            <div class="col"><span class="small muted">tokens saved</span><span class="mono" style="font-size:24px">${n.totals.tokens_saved_est ? '≈' + tok(n.totals.tokens_saved_est) : NA}</span></div>
-            <div class="col"><span class="small muted">of one weekly window</span><span class="mono" style="font-size:24px">${NA}</span></div>
-            <div class="col"><span class="small muted">bursts avoided</span><span class="mono" style="font-size:24px">${n.totals.bursts_avoidable}</span></div>
-          </div>
-          <div class="note">Counted from avoidable cache bursts in your own transcripts, joined to the router's ledger by request id. They change as the ledger grows.</div>
+        <div class="panel"><h2>Patterns</h2>
+          ${cards.map(([t, chip, body, foot]) => `<div class="inset"><div class="between"><b>${esc(t)}</b><span class="chip ${chip === 'habit' ? '' : 'warn'}">${chip}</span></div><div class="note">${body.startsWith('<') ? body : esc(body)}</div>${foot ? `<div class="small mono amber">${foot}</div>` : ''}</div>`).join('')
+            || '<div class="note">No recurring patterns yet. They show up once the ledger has a few days of joined sessions.</div>'}
         </div>
       </div></section>`;
   }],
@@ -453,7 +485,7 @@ const views = {
       <h2>The brain is off</h2>
       <div class="note">Turning it on does three things:</div>
       <div class="note"><b style="color:var(--fg)">1. Notes, for free.</b> Every session that has been idle for 15 minutes gets one Markdown note in <span class="mono">wiki/logs/</span> under the folder below: what you asked (each prompt cut to 300 characters), the files it wrote, the commands that worked, the tools and subagents it used. Obvious secrets are redacted. No model is called, and your existing sessions are written on the first pass.</div>
-      <div class="note"><b style="color:var(--fg)">2. Distilling, which spends quota.</b> Turning a session into decisions, learnings and a skill candidate is a call through your own <span class="mono">claude</span> CLI: a small model decides whether it is worth it, a larger one writes. It only runs when you click Distill (or when you switch it to run on idle), and never past the daily cap of ${units(b.cap_units)} units.</div>
+      <div class="note"><b style="color:var(--fg)">2. Distilling, which spends quota.</b> Turning a session into decisions, learnings and a skill candidate is a call through your own <span class="mono">claude</span> CLI: a small model decides whether it is worth it, a larger one writes. It only runs when you click Distill (or when you switch it to run on idle), and never past the daily cap of ${usd(b.cap_usd)} at list price.</div>
       <div class="note"><b style="color:var(--fg)">3. Skills, only when you say so.</b> Skill candidates stay in the folder until you promote one; promoting copies it to your Claude skills folder. Nothing else is written outside the folder below.</div>
       <div class="note">The ledger still stores no request bodies. This folder is the one place that holds excerpts of your own prompts and commands, and you can open it in Obsidian.</div>
       <label class="col small muted">Folder<input name="dir" value="${esc(b.dir)}" class="mono"></label>
@@ -493,12 +525,12 @@ const views = {
     return head('Brain', sub, `<details data-k="bset" ${ui.open.bset ? 'open' : ''} style="max-width:420px"><summary>Settings</summary>
         <form id="brain-settings" class="col" style="gap:8px;margin-top:8px">
           <label class="between small"><span>Distill</span><select name="brain_distill" class="sm">${[['manual', 'only when I click'], ['on_idle', 'when a session goes idle']].map(([v, l]) => `<option value="${v}" ${S.brain_distill === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-          <label class="between small"><span>Daily cap (units)</span><input name="brain_daily_units" value="${units(b.cap_units)}" class="mono" style="width:90px"></label>
+          <label class="between small"><span>Daily cap ($ at list price)</span><input name="brain_daily_usd" type="number" min="0" step="0.05" value="${b.cap_usd}" style="width:90px"></label>
           <label class="between small"><span>Classifier <span class="muted">(in use: ${esc(b.classifier_backend)})</span></span><select name="classifier" class="sm">${['auto', 'jev', 'model'].map((v) => `<option ${S.classifier === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <div class="row"><button class="sm">Save</button><button type="button" class="sm" data-bact="disable">Turn the brain off</button></div>
         </form></details>`)
     + `<section class="grid4">
-      ${kpi('Brain spend today', units(b.spend_today_units), `of ${units(b.cap_units)} units${b.queued ? ` · ${b.queued} queued for tomorrow` : ''}`, b.spend_today_units >= b.cap_units ? 'clay' : '')}
+      ${kpi('Brain spend today', usd(b.spend_today_usd), `of ${usd(b.cap_usd)} at list price${b.queued ? ` · ${b.queued} queued for tomorrow` : ''}`, b.spend_today_usd >= b.cap_usd ? 'clay' : '')}
       ${kpi('Sessions captured', b.sessions_captured, `${b.distilled} distilled`)}
       ${kpi('Skills promoted', b.promoted, 'loaded by every new session', 'teal')}
       ${kpi('Candidates waiting', b.candidates, 'review, then promote or reject', b.candidates ? 'amber' : '')}
@@ -523,7 +555,7 @@ const views = {
         <div class="tr th" style="${BC}"><span>skill</span><span>status</span><span>uses</span><span>sessions</span><span>projects</span><span>last used</span><span>source</span><span>cost to find</span></div>
         ${b.skills.map((k) => `<div class="tr" style="${BC}"><span class="nm">${item(`skills/candidates/${k.name}/SKILL.md`, k.name)}</span>
           <span><span class="chip ${k.status === 'promoted' ? 'ok' : ''}">${esc(k.status)}</span>${k.status === 'promoted' && (k.last_used ?? k.promoted_ts) < Date.now() - 30 * 864e5 ? ' <span class="chip warn" title="Its description costs prefix tokens in every session">unused 30d</span>' : ''}</span>
-          <span>${k.uses}</span><span>${k.sessions}</span><span>${k.projects}</span><span>${k.last_used ? ago(k.last_used) : NA}</span><span class="nm" title="${esc(k.source)}">${esc(k.source)}</span><span>${k.source_units ? units(k.source_units) : NA}</span></div>`).join('')
+          <span>${k.uses}</span><span>${k.sessions}</span><span>${k.projects}</span><span>${k.last_used ? ago(k.last_used) : NA}</span><span class="nm" title="${esc(k.source)}">${esc(k.source)}</span><span>${k.source_usd ? usd(k.source_usd) : NA}</span></div>`).join('')
           || '<div class="note">No skills yet. Distilling a session that worked out a reusable procedure proposes one; you can also import a SKILL.md by URL.</div>'}
       </div>
       <div class="note">A promoted skill adds its description line to every session's prefix, and applies from the next session. Skills unused for 30 days are flagged so you can demote them.</div>
@@ -603,6 +635,7 @@ document.addEventListener('click', (e) => {
     ui.busy[d.handoff] = true; refresh(true);
     send('POST', `sessions/${encodeURIComponent(d.handoff)}/handoff`).then((r) => { if (r?.error) alert(`Handoff failed: ${r.error.type}`); }).finally(() => { delete ui.busy[d.handoff]; refresh(true); });
   }
+  if (d.fix) navigator.clipboard.writeText(d.fix).then(() => { t.textContent = 'Copied'; });
   if (d.copy) navigator.clipboard.writeText(document.querySelector(`pre[data-ho="${CSS.escape(d.copy)}"]`).textContent).then(() => { t.textContent = 'Copied'; });
   if (d.pin) {
     const acct = document.querySelector(`select[data-s="${CSS.escape(d.pin)}"]`).value;
@@ -614,13 +647,13 @@ document.addEventListener('click', (e) => {
   if (d.act === 'focus-add') $('#add-id')?.focus();
   if (d.act === 'goto-add') { location.hash = '#accounts'; setTimeout(() => $('#add-id')?.focus(), 400); }
   if (d.act === 'relogin') { ui.open[`relogin-${d.id}`] = !ui.open[`relogin-${d.id}`]; refresh(true); }
-  if (d.act === 'units') { ui.dollars = d.v === '1'; refresh(true); }
   if (d.act === 'budget-del' && confirm('Delete this budget?')) putSettings({ budgets: S.budgets.filter((b) => b.id !== d.id) });
   if (d.act === 'rate-del') { const rc = { ...S.rate_card }; delete rc[d.m]; putSettings({ rate_card: rc }); }
   if (d.act === 'rate-add') {
     const f = new FormData($('#budgets')), m = String(f.get('rc_model')).trim();
-    if (!m) return alert('Model prefix is required');
-    putSettings({ rate_card: { ...S.rate_card, [m]: Object.fromEntries(['input', 'output', 'cache_read', 'cache_write'].map((k) => [k, Number(f.get(`rc_${k}`)) || 0])) } });
+    if (!m) return alert('Which model ids the override applies to is required');
+    // only the fields that were filled in override the built-in price
+    putSettings({ rate_card: { ...S.rate_card, [m]: Object.fromEntries(['input', 'write_5m', 'write_1h', 'read', 'output'].filter((k) => f.get(`rc_${k}`) !== '').map((k) => [k, Number(f.get(`rc_${k}`))])) } });
   }
 });
 document.addEventListener('change', (e) => {
@@ -628,6 +661,7 @@ document.addEventListener('change', (e) => {
   if (d.s) ui.open[`pin-${d.s}`] = t.value;
   if (d.act === 'cache-session') { ui.cacheSession = t.value; refresh(true); }
   if (d.act === 'cache-days') { ui.cacheDays = Number(t.value); refresh(true); }
+  if (d.act === 'whatif') { ui.whatif = t.value; refresh(true); }
   if ('b' in d) { // Add-budget selects: remembered across polls; a session cap is always per session
     const f = t.form, s = f.elements;
     if (s.scope.value === 'session') s.period.value = 'session';
@@ -641,7 +675,6 @@ document.addEventListener('change', (e) => {
     const v = Number(t.value);
     if (v >= 0 && v <= 100) putSettings({ [t.name]: v / 100 }); else alert('Enter 0–100');
   }
-  if (d.rule) putSettings({ context_rules: S.context_rules.map((r) => (r.id === d.rule ? { ...r, enabled: t.checked } : r)) });
 });
 document.addEventListener('toggle', (e) => { if (e.target.dataset?.k) ui.open[e.target.dataset.k] = e.target.open; }, true);
 document.addEventListener('submit', async (e) => {
@@ -652,23 +685,21 @@ document.addEventListener('submit', async (e) => {
     if (r.login_cmd) { ui.added = { id, login_cmd: r.login_cmd }; refresh(true); }
   }
   if (fid === 'budget-add') {
-    const scope = f.get('scope'), limit = parseUnits(String(f.get('limit')));
-    if (!(limit > 0)) return alert('Limit: a number of units, e.g. 2M or 500k');
+    const scope = f.get('scope'), limit = Number(f.get('limit'));
+    if (!(limit > 0)) return alert('Limit: dollars at list price, e.g. 20');
     const r = await putSettings({ budgets: [...(S.budgets ?? []), { id: `b${Date.now()}`, name: String(f.get('name')).trim(), scope, match: /project|account/.test(scope) ? String(f.get('match')).trim() : null,
       period: scope === 'session' ? 'session' : f.get('period'), limit, action: f.get('action'), thresholds: [0.8, 1] }] });
     if (!r?.error) { ui.b = {}; refresh(true); }
   }
-  if (fid === 'rule-add') putSettings({ context_rules: [...S.context_rules, { id: `r${Date.now()}`, text: String(f.get('text')), enabled: true, state: 'proposed' }] });
   if (fid === 'brain-enable') putSettings({ brain_enabled: true, brain_dir: String(f.get('dir')).trim() || null });
   if (fid === 'brain-search') { ui.bq = String(f.get('q')).trim(); refresh(true); }
   if (fid === 'brain-facts') { await act('brain/facts', { text: String(f.get('text')) }, 'PUT'); ui.bedit = false; refresh(true); }
   if (fid === 'brain-import') { const r = await act('brain/skills/import', { url: String(f.get('url')).trim() }); if (r?.name) { ui.note = `skills/candidates/${r.name}/SKILL.md`; refresh(true); } }
   if (fid === 'brain-settings') {
-    const cap = parseUnits(String(f.get('brain_daily_units')));
-    if (!(cap >= 0)) return alert('Daily cap: a number of units, e.g. 200k');
-    putSettings({ brain_distill: f.get('brain_distill'), brain_daily_units: cap, classifier: f.get('classifier') });
+    const cap = Number(f.get('brain_daily_usd'));
+    if (f.get('brain_daily_usd') === '' || !(cap >= 0)) return alert('Daily cap: dollars at list price, e.g. 1');
+    putSettings({ brain_distill: f.get('brain_distill'), brain_daily_usd: cap, classifier: f.get('classifier') });
   }
-  if (fid === 'ov') putSettings({ openvikings_endpoint: String(f.get('endpoint')).trim() || null });
 });
 addEventListener('hashchange', () => { deep(); refresh(true); });
 deep(); refresh(true);

@@ -8,7 +8,7 @@ import { resolve, dirname, sep } from 'node:path';
 import { db, settings, now } from './ledger.ts';
 import { claude } from './advisor.ts';
 import { ROOT } from './tailer.ts';
-import { UNITS, MSG, fmtUnits } from './console.ts';
+import { MSG, spendOf, fmtUsd } from './console.ts';
 
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
@@ -19,7 +19,7 @@ export const dir = () => resolve((process.env.BRAIN_DIR ?? settings().brain_dir 
 const skillsDir = () => process.env.CLAUDE_SKILLS_DIR ?? `${homedir()}/.claude/skills`;
 const err = (type: string, message?: string) => ({ error: { type, ...(message && { message }) } });
 class Bad extends Error {}  // a path from the API that leaves the vault -> 400
-class Over extends Error {} // brain_daily_units is spent -> queue, no model call
+class Over extends Error {} // brain_daily_usd is spent -> queue, no model call
 
 // ---- text helpers ----
 // One scrubber for every excerpt, before it is written to the vault or sent to a model. Obvious shapes only; it is not a DLP.
@@ -66,13 +66,13 @@ export function front(text: string): Record<string, string> | null {
   for (const x in o) o[x] = o[x].replace(/^(["'])(.*)\1$/, '$2');
   return o;
 }
-// Rewrites the keys in `f` where they stand (new keys go last), keeps every other line the user added; tags are a union.
+// Rewrites the keys in `f` where they stand (new keys go last; a key set to undefined is dropped), keeps every other line the user added; tags are a union.
 function setFront(t: string, f: Record<string, any>) {
   const m = t.match(FM), seen = new Set<string>();
   const old = (front(t)?.tags ?? '').replace(/^\[|\]$/g, '').split(',').map((x) => x.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
   if (f.tags) f = { ...f, tags: [...new Set([...f.tags, ...old])] };
-  const lines = (m?.[1] ?? '').split('\n').filter(Boolean).map((l) => { const k = l.match(/^([\w-]+):/)?.[1] ?? ''; return k in f ? (seen.add(k), `${k}: ${yv(f[k])}`) : l; });
-  for (const [k, v] of Object.entries(f)) if (!seen.has(k)) lines.push(`${k}: ${yv(v)}`);
+  const lines = (m?.[1] ?? '').split('\n').filter(Boolean).map((l) => { const k = l.match(/^([\w-]+):/)?.[1] ?? ''; return k in f ? (seen.add(k), f[k] === undefined ? '' : `${k}: ${yv(f[k])}`) : l; }).filter(Boolean);
+  for (const [k, v] of Object.entries(f)) if (!seen.has(k) && v !== undefined) lines.push(`${k}: ${yv(v)}`);
   return `---\n${lines.join('\n')}\n---\n${m ? t.slice(m[0].length) : t}`;
 }
 function put(root: string, rel: string, body: string, o: { name?: string; front?: Record<string, any>; head?: string } = {}) {
@@ -170,19 +170,29 @@ async function extract(sk: string) {
 }
 
 const MAXC = 80; // ponytail: a note lists the last 80 distinct commands that worked; the transcript has the rest
+// a note that is nothing but frontmatter and our own marked blocks: the user wrote nothing in it
+const onlyGenerated = (t: string) => !t.replace(FM, '').replace(/<!-- agent-router:begin( \w+)? -->[\s\S]*?<!-- agent-router:end\1 -->/g, '').trim();
 async function captureOne(sk: string, root: string) {
-  const x = await extract(sk), b = one('select note_path from brain_sessions where session_key = ?', sk);
-  const done = (path: string | null) => db.prepare(`insert into brain_sessions (session_key, last_captured_ts, note_path) values (?, ?, ?)
-    on conflict (session_key) do update set last_captured_ts = excluded.last_captured_ts, note_path = coalesce(excluded.note_path, note_path)`).run(sk, Date.now(), path);
-  if (!x || (!x.prompts.length && !x.calls)) return void done(null);
+  const x = await extract(sk), prev = one('select note_path from brain_sessions where session_key = ?', sk)?.note_path as string | undefined;
+  const done = (path: string | null, trivial = 0) => db.prepare(`insert into brain_sessions (session_key, last_captured_ts, note_path, trivial) values (?, ?, ?, ?)
+    on conflict (session_key) do update set last_captured_ts = excluded.last_captured_ts, note_path = excluded.note_path, trivial = excluded.trivial`).run(sk, Date.now(), path, trivial);
+  if (!x) return void done(prev ?? null); // no transcript on disk (any more): a note already written stays
   const s = one('select title, cwd from sessions where session_key = ?', sk) ?? {};
+  // A probe one-shot (fewer than 2 typed prompts and fewer than 3 tool calls) is noise: no note. One written before this rule is
+  // removed, unless the user wrote in it outside the markers: then the file stays and only leaves the index, daily and project lists.
+  if (x.prompts.length < 2 && x.calls < 3) {
+    const p = `${root}/${prev}`, gone = !!prev && existsSync(p) && onlyGenerated(readFileSync(p, 'utf8'));
+    if (gone) { rmSync(p); log(root, `remove ${prev} (one-shot session)`); }
+    done(gone ? null : prev ?? null, 1);
+    return prev ? { day: prev.split('/').pop()!.slice(0, 10), project: fname((s.cwd ?? x.cwd)?.split('/').pop() ?? '') || null, removed: gone } : undefined;
+  }
   if (!s.cwd && x.cwd) db.prepare('update sessions set cwd = ? where session_key = ?').run(x.cwd, sk);
-  const a = one(`select min(ts) t0, max(ts) t1, count(*) turns, round(sum(${UNITS()})) units, sum(cache_read) cr, sum(coalesce(cache_read, 0) + coalesce(cache_create, 0) + coalesce(in_tok, 0)) inp,
+  const a = one(`select min(ts) t0, max(ts) t1, count(*) turns, sum(cache_read) cr, sum(coalesce(cache_read, 0) + coalesce(cache_create, 0) + coalesce(in_tok, 0)) inp,
       max(iif(agent_id is null, in_tok + cache_read + cache_create, null)) peak, group_concat(distinct model) models, group_concat(distinct account_id) accounts
     from requests where session_key = ? and ${MSG()} and status < 400`, sk);
   const started = x.t0 || a.t0 || Date.now(), ended = x.t1 || a.t1 || started, d = day(started);
   const title = clip(s.title ?? x.prompts[0] ?? sk.slice(0, 8), 80), project = fname((s.cwd ?? x.cwd)?.split('/').pop() ?? '') || null;
-  let rel = `wiki/logs/${d} ${fname(title) || sk.slice(0, 8)}.md`, old = b?.note_path as string | undefined;
+  let rel = `wiki/logs/${d} ${fname(title) || sk.slice(0, 8)}.md`, old = prev;
   // the session key in the frontmatter is the identity: a note the user moved inside wiki/logs is found again by it
   if (old && !existsSync(`${root}/${old}`)) old = tree(root).find((p) => p.startsWith('wiki/logs/') && front(readFileSync(`${root}/${p}`, 'utf8'))?.session === sk);
   if (rel !== old && existsSync(`${root}/${rel}`)) rel = rel.replace(/\.md$/, ` (${sk.slice(0, 8)}).md`); // another session, same title and day
@@ -197,7 +207,8 @@ async function captureOne(sk: string, root: string) {
     '## Account switches', li(all('select ts, from_account f, to_account t, reason from migrations where session_key = ? order by ts', sk)
       .map((m) => `${new Date(m.ts).toLocaleString('sv').slice(0, 16)} ${m.f ?? '—'} → ${m.t} (${m.reason ?? '—'})`))].join('\n\n'),
     { front: { session: sk, title, project, started: new Date(started).toISOString(), ended: new Date(ended).toISOString(), turns: a.turns,
-      models: (a.models ?? '').split(',').filter(Boolean), accounts: (a.accounts ?? '').split(',').filter(Boolean), units: a.units ?? 0,
+      models: (a.models ?? '').split(',').filter(Boolean), accounts: (a.accounts ?? '').split(',').filter(Boolean), units: undefined, // units: from before dollars
+      usd: +spendOf(`session_key = ? and ${MSG()} and status < 400`, sk).usd.toFixed(4),
       cache_hit: a.inp ? +(a.cr / a.inp).toFixed(3) : null, peak_context: a.peak ?? null, tags: ['session', ...(project ? [tag(project)] : [])] } });
   done(rel);
   log(root, `capture ${rel}`);
@@ -205,45 +216,49 @@ async function captureOne(sk: string, root: string) {
 }
 function dayNote(root: string, d: string) {
   const t0 = new Date(`${d}T00:00:00`).getTime(), t1 = new Date(t0).setDate(new Date(t0).getDate() + 1);
-  const u = one(`select round(sum(${UNITS()})) u, round(sum(iif(source = 'brain', ${UNITS()}, 0))) b, count(*) n from requests where ${MSG()} and status < 400 and ts >= ? and ts < ?`, t0, t1);
-  put(root, `wiki/daily/${d}.md`, [`# ${d}`, `Spend: ${fmtUnits(u.u ?? 0)} units over ${u.n} requests, of which the brain ${fmtUnits(u.b ?? 0)}.`, '## Sessions',
-    li(all(`select note_path p from brain_sessions where note_path like ? order by 1`, `wiki/logs/${d} %`).map((r) => link(r.p)))].join('\n\n'), { front: { date: d, tags: ['daily'] } });
+  const w = `${MSG()} and status < 400 and ts >= ? and ts < ?`, u = spendOf(w, t0, t1);
+  put(root, `wiki/daily/${d}.md`, [`# ${d}`, `Spend: ${fmtUsd(u.usd)} at list price over ${u.n} requests${u.unpriced ? ` (${u.unpriced} on unpriced models not counted)` : ''}, of which the brain ${fmtUsd(spendOf(`source = 'brain' and ${w}`, t0, t1).usd)}.`, '## Sessions',
+    li(all(`select note_path p from brain_sessions where note_path like ? and coalesce(trivial, 0) = 0 order by 1`, `wiki/logs/${d} %`).map((r) => link(r.p)))].join('\n\n'), { front: { date: d, tags: ['daily'] } });
 }
 // Sessions list is regenerated; the `knowledge` block above it is appended to by distill and rewritten only by Consolidate.
 function projectNote(root: string, project: string) {
   put(root, `wiki/projects/${project}.md`, `## Sessions\n\n${li(all(`select b.note_path p from brain_sessions b join sessions s using (session_key)
-    where b.note_path is not null and substr(s.cwd, -length(?) - 1) = '/' || ? order by 1 desc`, project, project).map((r) => link(r.p)))}`,
+    where b.note_path is not null and coalesce(b.trivial, 0) = 0 and substr(s.cwd, -length(?) - 1) = '/' || ? order by 1 desc`, project, project).map((r) => link(r.p)))}`,
     { front: { project, tags: ['project'] }, head: `# ${project}\n\n## Knowledge\n\n${mark('knowledge').join('\n')}\n\n` });
 }
 // index.md (the catalogue Claude reads first) and the note of every promoted skill
 function index(root: string) {
-  const proj = new Map(all(`select b.note_path p, s.cwd from brain_sessions b join sessions s using (session_key) where b.note_path is not null`).map((r) => [r.p, r.cwd?.split('/').pop()]));
+  const noted = all(`select b.note_path p, s.cwd, b.trivial from brain_sessions b join sessions s using (session_key) where b.note_path is not null`);
+  const proj = new Map(noted.map((r) => [r.p, r.cwd?.split('/').pop()])), hidden = new Set(noted.filter((r) => r.trivial).map((r) => r.p)); // hidden: one-shot notes the user edited
   for (const k of stats().skills) if (k.status === 'promoted')
     put(root, `skills/${k.name}.md`, [`# ${k.name}`, `Status: ${k.status}${k.promoted_ts ? ` since ${day(k.promoted_ts)}` : ''} · Source: ${k.source_session ? link(one('select note_path p from brain_sessions where session_key = ?', k.source_session)?.p ?? k.source_session) : k.source}`,
-      `Used ${k.uses} time${k.uses === 1 ? '' : 's'} in ${k.sessions} session${k.sessions === 1 ? '' : 's'} across ${k.projects} project${k.projects === 1 ? '' : 's'}${k.last_used ? `, last on ${day(k.last_used)}` : ''}.${k.source_units ? ` Working it out the first time cost ${fmtUnits(k.source_units)} units.` : ''}`,
+      `Used ${k.uses} time${k.uses === 1 ? '' : 's'} in ${k.sessions} session${k.sessions === 1 ? '' : 's'} across ${k.projects} project${k.projects === 1 ? '' : 's'}${k.last_used ? `, last on ${day(k.last_used)}` : ''}.${k.source_usd ? ` Working it out the first time cost ${fmtUsd(k.source_usd)} at list price.` : ''}`,
       `Installed copy: \`${skillsDir()}/${k.name}/SKILL.md\``].join('\n\n'), { front: { skill: k.name, tags: ['skill'] } });
   const files = tree(root);
-  const sec = (h: string, pre: string, f = (p: string) => `- ${link(p)}`) => { const xs = files.filter((p) => p.startsWith(pre) && !p.slice(pre.length).includes('/')).reverse(); return xs.length ? `## ${h}\n\n${xs.map(f).join('\n')}` : ''; };
+  const sec = (h: string, pre: string, f = (p: string) => `- ${link(p)}`) => { const xs = files.filter((p) => p.startsWith(pre) && !p.slice(pre.length).includes('/') && !hidden.has(p)).reverse(); return xs.length ? `## ${h}\n\n${xs.map(f).join('\n')}` : ''; };
   const cands = files.filter((p) => /^skills\/candidates\/[^/]+\/SKILL\.md$/.test(p));
   put(root, 'index.md', ['Every note in this vault. Read `CRITICAL_FACTS.md` and this file first, then open only the few notes you need.',
     sec('Projects', 'wiki/projects/'), sec('Skills (promoted)', 'skills/'),
     cands.length ? `## Skill candidates (unreviewed)\n\n${cands.map((p) => `- [[${p.replace(/\.md$/, '')}|${p.split('/')[2]}]]`).join('\n')}` : '',
     sec('Sessions', 'wiki/logs/', (p) => `- ${link(p)}${proj.get(p) ? ` — ${proj.get(p)}` : ''}`), sec('Daily', 'wiki/daily/')].filter(Boolean).join('\n\n'), { head: '# Index\n\n' });
 }
-// idle: only sessions quiet for 15 min with activity since their last capture (the timer). Otherwise forced: one session, or all.
+// idle: only sessions quiet for 15 min with activity since their last capture (the timer), plus, once, every note from before the
+// one-shot rule (trivial is null). Otherwise forced: one session, or all.
 // Sessions made by the router's own model calls (requests.source) are never captured.
 export async function capture(o: { session?: string; idle?: boolean } = {}) {
   const root = vault(), t = Date.now(), days = new Set<string>(), projects = new Set<string>();
   const rows = all(`select s.session_key sk from sessions s left join brain_sessions b using (session_key) where ${o.session ? 's.session_key = ?' : '1'}
-    ${o.idle ? `and coalesce(s.last_ts, s.created_ts, 0) <= ${t - IDLE} and coalesce(s.last_ts, s.created_ts, 1) > coalesce(b.last_captured_ts, 0)` : ''}
+    ${o.idle ? `and ((coalesce(s.last_ts, s.created_ts, 0) <= ${t - IDLE} and coalesce(s.last_ts, s.created_ts, 1) > coalesce(b.last_captured_ts, 0)) or (b.note_path is not null and b.trivial is null))` : ''}
     and not exists (select 1 from requests r where r.session_key = s.session_key and r.source is not null)`, ...(o.session ? [o.session] : []));
-  let notes = 0;
+  let notes = 0, removed = 0;
   for (const { sk } of rows) {
     const n = await captureOne(sk, root).catch((e) => void console.error(`brain: capture ${sk.slice(0, 8)} failed: ${e.message}`));
-    if (n) { notes++; days.add(n.day); if (n.project) projects.add(n.project); }
+    if (!n) continue;
+    if (!('removed' in n)) notes++; else if (n.removed) removed++;
+    days.add(n.day); if (n.project) projects.add(n.project);
   }
-  if (notes) { for (const d of days) dayNote(root, d); for (const p of projects) projectNote(root, p); index(root); }
-  return { sessions: rows.length, notes, ms: Date.now() - t };
+  if (days.size) { for (const d of days) dayNote(root, d); for (const p of projects) projectNote(root, p); index(root); }
+  return { sessions: rows.length, notes, removed, ms: Date.now() - t };
 }
 
 // ---- gate: typed questions over the session note, two backends, one shape ----
@@ -251,10 +266,10 @@ type Q = Record<string, { type: 'noul' | 'choice'; instructions: string; criteri
 type Answers = Record<string, { value: any; confidence: number }>;
 const tsKey = () => { try { return process.env.TYPESAFE_API_KEY || readFileSync(`${homedir()}/.agent-router/typesafe.key`, 'utf8').trim() || null; } catch { return null; } };
 export const backend = () => (settings().classifier !== 'model' && tsKey() ? 'jev' : 'model');
-// Brain spend today = units (the budgets formula) of the requests our own subprocess made, tagged source = 'brain' by the router.
-export const spend = (): number => one(`select coalesce(round(sum(${UNITS()})), 0) u from requests where source = 'brain' and ts >= ?`, new Date(now()).setHours(0, 0, 0, 0)).u;
+// Brain spend today = dollars at list price (console.ts cost()) of the requests our own subprocess made, tagged source = 'brain' by the router.
+export const spend = (): number => spendOf(`source = 'brain' and ts >= ?`, new Date(now()).setHours(0, 0, 0, 0)).usd;
 const llm = (prompt: string, model: string, timeout = 60_000) => {
-  if (spend() >= settings().brain_daily_units) throw new Over();
+  if (spend() >= settings().brain_daily_usd) throw new Over();
   return claude(prompt, { model, source: 'brain', timeout });
 };
 // every question answered, with a 0–1 confidence and a value of the right kind; anything else is no answer at all
@@ -474,14 +489,14 @@ function recall(root: string) {
 
 // ---- views ----
 export function stats() {
-  const st = settings(), b = one(`select count(note_path) c, count(distilled_ts) d, coalesce(sum(queued), 0) q from brain_sessions`);
+  const st = settings(), b = one(`select count(note_path) filter (where coalesce(trivial, 0) = 0) c, count(distilled_ts) d, coalesce(sum(queued), 0) q from brain_sessions`);
   const skills = all(`select * from brain_skills where status != 'rejected' order by status = 'promoted' desc, created_ts desc`).map((k) => ({ name: k.name as string, status: k.status as string,
     ...(one(`select count(*) uses, count(distinct r.session_key) sessions, count(distinct s.cwd) projects, max(r.ts) last_used from tool_uses t
       left join requests r on r.request_id = t.request_id left join sessions s on s.session_key = r.session_key where t.name = 'Skill' and t.arg = ?`, k.name) as { uses: number; sessions: number; projects: number; last_used: number | null }),
     source: k.source as string, source_session: k.source_session as string | null, promoted_ts: k.promoted_ts as number | null,
-    source_units: k.source_session ? one(`select round(sum(${UNITS()})) u from requests where session_key = ? and ${MSG()} and status < 400`, k.source_session).u as number | null : null }));
+    source_usd: k.source_session ? spendOf(`session_key = ? and ${MSG()} and status < 400`, k.source_session).usd : null }));
   return { enabled: !!st.brain_enabled, dir: dir(), sessions_captured: b.c, distilled: b.d, candidates: skills.filter((k) => k.status === 'candidate').length,
-    promoted: skills.filter((k) => k.status === 'promoted').length, spend_today_units: spend(), cap_units: st.brain_daily_units, queued: b.q, classifier_backend: backend(), skills };
+    promoted: skills.filter((k) => k.status === 'promoted').length, spend_today_usd: spend(), cap_usd: st.brain_daily_usd, queued: b.q, classifier_backend: backend(), skills };
 }
 // ponytail: a linear scan of every note per query; fine for a few thousand notes, build an index if the vault outgrows that
 function search(q: string) {
@@ -543,7 +558,7 @@ async function tick() {
   ticking = true;
   try {
     await capture({ idle: true });
-    const todo = spend() >= st.brain_daily_units ? [] : all(`select b.session_key sk from brain_sessions b join sessions s using (session_key) where b.note_path is not null and (b.queued = 1
+    const todo = spend() >= st.brain_daily_usd ? [] : all(`select b.session_key sk from brain_sessions b join sessions s using (session_key) where b.note_path is not null and (b.queued = 1
       ${st.brain_distill === 'on_idle' ? `or (s.last_ts > ${t - 864e5} and s.last_ts <= ${t - IDLE} and coalesce(b.gated_ts, 0) < s.last_ts)` : ''}) limit 5`);
     for (const { sk } of todo) if ((await distill(sk)).queued) break;
   } catch (e: any) { console.error('brain:', e.message); } finally { ticking = false; }

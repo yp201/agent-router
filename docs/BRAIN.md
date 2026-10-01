@@ -34,7 +34,7 @@ A note can hold more than one generated block, so each is rewritten on its own: 
 
 1. **Capture (no model call).** When a session has been idle 15 minutes (or on demand) write its
    `wiki/logs/YYYY-MM-DD <title>.md`: frontmatter (session, project, started, ended, turns, models, accounts,
-   units, cache hit, peak context, tags) and sections Asked (user prompts, <= 300 chars each, reminder blocks
+   usd at list price, cache hit, peak context, tags) and sections Asked (user prompts, <= 300 chars each, reminder blocks
    stripped), Files touched, Commands run (successful Bash commands, <= 200 chars each), Tools, Subagents,
    Account switches. Regenerate the day note, the project note's session list and `index.md`.
    As built: a note lists the last 80 distinct commands (the rest are counted); the transcript is the path the tailer
@@ -82,15 +82,15 @@ A note can hold more than one generated block, so each is rewritten on its own: 
 ## Cost accounting
 
 - **Brain spend is exact.** Gate and distill calls go through the router; they are tagged `source = brain` and
-  summed in units. `brain_daily_units` (default 200k) caps the day; over the cap, work queues until tomorrow.
+  summed in dollars at list price. `brain_daily_usd` (default 1.00) caps the day; over the cap, work queues until tomorrow.
   The tag is the `x-agent-router-source` request header, set through the CLI's `ANTHROPIC_CUSTOM_HEADERS`, stored in
-  `requests.source` and stripped before the request goes upstream. Jev calls are another vendor's bill and not in units.
+  `requests.source` and stripped before the request goes upstream. Jev calls are another vendor's bill and not counted.
   The subprocess runs lean (`--safe-mode`, a one-line system prompt, a fixed session name, no thinking, no cache write):
-  a distill measured ~16k units instead of ~51k with a bare `claude -p` (NOTES.md "Brain").
+  a distill measured about a third of what a bare `claude -p` costs (NOTES.md "Brain"; roughly $0.03 at list price).
 - With `brain_distill = on_idle` only sessions that went idle within the last day are distilled automatically; older
   history stays manual, so enabling the brain cannot spend days of cap on the backlog.
 - **Skill use is counted, savings are not claimed.** Transcripts record each Skill tool call by name. Per skill
-  the console shows uses, sessions, projects, last used, and the units the source session spent working it out.
+  the console shows uses, sessions, projects, last used, and the dollars (list price) the source session spent working it out.
 - **A promoted skill costs prefix tokens in every session** (its description line). Skills unused for 30 days
   are flagged for demotion. Promotion changes the skill list, so it applies from the next session.
 
@@ -111,7 +111,7 @@ captured, skills promoted, candidates waiting.
 
 ## Settings
 
-`brain_enabled` false · `brain_dir` · `brain_distill` `manual` | `on_idle` · `brain_daily_units` 200000 ·
+`brain_enabled` false · `brain_dir` · `brain_distill` `manual` | `on_idle` · `brain_daily_usd` 1.00 ·
 `classifier` `auto` | `jev` | `model` · `brain_classifier_model` `haiku` · `brain_writer_model` `sonnet` ·
 `brain_confidence` 0.7
 

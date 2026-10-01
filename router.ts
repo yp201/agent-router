@@ -12,7 +12,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { db, logRequest, settings, putSetting, DEFAULTS, now, clock } from './ledger.ts';
 import { startTailer, joined } from './tailer.ts';
-import { consoleApi, util, timeline, advice, budgetStatus, fmtUnits } from './console.ts';
+import { consoleApi, util, timeline, advice, budgetStatus, fmtUsd, warmth } from './console.ts';
 import { CLAUDE_BIN, handoff, notify, title } from './advisor.ts';
 import { brainApi, startBrain } from './brain.ts';
 import { type Account, listAccounts, getAccount, setAcct, healthy, token, forget, expiresAt } from './accounts.ts';
@@ -61,18 +61,28 @@ const migrate = (...r: any[]) => db.prepare('insert into migrations (ts, session
 
 const h16 = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, 16);
 const texts = (c: any): string[] => typeof c === 'string' ? [c] : Array.isArray(c) ? c.filter((b: any) => b?.type === 'text').map((b: any) => String(b.text)) : [];
-// Fingerprints of a /v1/messages body: hashes and counts only, no body text is kept.
-function fingerprint(p: any, bytes: number) {
-  const tools: string[] = Array.isArray(p.tools) ? p.tools.map((t: any) => String(t?.name ?? t?.type ?? '')) : [];
+// Fingerprints of a /v1/messages request: hashes, counts and two short enums; no body text is kept. From tools_loaded on, these are
+// the things the Claude Code docs name as the prompt-cache key (console.ts why() reads them); field names observed in NOTES.md "Cost insights".
+function fingerprint(p: any, bytes: number, hdr: IncomingMessage['headers']) {
+  const defs: any[] = Array.isArray(p.tools) ? p.tools : [];
+  // `defer_loading: true` = a tool-search deferred definition: listed in `tools` but not part of the prompt prefix, so one appearing
+  // mid-session leaves the cache intact (observed). The hash, the names and the size therefore cover the loaded definitions only.
+  const loaded = defs.filter((t) => t?.defer_loading !== true), tools = loaded.map((t: any) => String(t?.name ?? t?.type ?? ''));
   // the CLI's first system block is a per-request billing header, not part of the cached prefix
   const sys = texts(p.system).filter((t) => !t.startsWith('x-anthropic-billing-header'));
   const first = texts(p.messages?.find?.((m: any) => m?.role === 'user')?.content);
   const typed = first.filter((t) => !t.trimStart().startsWith('<system-reminder>')).join('\n') || first.join('\n');
-  const tools_hash = h16(tools.join('\n'));
+  const tools_hash = h16(tools.join('\n')), beta = String(hdr['anthropic-beta'] ?? ''), enumOf = (v: any) => (v == null || v === '' ? null : String(v).slice(0, 24));
+  const images = (c: any): number => (Array.isArray(c) ? c.reduce((n, b) => n + (b?.type === 'image' ? 1 : b?.type === 'tool_result' ? images(b.content) : 0), 0) : 0);
   return {
-    system_hash: h16(sys.join('\n')), tools_hash, tools_count: tools.length, msg_count: Array.isArray(p.messages) ? p.messages.length : null,
+    system_hash: h16(sys.join('\n')), tools_hash, tools_count: defs.length, msg_count: Array.isArray(p.messages) ? p.messages.length : null,
     first_user_hash: typed ? h16(typed) : null, first_user_tok: Math.round(typed.length / 4), context_est: Math.round(bytes / 4),
     tool_names_json: one('select 1 from requests where tools_hash = ? and tool_names_json is not null', tools_hash) ? null : JSON.stringify(tools),
+    tools_loaded: loaded.length, tools_deferred: defs.length - loaded.length, tools_tok: loaded.length ? Math.round(JSON.stringify(loaded).length / 4) : 0,
+    effort: enumOf(p.output_config?.effort ?? p.thinking?.budget_tokens), speed: enumOf(p.speed), // fast mode = speed 'fast'
+    beta_hash: beta ? h16(beta.split(',').map((x) => x.trim()).sort().join(',')) : null,
+    image_count: Array.isArray(p.messages) ? p.messages.reduce((n: number, m: any) => n + images(m?.content), 0) : null,
+    cli_version: /claude-cli\/(\d+(?:\.\d+)*)/.exec(String(hdr['user-agent'] ?? ''))?.[1] ?? null,
   };
 }
 const uaShapes = new Set<string>(); // log each user-agent *shape* once (digits and hex masked), never the value
@@ -132,7 +142,7 @@ function warnCheck(id: string, j: string) {
   if (hit) notify(`${id} at ${Math.round(hit.u * 100)}% of its ${hit.w} window${hit.reset ? `, resets ${at(hit.reset * 1000)}` : ''}`);
 }
 
-// ---- budgets (settings.budgets): status and the unit formula live in console.ts ----
+// ---- budgets (settings.budgets): status and the unit (dollars at list price, console.ts cost()) live in console.ts ----
 const okBudget = (b: any) => !!b && typeof b === 'object' && typeof b.id === 'string' && /^[\w-]{1,64}$/.test(b.id) && typeof b.name === 'string' && !!b.name.trim() && b.name.length <= 80
   && ['all', 'project', 'account', 'session'].includes(b.scope) && ['day', 'week', 'session'].includes(b.period)
   && (b.scope === 'all' ? b.match == null : b.scope === 'session' ? b.period === 'session' && (b.match == null || typeof b.match === 'string') : typeof b.match === 'string' && b.match !== '')
@@ -153,12 +163,29 @@ function budgetCheck(key: string | null, acct: string) {
     const hit = [...b.thresholds].sort((x: number, y: number) => y - x).filter((th: number) => b.spent >= th * b.limit
       && db.prepare(`insert into budget_events (budget_id, period_key, threshold, ts) select ?, ?, ?, ? where not exists
         (select 1 from budget_events where budget_id = ? and period_key = ? and threshold = ? and ts >= ?)`).run(b.id, b.period_key, th, now(), b.id, b.period_key, th, b.period_start).changes);
-    if (hit.length) notify(`Budget ‘${b.name}’ at ${Math.floor(b.pct * 100)}% — ${fmtUnits(b.spent)} of ${fmtUnits(b.limit)} units${b.action === 'stop' && b.state === 'over' ? ' — requests are now stopped' : ''}`);
+    if (hit.length) notify(`Budget ‘${b.name}’ at ${Math.floor(b.pct * 100)}% — ${fmtUsd(b.spent)} of ${fmtUsd(b.limit)}${b.action === 'stop' && b.state === 'over' ? ' — requests are now stopped' : ''}`);
   }
 }
-const stopMsg = (b: any) => `agent-router budget ‘${b.name}’ is spent: ${fmtUnits(b.spent)} of ${fmtUnits(b.limit)} input-equivalent tokens ${
+const stopMsg = (b: any) => `agent-router budget ‘${b.name}’ is spent: ${fmtUsd(b.spent)} of ${fmtUsd(b.limit)} at list price ${
   b.period === 'day' ? `today. It resets ${at(b.period_end)}` : b.period === 'week' ? 'in the last 7 days. The window is rolling: spend frees up as it ages past 7 days'
   : 'in this session. A per-session cap does not reset: start a new session'}. Raise or remove it at http://localhost:${PORT}/router/#cost`;
+
+// Going cold (docs/COST-INSIGHTS.md A2): every 60 s. A main conversation on the 1h cache whose cached context is at least
+// cold_min_context tokens, and whose rebuild would cost at least cold_min_usd, gets one notification cold_lead_min minutes before
+// that cache's lifetime ends. Nothing is sent upstream. Once per idle period: `warned` holds the turn a session was last warned for.
+// ponytail: in memory, so a restart inside the lead window can repeat one warning.
+const warned = new Map<string, number>();
+function coldTick() {
+  const st = settings(), t = now();
+  if (!st.cold_warn) return;
+  for (const w of warmth(t - 3600_000)) {
+    const left = w.cold_at! - t;
+    if (!w.ttl_1h || w.ctx < st.cold_min_context || !(w.rebuild_usd! >= st.cold_min_usd) || warned.get(w.sk) === w.ts || left <= 0 || left > st.cold_lead_min * 60_000) continue;
+    warned.set(w.sk, w.ts);
+    notify(`‘${title(w.sk)}’ goes cold in ${Math.max(1, Math.round(left / 60_000))} min — a message now costs about ${fmtUsd(w.read_usd)}, after that the next turn costs about ${fmtUsd(w.rebuild_usd)}`);
+  }
+}
+setInterval(() => { try { coldTick(); } catch (e: any) { console.error('cold check failed:', e.message); } }, Number(process.env.COLD_TICK_MS) || 60_000).unref();
 
 // Usage from the response stream: a tee of the bytes the client gets (never delayed or altered), decoded and parsed for `usage`.
 // SSE: message_start.message.usage, then message_delta.usage (later fields win); only the current partial line is held.
@@ -261,7 +288,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   const est = Math.round(body.length / 4), src = String(req.headers['x-agent-router-source'] ?? '');
   let fp: Record<string, any> = {};
   if (isMsg) {
-    try { fp = fingerprint(parsed, decode(body).length); } catch {}
+    try { fp = fingerprint(parsed, decode(body).length, req.headers); } catch {}
     const ua = String(req.headers['user-agent'] ?? '');
     fp.ua_kind = /claude-desktop/i.test(ua) ? 'desktop' : 'cli';
     const shape = ua.replace(/[0-9a-f]{8,}/gi, 'H').replace(/\d+/g, 'N');
@@ -392,8 +419,8 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
     const ok = listAccounts().filter(healthy), n = newSession(ok);
     return json(res, 200, { ...consoleApi('overview', url.searchParams, accountsView()), policy_line: n.a ? `new sessions start on ${n.a.id} — ${n.why}` : n.why });
   }
-  if (m === 'GET' && ['cache', 'cost', 'insights', 'sessions', 'budgets'].includes(what) && !id) return json(res, 200, consoleApi(what, url.searchParams));
-  if (m === 'GET' && what === 'sessions' && action === 'timeline') return json(res, 200, timeline(id));
+  if (m === 'GET' && ['cache', 'cost', 'insights', 'sessions', 'budgets'].includes(what) && !id) return json(res, 200, await consoleApi(what, url.searchParams));
+  if (m === 'GET' && what === 'sessions' && action === 'timeline') return json(res, 200, await timeline(id));
   if (m === 'GET' && what === 'sessions' && action === 'advice') return json(res, 200, advice(id));
   if (m === 'GET' && what === 'advice') return json(res, 200, advice());
   if (m === 'POST' && what === 'sessions' && action === 'handoff') {

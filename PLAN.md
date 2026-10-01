@@ -189,7 +189,7 @@ Same binary, `--listen 0.0.0.0 --require-key`. Adds:
 
 ### P6 — recommendations
 Pure SQL over the ledger, rendered in the UI. First three, in order of payoff:
-1. **Cache-miss detector**: sessions where `cache_create` spikes without a preceding migration → something invalidated the prefix (system-prompt/tooling change, MCP tool list churn, edited CLAUDE.md mid-session). Show the turn.
+1. **Cache-miss detector**: sessions where `cache_create` spikes without a preceding migration → something invalidated the prefix (model, effort or fast-mode switch, a changed loaded tool set, a system-prompt change; not CLAUDE.md, which neither applies nor invalidates mid-session). Show the turn.
 2. **Migration cost report**: total tokens burned by account switches; suggests "add capacity to account X" vs "add another account".
 3. **Cross-cutting skills**: cluster first-user-messages across sessions by embedding or even just TF-IDF; repeated prompt shapes → "this is a skill". Later. Needs volume first.
 

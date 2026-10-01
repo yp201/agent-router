@@ -41,6 +41,10 @@ export function claude(prompt: string, o: { model?: string; source?: string; tim
 }
 
 const TARGET = new Set(['Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash']);
+// a tool call's short target (file, pattern or command, 60 chars) and a tool result's size: all that is ever kept of either
+const targetOf = (b: any) => (TARGET.has(b.name) ? String(Object.values(b.input ?? {}).find((v) => typeof v === 'string') ?? '').slice(0, 60) : String(b.name));
+const resultChars = (b: any): number => typeof b.content === 'string' ? b.content.length
+  : Array.isArray(b.content) ? b.content.reduce((a: number, x: any) => a + (x?.type === 'text' ? String(x.text ?? '').length : 0), 0) : 0; // ponytail: images not counted
 const strip = (s: string) => s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
 // One pass over a transcript. Tool results are counted since the last compaction (that's what is in context now); prompts,
 // files and assistant text span the whole file (handoff input). Only sizes of tool results are kept, never their content.
@@ -59,16 +63,14 @@ async function scan(path: string) {
       if (r.type === 'user' && b?.type === 'text' && strip(String(b.text))) prompts.push(strip(String(b.text)).slice(0, 300));
       if (r.type === 'assistant' && b?.type === 'text' && b.text?.trim()) texts.push(String(b.text).trim().slice(0, 500));
       if (b?.type === 'tool_use') {
-        const target = TARGET.has(b.name) ? String(Object.values(b.input ?? {}).find((v) => typeof v === 'string') ?? '').slice(0, 60) : b.name;
+        const target = targetOf(b);
         uses.set(b.id, { tool: b.name, target });
         if (/^(Read|Edit|Write)$/.test(b.name) && target) files.add(target);
       }
       if (b?.type === 'tool_result') {
         const u = uses.get(b.tool_use_id) ?? { tool: 'unknown', target: 'unknown' }, k = `${u.tool}\0${u.target}`;
-        const chars = typeof b.content === 'string' ? b.content.length
-          : Array.isArray(b.content) ? b.content.reduce((a: number, x: any) => a + (x?.type === 'text' ? String(x.text ?? '').length : 0), 0) : 0; // ponytail: images not counted
         const e = acc.get(k) ?? { ...u, chars: 0, count: 0 };
-        e.chars += chars; e.count++; acc.set(k, e);
+        e.chars += resultChars(b); e.count++; acc.set(k, e);
       }
     }
   }
@@ -80,6 +82,35 @@ async function scan(path: string) {
       by_tool: [...by.values()].sort((a, b) => b.tokens - a.tokens) },
     prompts, files: [...files], texts: texts.slice(-3),
   };
+}
+
+// Carrying cost (docs/COST-INSIGHTS.md A4): what each tool result cost to keep in context. Every main-thread request after a result
+// re-reads it, until the next compaction or the end of the transcript: tokens (chars / 4) × those turns × the cache-read price of the
+// model each turn ran on (`read`, $/MTok; a turn on an unpriced model adds nothing). Returns the ten costliest with a suggestion by
+// kind. Only tool names, short targets and sizes leave this function, never a result's content.
+const BUILD = /\b(test|tests|jest|vitest|pytest|mocha|tsc|build|lint|cargo|make|gradle|mvn|xcodebuild|npm (run|ci|install|i)|go (test|build|vet))\b/;
+export async function carrying(path: string, read: (model: string | null) => number | null) {
+  const uses = new Map<string, { tool: string; target: string }>(), reads = new Map<string, number>(), live: any[] = [], out: any[] = [];
+  let turns = 0, cum = 0, last = ''; // cum = sum of the read price over the turns so far
+  const close = (x: any) => { if (turns > x.n0) out.push({ tool: x.tool, target: x.target, tokens: x.tokens, turns: turns - x.n0, usd: x.tokens * (cum - x.c0) / 1e6 }); };
+  for await (const l of createInterface({ input: createReadStream(path), crlfDelay: Infinity })) {
+    if (l.includes('"subtype":"compact_boundary"')) { live.splice(0).forEach(close); continue; }
+    if (!l.includes('"message"')) continue;
+    let r: any;
+    try { r = JSON.parse(l); } catch { continue; }
+    if (r.isSidechain || r.isMeta) continue;
+    if (r.type === 'assistant' && r.requestId && r.requestId !== last) { last = r.requestId; turns++; cum += read(r.message?.model ?? null) ?? 0; }
+    for (const b of Array.isArray(r.message?.content) ? r.message.content : []) {
+      if (b?.type === 'tool_use') { const u = { tool: String(b.name), target: targetOf(b) }; uses.set(b.id, u); if (u.tool === 'Read') reads.set(u.target, (reads.get(u.target) ?? 0) + 1); }
+      if (b?.type === 'tool_result') live.push({ ...(uses.get(b.tool_use_id) ?? { tool: 'unknown', target: 'unknown' }), tokens: Math.round(resultChars(b) / 4), n0: turns, c0: cum });
+    }
+  }
+  live.forEach(close);
+  return out.sort((a, b) => b.usd - a.usd || b.tokens * b.turns - a.tokens * a.turns).slice(0, 10).map((x) => ({ ...x,
+    suggestion: x.tool === 'Read' ? ((reads.get(x.target) ?? 0) > 1 ? `Read it once: this file was read ${reads.get(x.target)} times and every copy stays in context.`
+        : 'Read only the part you need: pass `offset` and `limit` instead of the whole file.')
+      : x.tool === 'Bash' && BUILD.test(x.target) ? 'Filter test and build output with a PreToolUse hook (Claude Code costs doc) so only the failures reach the context.'
+      : 'Run this kind of exploration in a subagent: only its summary enters the main context.' }));
 }
 
 const ADVISE = (pct: number, w: number) => `You are advising a developer whose Claude Code session is at ${pct}% of its ${w}-token context window and will auto-compact soon. Below is a structured breakdown of what occupies the context: tool results by size, files read repeatedly, tokens per tool, thinking tokens. In under 150 words, plain text, no preamble: (1) the three biggest avoidable items and what to do about each, (2) whether to start a fresh session with a handoff summary now or continue, with the reason, (3) one habit change that would have kept this smaller. Be specific: name the files and numbers from the breakdown.`;

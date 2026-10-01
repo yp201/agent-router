@@ -29,7 +29,8 @@ class AgentRouter < Formula
     <<~EOS
       Start the router:      brew services start agent-router
       Desktop-app capture:   agent-router install   (local CA + hosts entry; asks for sudo; undo with `agent-router uninstall`)
-      CLI only, no sudo:     add {"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:4001"}} to ~/.claude/settings.json
+      CLI only, no sudo:     add {"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:4001","ENABLE_TOOL_SEARCH":"true"}} to ~/.claude/settings.json
+                             (a custom base URL turns tool search off; without the second key every tool definition loads upfront)
       Console:               http://localhost:4001/router/
     EOS
   end

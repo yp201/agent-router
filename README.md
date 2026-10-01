@@ -12,9 +12,10 @@ not a way to share one account between people. MIT licensed.
 - **Sticky routing.** A session stays on one account (its cache lives there). New sessions start on the account with
   the most headroom. Rate-limited → cooldown, replay on another account, logged. A session whose account passes 95% of a
   window moves to one with more headroom *before* it gets rate-limited, and every switch posts a macOS notification.
-- **Ledger.** Every request joined to your session transcripts by request id: cache read/write per turn, bursts and
-  why they happened, per-window headroom, per-session cost.
-- **Console** at `http://localhost:4001/router/`: accounts, sessions (switch with one click), cache manager, budgets, insights.
+- **Ledger.** Every request joined to your session transcripts by request id: cache read/write per turn, every cache
+  re-write with its cause and its cost, per-window headroom, per-session cost in dollars at list price.
+- **Console** at `http://localhost:4001/router/`: accounts, sessions (switch with one click), cache manager, budgets, and
+  insights: a ranked list of where the money went, each with the setting or command that fixes it.
 - **Brain** (optional, off by default). Plain Markdown notes about your past sessions, and skills extracted from them, so the
   next session looks things up instead of working them out again.
 
@@ -81,22 +82,54 @@ A budget is a spend limit over a scope (everything, one project, one account, or
 (day = since local midnight, week = the last 7×24 h, rolling, or the session's whole life). Add them in the console under
 **Cost & budgets**, or `PUT /router/settings` with `budgets: [...]`. There are none until you add one.
 
-- **Unit:** input-equivalent tokens, the same for every model: `input + 0.1 × cache read + 1.25 × cache write (5m) + 2 × cache write (1h) + 5 × output`.
-  Usage is read from each response as it streams through, so spend is current to the last request. Dollars are shown only for models in your rate card.
+- **Unit:** dollars at list price. Each request is priced from a built-in table of Anthropic's published rates (input, 5-minute
+  and 1-hour cache writes, cache reads, output, per model; the console shows the table and its as-of date), and `rate_card`
+  overrides a model's rates. On a subscription this is an equivalent, not a bill. A model that is not in the table has no price:
+  its requests are counted as "unpriced" and left out of every sum, never guessed. Usage is read from each response as it
+  streams through, so spend is current to the last request.
 - **notify** posts one macOS notification the first time the budget passes 80% and 100% in a period.
 - **stop** also refuses further `/v1/messages` requests in that scope once it is at 100%: Claude Code shows
-  `API Error: 400 agent-router budget ‘…’ is spent: 2.1M of 2M input-equivalent tokens today. It resets Fri 00:00. Raise or remove it at http://localhost:4001/router/#cost`
+  `API Error: 400 agent-router budget ‘…’ is spent: $20.14 of $20.00 at list price today. It resets Fri 00:00. Raise or remove it at http://localhost:4001/router/#cost`
   and ends the turn (no retries). Raise or delete the budget to continue. Token counting and other endpoints are never blocked.
 
 ```bash
-# 2M units a day for one project (notify), and a 5M cap on any single session (stop: the runaway-agent guard)
+# $20 a day for one project (notify), and a $50 cap on any single session (stop: the runaway-agent guard)
 curl -X PUT localhost:4001/router/settings -d '{"budgets": [
-  {"id": "cf-day", "name": "climatefluent / day", "scope": "project", "match": "climatefluent", "period": "day", "limit": 2000000, "action": "notify", "thresholds": [0.8, 1]},
-  {"id": "cap", "name": "per-session cap", "scope": "session", "match": null, "period": "session", "limit": 5000000, "action": "stop", "thresholds": [0.8, 1]}]}'
+  {"id": "cf-day", "name": "climatefluent / day", "scope": "project", "match": "climatefluent", "period": "day", "limit": 20, "action": "notify", "thresholds": [0.8, 1]},
+  {"id": "cap", "name": "per-session cap", "scope": "session", "match": null, "period": "session", "limit": 50, "action": "stop", "thresholds": [0.8, 1]}]}'
 ```
 
 A project is the basename of the session's working directory, known once the session's transcript has been read: the first
 request or two of a brand-new session are not counted against (or stopped by) a project budget.
+
+## Insights
+
+The Insights tab (and `./agent-router.sh report`) ranks what cost money in the last 7 days. Every figure is arithmetic over the
+ledger and your transcripts at list prices; no model is asked for any of it.
+
+**Exact, and no change in what the model does** (chip: *no quality change*):
+
+- **Why each cache re-write happened and what it cost.** The router fingerprints what Claude Code's cache key depends on
+  (model, effort, fast mode, the loaded tool set, the system prompt, image count, CLI version; hashes and counts only) and names
+  the cause: a model switch, fast mode turned on, an effort change on a model where that re-writes, a changed tool set. Compaction
+  and clearing are shown as expected rebuilds, not misses.
+- **Going cold.** A macOS notification five minutes before a large 1-hour cache lapses, with what a message costs now and what
+  the next turn costs after (`cold_warn`, `cold_min_context`, `cold_min_usd`, `cold_lead_min`). The router sends nothing upstream.
+- **Cache lifetime fit.** Your real pauses replayed under a 5-minute and a 1-hour cache, per bucket. It names `promptCacheTtl` or
+  `subagentPromptCacheTtl` only when the other lifetime would have saved at least 5% and $1.
+- **Carrying cost.** Each tool result's size × the turns that re-read it × the read price: the ten costliest, and the top five
+  per session in its timeline. Names, targets and sizes only, never the output.
+- **Gateway check.** Sessions that load every tool definition because tool search is off (see the CLI-only section below).
+
+**Exact arithmetic, quality not measured:**
+
+- **Model what-if** (chip: *unverified*). The same tokens at every other model's price, and for one session what switching now
+  costs (the one-time cache re-write) and how many turns it takes to pay back. Nothing here tells whether the cheaper model
+  would have done the work as well; it says so on every such number.
+- **Safe switches.** A newer, cheaper model of the same family (*no quality change* expected), and subagent runs that only read
+  files or the web on a model above Haiku (*docs-recommended*: the Claude Code costs doc suggests `model: haiku` for those).
+
+Design, sources and what was left out: `docs/COST-INSIGHTS.md`.
 
 ## Brain
 
@@ -112,14 +145,14 @@ skills/          one note per promoted skill;  skills/candidates/<name>/SKILL.md
 ```
 
 - **Capture is free.** A session that has been idle for 15 minutes gets its note straight from its transcript; no model is
-  called. Prompts are cut to 300 characters, commands to 200, obvious secrets (API keys, bearer tokens, `password=`, private
+  called. One-shots (fewer than 2 typed prompts and fewer than 3 tool calls) get no note. Prompts are cut to 300 characters, commands to 200, obvious secrets (API keys, bearer tokens, `password=`, private
   keys) are redacted, tool output is never copied. Text you write outside the `<!-- agent-router:begin/end -->` markers is kept.
 - **Distilling spends quota, and only when asked.** Click **Distill** on a session (or set `brain_distill` to `on_idle`). A
   classifier first decides whether the session is worth it: [TypeSafe's Jev](https://docs.typesafe.ai) if you have a key
   (`TYPESAFE_API_KEY` or `~/.agent-router/typesafe.key`), otherwise Haiku. Only then does Sonnet write the summary, the dated
   bullets for the project note and, when the session worked out a reusable procedure, a skill candidate. Both models run
-  through your own `claude` CLI and this router; their requests are tagged, summed in the same units as budgets, and stop at
-  `brain_daily_units` (200k a day by default). Over the cap, work is queued for the next day.
+  through your own `claude` CLI and this router; their requests are tagged, summed in dollars at list price like budgets, and
+  stop at `brain_daily_usd` ($1 a day by default). Over the cap, work is queued for the next day.
 - **Skills go candidate → promoted, by hand.** A candidate (extracted, or imported from an https URL to one `SKILL.md`) is just
   a file in the vault. **Promote** copies it to `~/.claude/skills/<name>/` with a marker file, so every new session loads it;
   a skill directory the router did not install is never overwritten. **Demote** removes it again, **Reject** deletes the
@@ -128,7 +161,7 @@ skills/          one note per promoted skill;  skills/candidates/<name>/SKILL.md
 - **Recall.** *Install recall skill* adds a small `brain` skill that tells Claude to read the vault's index and at most three
   notes when you refer to past work.
 
-Settings: `brain_enabled`, `brain_dir`, `brain_distill` (`manual` | `on_idle`), `brain_daily_units`, `classifier`
+Settings: `brain_enabled`, `brain_dir`, `brain_distill` (`manual` | `on_idle`), `brain_daily_usd`, `classifier`
 (`auto` | `jev` | `model`), `brain_classifier_model` (`haiku`), `brain_writer_model` (`sonnet`), `brain_confidence` (0.7).
 Design and the choices behind it: `docs/BRAIN.md`.
 
@@ -137,6 +170,7 @@ Design and the choices behind it: `docs/BRAIN.md`.
 ```bash
 ./agent-router.sh status     # one line per component
 ./agent-router.sh logs       # tail the router log
+./agent-router.sh report     # the ranked cost findings for the last 7 days (report 30 for 30 days)
 ./agent-router.sh restart    # after pulling a new version
 ./agent-router.sh uninstall  # remove hosts entry, CA trust, launchd job
 ```
@@ -151,16 +185,17 @@ you in one line, `start` fixes it.
 No sudo needed. Add to `~/.claude/settings.json`:
 
 ```json
-{ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001" } }
+{ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001", "ENABLE_TOOL_SEARCH": "true" } }
 ```
 
-and run `node router.ts` (or the launchd/systemd job). Transparent mode is only required for the desktop app,
+and run `node router.ts` (or the launchd/systemd job). `ENABLE_TOOL_SEARCH` matters: with a custom base URL Claude Code turns
+tool search off, so every tool definition (68 here, about 34k tokens) loads into every request instead of about a dozen. Transparent mode is only required for the desktop app,
 which ignores that setting.
 
 ## Development
 
 ```bash
-node --test test_router.ts   # 28 tests, fake upstream, no network
+node --test test_router.ts   # 35 tests, fake upstream, no network
 ```
 
 `router.ts` proxy + routing · `accounts.ts` token store · `tailer.ts` transcript join · `console.ts` analytics · `advisor.ts` context advisor · `brain.ts` notes and skills ·

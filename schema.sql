@@ -39,7 +39,10 @@ create table if not exists requests (
   cache_1h integer, cache_5m integer, thinking_tok integer, model_from_transcript text,
   usage_src text,                     -- 'stream' (read from the proxied response) | 'transcript' (filled by the tailer)
   -- request fingerprints (P3), /v1/messages only; hashes = sha256 hex[:16], never body text
-  system_hash text, tools_hash text, tools_count integer, msg_count integer,
+  system_hash text, tools_hash text, tools_count integer, msg_count integer, -- tools_hash: names of the loaded (not defer_loading) tools
+  tools_loaded integer, tools_deferred integer, tools_tok integer, -- definitions in the prefix / marked defer_loading / loaded definitions' JSON bytes / 4
+  effort text, speed text, beta_hash text,  -- output_config.effort (else thinking.budget_tokens); body `speed`; hash of the sorted anthropic-beta list
+  image_count integer, cli_version text,    -- image blocks in messages; claude-cli/<version> from the user-agent
   first_user_hash text,               -- first user message minus <system-reminder> blocks (thread id + preamble detection)
   first_user_tok integer,             -- its length / 4
   context_est integer,                -- decoded body bytes / 4
@@ -69,6 +72,6 @@ create index if not exists requests_ts on requests(ts);
 create table if not exists budget_events (budget_id text, period_key text, threshold real, ts integer);
 -- brain (brain.ts): what was captured / gated / distilled per session, and every skill candidate it knows
 create table if not exists brain_sessions (session_key text primary key, last_captured_ts integer, note_path text, gate_json text, gate_backend text,
-  gated_ts integer, distilled_ts integer, skill_candidate text, queued integer default 0);
+  gated_ts integer, distilled_ts integer, skill_candidate text, queued integer default 0, trivial integer);
 create table if not exists brain_skills (name text primary key, status text, -- 'candidate' | 'promoted' | 'rejected'
   source text, source_session text, created_ts integer, promoted_ts integer);

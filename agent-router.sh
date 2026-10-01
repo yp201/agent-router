@@ -4,6 +4,7 @@
 #   uninstall  reverse all of it
 #   status     one line per component
 #   start|stop|restart|logs|ui
+#   report [days]   the ranked cost findings (GET /router/insights), dollars at list price
 set -uo pipefail
 PROJ=$(cd "$(dirname "$0")" && pwd); CA=~/.agent-router/ca/ca.pem
 PLIST=~/Library/LaunchAgents/com.agent-router.plist; LABEL=gui/$(id -u)/com.agent-router
@@ -70,5 +71,8 @@ case ${1:-} in
   restart)   if [ -n "$BREW" ]; then brew services restart agent-router; else NO_HINTS=1 "$PROJ/setup.sh" >/dev/null && reload; fi; wait_up && echo up || { echo "NOT UP — see ~/.agent-router/router.log"; exit 1; } ;;
   logs)      tail -f ~/.agent-router/router.log ;;
   ui)        open http://localhost:4001/router/ ;;
-  *)         echo "usage: $0 install|uninstall|status|start|stop|restart|logs|ui"; exit 2 ;;
+  report)    curl -s -m 60 "localhost:4001/router/insights?days=${2:-7}" | node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => { const n = JSON.parse(s);
+               console.log(`${n.window.days} days, ${n.window.turns} turns: $${n.usd.toFixed(2)} at list price (as of ${n.prices_as_of})${n.unpriced_requests ? `, ${n.unpriced_requests} requests on unpriced models not counted` : ""}`);
+               for (const f of n.findings) console.log(`\n$${(f.usd ?? 0).toFixed(2).padStart(8)}  ${f.title}  [${f.quality === "none" ? "no quality change" : f.quality}]\n           ${f.evidence.join(" · ")}${f.fix ? `\n           ${f.fix}` : ""}`); })' ;;
+  *)         echo "usage: $0 install|uninstall|status|start|stop|restart|logs|ui|report"; exit 2 ;;
 esac

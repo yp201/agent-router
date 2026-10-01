@@ -254,8 +254,9 @@ not per session: the cheapest fallback is the account that recently served the s
   thresholds: [0.8, 1]}]`, validated on `PUT /router/settings` (400 `invalid_setting`). `scope: session` requires `period: session`
   (`match: null` = every session, each measured on its own: the runaway-agent guard). `period: session` also works with the other scopes
   (a per-session cap inside one project/account). Default `[]`, so nothing can stop until the user adds a budget.
-- **Unit** (`console.ts UNITS()`, the only definition, a SQL expression): `in + 0.1·cache_read + 1.25·cache_5m + 2·cache_1h + 5·out`;
-  a cache write without the 1h/5m split counts 1.25×. Dollars come only from `rate_card`, null if any model in the window has no rate.
+- **Unit** — superseded the same day by dollars at list price (see "Cost insights" below; `limit` is now USD, messages read
+  `$1.65 of $2.00`). What this section measured in "units" was `in + 0.1·cache_read + 1.25·cache_5m + 2·cache_1h + 5·out`, which is
+  exactly Haiku 4.5's price list × 1e6 and wrong for every other model.
 - **Spend** (`console.ts budgetStatus()`): `sum(UNITS)` over `/v1/messages` rows with status < 400 in the window, grouped by session and
   model (top 3 sessions, dollars). day = since local midnight, week = rolling 7×24 h (no reset; `period_end: null`), session = the
   session's whole life. Computed on demand per request and per UI poll; ~3 ms per budget on a 25k-row ledger using the two existing
@@ -335,3 +336,62 @@ Spec: `docs/BRAIN.md`. Code: `brain.ts` (+ hooks in router/tailer/console/adviso
   a session the 200k default cap is about 12 distills a day.
 - **Not built:** the per-prompt recall hook (the `brain` skill is the recall path), bundled scripts in imported skills, vector search
   (search is a substring scan), automatic demotion (unused-for-30-days is a chip in the console).
+
+## Cost insights (2026-10-01)
+Spec: `docs/COST-INSIGHTS.md`. Code: `console.ts` (prices, `cost()`, `why()`, `ttlFit()`, `whatIf()`, `insights()`), `router.ts` (`fingerprint()`,
+`coldTick()`), `advisor.ts` (`carrying()`), `brain.ts` (one-shot filter). No model call anywhere in it.
+- **Unit: dollars at list price.** `console.ts PRICES` ($/MTok input / 5m write / 1h write / read / output, `PRICES_AS_OF = '2026-10-01'`),
+  matched by substring of the model id, first hit wins (`opus-5-5` before `opus-5`). `cost(row)` is the only pricing function: budgets,
+  brain cap (`brain_daily_usd`, default 1.00; a stored `brain_daily_units` is ignored), Cost tab, bursts, insights. `rate_card`
+  (`{ [substring]: { input, write_5m, write_1h, read, output } }`) overrides the fields it names. A cache write without the 1h/5m split is
+  priced at the 5m rate. A model with no price (seen here: `claude-opus-4-6`, and rows with no model) costs `null`: counted as
+  "unpriced", never summed. Body `speed: "fast"` on Opus 5.5 doubles input and output (not observed live yet).
+- **Fingerprint fields confirmed from real requests** (terminal CLI 2.1.268 through a header-logging forwarder in front of the dev router):
+  | stored | where it comes from |
+  | --- | --- |
+  | `effort` | body `output_config.effort` (`"high"` on Sonnet 5, sent with `thinking: {type: "adaptive"}`); Haiku 4.5 sends no effort but `thinking: {type: "enabled", budget_tokens: 31999}`, so the budget is stored instead |
+  | `speed` | body `speed` (absent in every request seen; fast mode was never on) |
+  | `beta_hash` | header `anthropic-beta`, comma list, sorted then hashed. Seen: `claude-code-20250219, oauth-2025-04-20, interleaved-thinking-2025-05-14, thinking-token-count-2026-05-13, context-management-2025-06-27, prompt-caching-scope-2026-01-05, mid-conversation-system-2026-04-07, advisor-tool-2026-03-01, effort-2025-11-24, extended-cache-ttl-2025-04-11`, plus `advanced-tool-use-2025-11-20` only when tool search is on and `structured-outputs-2025-12-15` on the title side request |
+  | `cli_version` | header `user-agent`: `claude-cli/2.1.268 (external, sdk-cli)` |
+  | `image_count` | `image` blocks in `messages[].content`, including inside `tool_result.content` |
+  | `tools_loaded` / `tools_deferred` / `tools_tok` | `tools[]` entries without / with `defer_loading: true`; JSON bytes of the loaded ones / 4 |
+  | TTL used | response usage `cache_creation.ephemeral_1h_input_tokens` vs `ephemeral_5m_input_tokens` (already stored as `cache_1h` / `cache_5m`). Request side: `cache_control: {type: "ephemeral", ttl: "1h"}` on the last two system blocks and the last message block |
+  Last 7 days here: the main conversation wrote only 1h caches, subagents only 5m (no turn mixed the two).
+- **Deferred-tool flag: `defer_loading: true`.** With `ENABLE_TOOL_SEARCH=true` the CLI sent 12 `tools` entries instead of 68: 11 plain ones
+  (among them a client tool named `ToolSearch`) and one `DeferredToolPlaceholder` carrying `defer_loading: true`. After the model called
+  `ToolSearch`, the next request listed the found MCP tool as a 13th entry, also `defer_loading: true`; the old all-names `tools_hash`
+  changed, yet that turn read the whole prefix from cache (read 31,509 = the previous 23,748 + 7,761; wrote 1,419). So deferred
+  definitions are not part of the cache key: `tools_hash`, `tool_names_json` and `tools_tok` cover loaded definitions only, and the
+  unused-tools insight counts loaded tools only (rows from before `tools_loaded` are used only while nothing newer is in the window).
+- **Tool search behind a custom base URL, verified.** Same prompt, Haiku, dev port: without the variable 68 definitions, no `ToolSearch`,
+  `tools_tok` 34,331, cached prefix 50,709 tokens; with `"ENABLE_TOOL_SEARCH": "true"` in the settings `env` 12 definitions (11 loaded +
+  1 deferred), `tools_tok` 10,575, prefix 23,786. The CLI binary carries the message: `[ToolSearch:optimistic] disabled: ANTHROPIC_BASE_URL=…
+  is not a first-party Anthropic host. Set ENABLE_TOOL_SEARCH=true`. This machine's own `~/.claude/settings.json` still has only the base
+  URL; the A7 finding flags its terminal sessions.
+- **Rewrite causes** (`why()`, previous request of the same thread, first match wins): account switch → model changed → fast mode on →
+  effort changed (not on Opus 5.5 / Sonnet 5.5 / Fable 5.1: `EFFORT_KEEPS_CACHE`) → loaded tool set changed → system prompt changed →
+  images removed → message count dropped (compaction: "expected rebuild") → gap > lifetime (60 min after 1h writes, 5 min after 5m) →
+  request body got smaller (also "expected rebuild", see below) → CLI version changed → unexplained. Avoidable = model, fast, effort, tools.
+  Editing CLAUDE.md is not a cause: it neither applies nor invalidates mid-session. On the last 7 days (57 re-writes):
+  | | before | after |
+  | --- | --- | --- |
+  | idle / lifetime expired | 20 (only gaps > 1h) | 38 (13 on 1h, 25 on 5m) |
+  | account switch | 8 | 8 |
+  | model changed | — | 2 (Fable 5.1 → Opus 5.5, $8.43) |
+  | expected rebuild | — | 4 |
+  | unknown / unexplained | 29 | 5 ($2.28) |
+  The four rebuilds had a growing message count and a *smaller* body (two subagents whose body lost a third of its bytes; two main
+  turns 8 and 12 minutes after the one before, a few hundred tokens smaller): the client had cleared something out of the history, so the
+  spec's "message count dropped" alone missed them. That rule sits after the lifetime check so a cold cache is never called a rebuild.
+- **Lifetime fit, same 7 days:** main conversation actual $391.78 on 1h, $632.34 on 5m (+61%; 64 of 1,429 turns followed a 5–60 min
+  pause). Subagents actual $176.30 on 5m, $170.40 on 1h (−3%; 22 of 1,747 turns): under the 5% bar, so "keep".
+- **Going cold:** `warmth()` = a session's last main turn (no `agent_id`, a tool list) + the lifetime of its last cache write;
+  `coldTick()` every 60 s (`COLD_TICK_MS` in tests) notifies once per idle period, keyed in memory by that turn's timestamp.
+- **A6 idle fires: not shipped.** 167 transcripts hold no marker for a scheduled, loop or goal check-in turn: no `/loop` or schedule
+  `command-name`, no Cron/ScheduleWakeup tool call, and `origin.kind` on user rows is only `human`, `task-notification`, `coordinator` or
+  `peer`. `queue-operation` rows (enqueue/dequeue/remove) carry typed prompts, `<task-notification>`, `<bash-input>` and `<agent-message>`,
+  i.e. queued user input and subagent results, not timers. Without a marker it would be a guess from gaps, so it was left out.
+- **Brain noise:** capture skips sessions with fewer than 2 typed prompts and fewer than 3 tool calls. On the copy of the live vault the
+  next idle pass removed 22 of 42 notes (all one prompt, at most two tool calls: `reply with exactly: ok` probes and the like); the 20
+  left include two-prompt drills, which the rule keeps. `brain_sessions.trivial`: null = not judged yet (judged once), 1 = one-shot.
+

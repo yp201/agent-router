@@ -37,11 +37,13 @@ addCol('sessions', 'cwd text');
 if (addCol('sessions', 'title text')) db.exec('delete from tail_offsets'); // re-read the last 7 days once for titles/subagents; joins are idempotent
 addCol('requests', 'agent_id text');
 db.exec('create index if not exists requests_agent on requests(agent_id)');
-const FP = ['system_hash', 'tools_hash', 'tools_count', 'msg_count', 'first_user_hash', 'first_user_tok', 'context_est', 'tool_names_json', 'ua_kind'];
-for (const c of ['model_from_transcript', ...FP]) addCol('requests', `${c} ${/count|tok|est/.test(c) ? 'integer' : 'text'}`);
+const FP = ['system_hash', 'tools_hash', 'tools_count', 'msg_count', 'first_user_hash', 'first_user_tok', 'context_est', 'tool_names_json', 'ua_kind',
+  'tools_loaded', 'tools_deferred', 'tools_tok', 'effort', 'speed', 'beta_hash', 'image_count', 'cli_version']; // cache-key fingerprint (NOTES.md "Cost insights")
+for (const c of ['model_from_transcript', ...FP]) addCol('requests', `${c} ${/count|tok|est|loaded|deferred/.test(c) ? 'integer' : 'text'}`);
 if (addCol('requests', 'usage_src text')) db.exec(`update requests set usage_src = 'transcript' where cache_create is not null`); // all usage so far came from the tailer
 addCol('requests', 'source text');
 addCol('tool_uses', 'arg text');
+addCol('brain_sessions', 'trivial integer'); // 1 = a probe one-shot the brain keeps no note for; null = a note from before that test, judged on the next capture pass
 db.exec('create index if not exists tool_uses_arg on tool_uses(arg)');
 db.exec(`insert or ignore into accounts (id, kind) values ('home', 'home')`);
 // Clock: Date.now() plus a skew only the DRILLS hook `POST /router/clock {skew_ms}` sets (tests roll a budget period with it).
@@ -59,7 +61,7 @@ export const DEFAULTS: Record<string, any> = {
   warn_pct: 0.8, route_cutoff_pct: 0.9, weekly_reserve_pct: 0.2,
   proactive_switch_pct: 0.95, proactive_min_gain: 0.2, notify: true, // move a pinned session off an account this full, to one this much emptier
   policy: 'sticky_least_utilized', // | 'prefer_home_until_80' | 'manual'
-  rate_card: {},                   // { [model]: { input, output, cache_read, cache_write } } in $/Mtok
+  rate_card: {},                   // { [model id substring]: { input, write_5m, write_1h, read, output } } in $/MTok: overrides console.ts PRICES per model
   context_rules: [
     { id: 'handoff-100k', text: 'Warn at 100k context, suggest a handoff summary', enabled: true, state: 'proposed' },
     { id: 'keep-warm', text: 'Keep sessions warm: nudge before the 1h cache lapses', enabled: true, state: 'proposed' },
@@ -70,10 +72,14 @@ export const DEFAULTS: Record<string, any> = {
   // context advisor: window per model prefix (longest wins; a model containing [1m] defaults to 1M), thresholds, the Haiku subprocess
   context_windows: { default: 200000 }, context_warn_pct: 0.7, context_urgent_pct: 0.85,
   advisor_model: 'haiku', advisor_enabled: true, claude_bin: null,
-  // [{ id, name, scope: 'all'|'project'|'account'|'session', match, period: 'day'|'week'|'session', limit (units), action: 'notify'|'stop', thresholds }]
+  // [{ id, name, scope: 'all'|'project'|'account'|'session', match, period: 'day'|'week'|'session', limit (USD at list price), action: 'notify'|'stop', thresholds }]
   budgets: [],
-  // brain (docs/BRAIN.md): off until enabled; brain_dir null = ~/agent-router-brain; distilling spends at most brain_daily_units a day
-  brain_enabled: false, brain_dir: null, brain_distill: 'manual', brain_daily_units: 200000, // brain_distill: 'manual' | 'on_idle'
+  // going cold (router.ts coldTick): warn cold_lead_min minutes before a 1h-cached main conversation of at least cold_min_context tokens,
+  // whose rebuild would cost at least cold_min_usd, loses its cache
+  cold_warn: true, cold_min_context: 100000, cold_min_usd: 1, cold_lead_min: 5,
+  // brain (docs/BRAIN.md): off until enabled; brain_dir null = ~/agent-router-brain; distilling spends at most brain_daily_usd a day
+  // (a stored brain_daily_units from before dollars is ignored)
+  brain_enabled: false, brain_dir: null, brain_distill: 'manual', brain_daily_usd: 1, // brain_distill: 'manual' | 'on_idle'
   classifier: 'auto', brain_classifier_model: 'haiku', brain_writer_model: 'sonnet', brain_confidence: 0.7, // classifier: 'auto' | 'jev' | 'model'
 };
 export const settings = (): Record<string, any> => ({
