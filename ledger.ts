@@ -39,9 +39,14 @@ addCol('requests', 'agent_id text');
 db.exec('create index if not exists requests_agent on requests(agent_id)');
 const FP = ['system_hash', 'tools_hash', 'tools_count', 'msg_count', 'first_user_hash', 'first_user_tok', 'context_est', 'tool_names_json', 'ua_kind'];
 for (const c of ['model_from_transcript', ...FP]) addCol('requests', `${c} ${/count|tok|est/.test(c) ? 'integer' : 'text'}`);
+if (addCol('requests', 'usage_src text')) db.exec(`update requests set usage_src = 'transcript' where cache_create is not null`); // all usage so far came from the tailer
 db.exec(`insert or ignore into accounts (id, kind) values ('home', 'home')`);
+// Clock: Date.now() plus a skew only the DRILLS hook `POST /router/clock {skew_ms}` sets (tests roll a budget period with it).
+export const clock = { skew: 0 };
+export const now = () => Date.now() + clock.skew;
 
-const cols = ['ts', 'request_id', 'session_key', 'account_id', 'method', 'path', 'model', 'status', 'latency_ms', 'stream', 'retry_of', 'ratelimit_json', ...FP];
+const USAGE = ['in_tok', 'out_tok', 'cache_read', 'cache_create', 'cache_1h', 'cache_5m', 'usage_src']; // from the response stream, at log time
+const cols = ['ts', 'request_id', 'session_key', 'account_id', 'method', 'path', 'model', 'status', 'latency_ms', 'stream', 'retry_of', 'ratelimit_json', ...FP, ...USAGE];
 const ins = db.prepare(`insert into requests (${cols}) values (${cols.map((c) => `:${c}`)})`);
 export const logRequest = (row: Record<string, string | number | null>) =>
   Number(ins.run(Object.fromEntries(cols.map((c) => [c, row[c] ?? null]))).lastInsertRowid);
@@ -62,6 +67,8 @@ export const DEFAULTS: Record<string, any> = {
   // context advisor: window per model prefix (longest wins; a model containing [1m] defaults to 1M), thresholds, the Haiku subprocess
   context_windows: { default: 200000 }, context_warn_pct: 0.7, context_urgent_pct: 0.85,
   advisor_model: 'haiku', advisor_enabled: true, claude_bin: null,
+  // [{ id, name, scope: 'all'|'project'|'account'|'session', match, period: 'day'|'week'|'session', limit (units), action: 'notify'|'stop', thresholds }]
+  budgets: [],
 };
 export const settings = (): Record<string, any> => ({
   ...DEFAULTS,

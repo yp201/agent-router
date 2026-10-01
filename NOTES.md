@@ -228,3 +228,55 @@ not per session: the cheapest fallback is the account that recently served the s
   of its 5h window, resets Sat 03:18`; resumed turn stayed on home (manual never moves), no migration; home's next real response put it
   back at 39%/16%. The proactive move itself is covered by the fake-upstream test only until a drill runs with a non-manual policy.
 
+## Stream usage (2026-10-01)
+- **Why:** usage columns were filled only by the tailer's transcript join, which lags (the row is written when the stream ends, the
+  join later) and never happens for side requests and turns the CLI doesn't write to disk. On the live ledger that day: 105 of 149
+  successful `/v1/messages` rows (70.5%) had usage. Budgets need it at the moment the response ends.
+- **How** (`router.ts tapUsage()`): a second `data` listener on the upstream response next to `pipeline(up, res)`: the client's bytes are
+  not delayed, re-chunked or altered (the SSE-verbatim and gzip-passthrough tests are unchanged). The copy goes through a streaming
+  `createGunzip/Inflate/BrotliDecompress` when `content-encoding` says so, then:
+  - `text/event-stream`: split on `\n`, keep only the current partial line; `data:` lines containing `"usage"` are parsed:
+    `message_start` → `message.usage`, `message_delta` → `usage`, shallow-merged so the last value of each field wins (the delta carries
+    the final `output_tokens`; `cache_creation.ephemeral_{1h,5m}_input_tokens` come from `message_start`).
+  - anything else: body buffered up to 2 MB, top-level `usage` read at the end (only if the response completed).
+  Only numeric fields are kept. Any parse failure → that row has no stream usage, one log line per process (never the content).
+- The row gets `in_tok/out_tok/cache_read/cache_create/cache_1h/cache_5m` and `usage_src = 'stream'` in the same insert. The tailer still
+  does everything it did (titles, agents, tool_uses, `agent_id`, `jsonl_path`, `thinking_tok`, advisor + switch-cost hooks) but its usage
+  UPDATE is `coalesce(existing, transcript)` and sets `usage_src = 'transcript'` only when it filled. Rows from before the column were
+  backfilled `'transcript'` once.
+- **Dry run on a copy of the live ledger, real `claude -p` (CLI 2.1.x, haiku):** 12 of 12 `/v1/messages` rows through the new code had
+  usage at log time, including the 6 one-message side requests that never reach a transcript (`in 900 / out ~9`). Real responses were
+  uncompressed SSE; the gzip path is covered by the test only.
+- A client that disconnects mid-stream leaves the `message_start` numbers (input and cache) with `output_tokens` as of that event.
+
+## Budgets (2026-10-01)
+- **Shape:** `settings.budgets = [{id, name, scope: all|project|account|session, match, period: day|week|session, limit, action: notify|stop,
+  thresholds: [0.8, 1]}]`, validated on `PUT /router/settings` (400 `invalid_setting`). `scope: session` requires `period: session`
+  (`match: null` = every session, each measured on its own: the runaway-agent guard). `period: session` also works with the other scopes
+  (a per-session cap inside one project/account). Default `[]`, so nothing can stop until the user adds a budget.
+- **Unit** (`console.ts UNITS()`, the only definition, a SQL expression): `in + 0.1·cache_read + 1.25·cache_5m + 2·cache_1h + 5·out`;
+  a cache write without the 1h/5m split counts 1.25×. Dollars come only from `rate_card`, null if any model in the window has no rate.
+- **Spend** (`console.ts budgetStatus()`): `sum(UNITS)` over `/v1/messages` rows with status < 400 in the window, grouped by session and
+  model (top 3 sessions, dollars). day = since local midnight, week = rolling 7×24 h (no reset; `period_end: null`), session = the
+  session's whole life. Computed on demand per request and per UI poll; ~3 ms per budget on a 25k-row ledger using the two existing
+  indexes, so no new index. `// ponytail:` keep a running total per budget if the ledger gets large.
+- **Project** = basename of `sessions.cwd`, which comes from the transcript. Observed live: a fresh `claude -p` session's cwd is not yet
+  in the ledger when its first request arrives (it was ~2 s later, when the response ended), so a project budget does not stop a
+  one-shot `claude -p`; a resumed or multi-turn session is stopped from its next request. `all`, `account` and per-session budgets have
+  no such gap. Upgrade path if it matters: read the working directory from the request's system prompt.
+- **Notify** (`router.ts budgetCheck()`, after every successful `/v1/messages` row is logged): thresholds crossed for the first time in the
+  current period are inserted into `budget_events(budget_id, period_key, threshold, ts)` (`period_key` = local date / `rolling-7d` /
+  session key; an event counts while `ts >= period_start`, so a rolling week re-arms 7 days after it fired) and one notification goes
+  out for the highest: `Budget ‘climatefluent / day’ at 82% — 1.6M of 2M units`. Raising a limit mid-period does not re-arm.
+  Spend is re-read on the next request, not when the tailer later fills a row the stream missed.
+- **Stop** (`router.ts handle()`, before dialing; fails open on any error in the check): a matching `stop` budget at ≥ 100% →
+  **HTTP 400** `{"type":"error","error":{"type":"invalid_request_error","message":…}}` plus `x-should-retry: false`, and a ledger row with
+  status 400, the account it would have used, no `request_id`. `count_tokens` and every non-messages path are never checked.
+- **Stop status, observed with real `claude -p` against the dev router:** 400 `invalid_request_error` → the CLI printed
+  `API Error: 400 agent-router budget ‘budgetproj / day’ is spent: 10.98M of 50k input-equivalent tokens today. It resets Fri 00:00.
+  Raise or remove it at http://localhost:4101/router/#cost`, exit code 1 after 2.6 s, `terminal_reason: "api_error"` in
+  `--output-format json`. The ledger shows exactly one 400 row per request the CLI made (the title side request and the turn): no retry.
+  429 was not tried: the CLI retries it with backoff, which is the loop this must avoid.
+- **Clock:** `ledger.ts now()` = `Date.now()` + a skew that only `POST /router/clock {skew_ms}` (DRILLS=1) sets; request rows and budget
+  windows both use it. The period-roll test moves it a day forward.
+

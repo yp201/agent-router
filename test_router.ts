@@ -127,7 +127,7 @@ async function setup(t: TestContext, env: Record<string, string> = {}) {
   const s = {
     seen: [] as { who: string; xkey?: string; body: string; enc?: string }[],
     util: {} as Record<string, number>, util7: {} as Record<string, number>, fail: {} as Record<string, number>,
-    refreshes: [] as any[], refreshStatus: 200, n: 0,
+    refreshes: [] as any[], refreshStatus: 200, n: 0, usage: null as any, // usage: echoed as the response's top-level `usage`
   };
   const handler = (req: IncomingMessage, res: ServerResponse) => {
     let body = '';
@@ -145,7 +145,7 @@ async function setup(t: TestContext, env: Record<string, string> = {}) {
         s.fail[who]--;
         return res.writeHead(429, { ...h, 'retry-after': '1', 'anthropic-ratelimit-unified-representative-claim': 'five_hour' }).end('{"type":"error","error":{"type":"rate_limit_error"}}');
       }
-      res.writeHead(200, h).end(JSON.stringify({ who }));
+      res.writeHead(200, h).end(JSON.stringify({ who, ...(s.usage && { usage: s.usage }) }));
     });
   };
   const oauth = createServer(handler); // the token endpoint is plain http; the API upstream is TLS
@@ -432,6 +432,7 @@ test('tailer: joins transcript usage on requestId, records tool_use, persists of
   const r1 = row('req_1');
   assert.deepEqual([r1.in_tok, r1.out_tok, r1.cache_read, r1.cache_create, r1.cache_1h, r1.cache_5m, r1.thinking_tok, r1.session_id, r1.api_block_index, r1.model_from_transcript, r1.jsonl_path],
     [3, 50, 1000, 200, 200, 0, 7, 'tj', 1, 'claude-haiku-4', f]);
+  assert.equal(r1.usage_src, 'transcript', 'the response carried no usage, so the tailer filled it');
   assert.deepEqual({ ...(db.prepare('select * from tool_uses').get() as any) }, { id: 'tu1', request_id: 'req_1', name: 'Bash' });
   assert.equal((db.prepare(`select cwd from sessions where session_key = 'tj'`).get() as any).cwd, '/tmp/proj-x');
   const off = () => (db.prepare('select offset from tail_offsets where path = ?').get(f) as any)?.offset;
@@ -641,6 +642,137 @@ test('proactive switch before a pinned account fills up; notifications once per 
   assert.equal((await h.msg('s1')).who, 'acct-b', 'one proactive move per session per 10 min');
   assert.equal((await h.api('accounts')).find((a: any) => a.id === 'acct-b').util_5h, 0.1, 'real response overwrote the fake');
   assert.equal(notes().length, 3); assert.match(notes()[2], /^acct-b at 97% of its 5h window, resets \w{3} \d\d:\d\d$/);
+  h.noLeak();
+});
+
+// ---- usage from the response stream, budgets ----
+const USAGE_COLS = 'in_tok, out_tok, cache_read, cache_create, cache_1h, cache_5m, usage_src';
+test('stream usage: SSE, gzipped SSE, non-stream JSON at log time; malformed SSE -> null usage, response intact; tailer only fills nulls', async (t) => {
+  const sseBody = `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: 'm', usage: { input_tokens: 10, cache_read_input_tokens: 1000,
+    cache_creation_input_tokens: 300, cache_creation: { ephemeral_1h_input_tokens: 200, ephemeral_5m_input_tokens: 100 }, output_tokens: 1 } } })}\n\n`
+    + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'say "usage" é' } })}\n\n`
+    + `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 42 } })}\n\n` + EV2;
+  const bad = 'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":\n\n' + EV2;
+  const gz = gzipSync(sseBody), jsonBody = JSON.stringify({ type: 'message', usage: { input_tokens: 5, output_tokens: 7, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
+  const proj = mkdtempSync(`${tmpdir()}/router-proj-`);
+  const { base, ledger, stdout } = await startRouter(t, { CLAUDE_PROJECTS_DIR: proj, ...(await fakeUpstream(t, (req, res) => req.resume().on('end', () => {
+    const k = new URL(req.url!, 'http://x').searchParams.get('k')!, h = { 'content-type': k === 'json' ? 'application/json' : 'text/event-stream', 'request-id': `req_${k}` };
+    if (k === 'gz') return res.writeHead(200, { ...h, 'content-encoding': 'gzip' }).end(gz);
+    if (k === 'json') return res.writeHead(200, h).end(jsonBody);
+    const b = Buffer.from(k === 'sse' ? sseBody : bad);
+    res.writeHead(200, h); res.write(b.subarray(0, 150)); // split mid-line (and for `sse`, later, mid-character)
+    setTimeout(() => res.end(b.subarray(150)), 20);
+  }))) });
+  const get = (k: string) => raw({ port: Number(new URL(base).port), path: `/v1/messages?k=${k}` }, '{"model":"m","stream":true}');
+  const db = new DatabaseSync(ledger, { readOnly: true, timeout: 2000 });
+  t.after(() => db.close());
+  const row = (k: string) => until(() => db.prepare(`select ${USAGE_COLS}, thinking_tok from requests where request_id = ?`).get(`req_${k}`) as any, `row ${k}`);
+  const full = { in_tok: 10, out_tok: 42, cache_read: 1000, cache_create: 300, cache_1h: 200, cache_5m: 100, usage_src: 'stream', thinking_tok: null };
+
+  assert.equal((await get('sse')).body.toString(), sseBody);
+  assert.deepEqual({ ...(await row('sse')) }, full, 'usage on the row at log time, no transcript involved');
+  assert.ok((await get('gz')).body.equals(gz), 'client got the exact gzipped bytes');
+  assert.deepEqual({ ...(await row('gz')) }, full);
+  assert.equal((await get('json')).body.toString(), jsonBody);
+  assert.deepEqual({ ...(await row('json')) }, { in_tok: 5, out_tok: 7, cache_read: 0, cache_create: 0, cache_1h: null, cache_5m: null, usage_src: 'stream', thinking_tok: null });
+  for (const k of ['bad', 'bad2']) {
+    const r = await get(k);
+    assert.equal(r.status, 200); assert.equal(r.body.toString(), bad, 'malformed SSE still proxied verbatim');
+    assert.deepEqual(Object.values({ ...(await row(k)) }), Array(8).fill(null), 'row written, no usage');
+  }
+  assert.equal(stdout().split('usage: could not parse').length - 1, 1, 'parse failure logged once');
+  assert.ok(!stdout().includes('input_tokens'), 'response text logged');
+
+  // the transcript for the same request: usage stays the stream's; the tailer adds what only it knows
+  mkdirSync(`${proj}/-p`);
+  writeFileSync(`${proj}/-p/s.jsonl`, arow('req_sse', { in: 999, read: 999, create: 999 }) + arow('req_bad', { in: 3, read: 4, create: 5 }));
+  await until(async () => (await row('bad')).usage_src === 'transcript', 'tailer filled the row the stream could not');
+  assert.deepEqual({ ...(await row('sse')) }, { ...full, thinking_tok: 7 });
+});
+
+const B_USAGE = { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 1000, cache_creation_input_tokens: 300, cache_creation: { ephemeral_1h_input_tokens: 200, ephemeral_5m_input_tokens: 100 } };
+const B_UNITS = 100 + 0.1 * 1000 + 1.25 * 100 + 2 * 200 + 5 * 20; // 825
+async function budgetSetup(t: TestContext) {
+  const log = `${mkdtempSync(`${tmpdir()}/router-notify-`)}/notify.log`, proj = mkdtempSync(`${tmpdir()}/router-proj-`);
+  const h = await setup(t, { DRILLS: '1', NOTIFY: '0', NOTIFY_LOG: log, CLAUDE_PROJECTS_DIR: proj });
+  h.s.usage = B_USAGE;
+  // a real turn (tools, so /router/cost does not file it under one-shots); the row and the budget check land just after the response ends
+  const turn = async (session: string) => { const r = await h.msg(session, { tools: [{ name: 'Read', input_schema: {} }] }); await new Promise((ok) => setTimeout(ok, 40)); return r; };
+  return { ...h, proj, turn, notes: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []),
+    put: (b: unknown) => fetch(`${h.base}/router/settings`, { method: 'PUT', body: JSON.stringify(b) }) };
+}
+
+test('budgets: units formula, project/day budget notifies once at 80% and once at 100%, re-arms when the period rolls', async (t) => {
+  const h = await budgetSetup(t);
+  assert.deepEqual((await h.api('settings')).budgets, [], 'no budgets (so no stop) until the user adds one');
+  // the session's project comes from its transcript cwd
+  mkdirSync(`${h.proj}/-p`);
+  writeFileSync(`${h.proj}/-p/b1.jsonl`, JSON.stringify({ type: 'user', sessionId: 'b1', cwd: '/tmp/climatefluent', timestamp: new Date().toISOString(), message: { role: 'user', content: 'hi' } }) + '\n');
+  await until(async () => (await h.rows(`select cwd from sessions where session_key = 'b1'`))[0]?.cwd, 'cwd from transcript');
+  const budget = { id: 'cf', name: 'climatefluent / day', scope: 'project', match: 'climatefluent', period: 'day', limit: 2000, action: 'notify', thresholds: [0.8, 1] };
+  assert.equal((await h.put({ budgets: [budget] })).status, 200);
+  const status = async () => (await h.api('budgets'))[0];
+
+  await h.turn('b1');
+  h.s.usage = { ...B_USAGE, cache_creation: undefined }; // no 1h/5m split -> the whole cache write at 1.25×
+  await h.turn('other');
+  const cost = Object.fromEntries((await h.api('cost')).per_session.map((s: any) => [s.session_key, s.units]));
+  assert.deepEqual(cost, { b1: B_UNITS, other: 100 + 0.1 * 1000 + 1.25 * 300 + 5 * 20 });
+  h.s.usage = B_USAGE;
+  let st = await status();
+  assert.deepEqual([st.spent, st.limit, st.pct, st.state, st.dollars, st.period_end > Date.now()], [B_UNITS, 2000, B_UNITS / 2000, 'ok', null, true], 'only the project counts');
+  assert.deepEqual(h.notes(), []);
+
+  await h.turn('b1'); // 1650 = 82%
+  assert.equal((await status()).state, 'warn');
+  await h.turn('b1'); // 2475 = 123%
+  await h.turn('b1'); await h.turn('other');
+  assert.equal(h.notes().length, 2, 'one per threshold, none repeated');
+  assert.match(h.notes()[0], /^Budget ‘climatefluent \/ day’ at 82% — 1\.\dk of 2k units$/);
+  assert.match(h.notes()[1], /^Budget ‘climatefluent \/ day’ at 123% — 2\.5k of 2k units$/);
+  st = await status();
+  assert.deepEqual([st.spent, st.state, st.top], [4 * B_UNITS, 'over', [{ label: 'hi', units: 4 * B_UNITS }]]);
+  assert.deepEqual((await h.api('overview')).budgets, [{ name: 'climatefluent / day', pct: 4 * B_UNITS / 2000, state: 'over' }]);
+  await h.put({ rate_card: { 'claude-haiku': { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 } } });
+  assert.ok(Math.abs((await status()).dollars - 4 * (100 + 5 * 20 + 0.1 * 1000 + 1.25 * 300) / 1e6) < 1e-12, 'dollars only from the rate card');
+  assert.deepEqual((await h.rows('select threshold from budget_events order by ts')).map((r) => r.threshold), [0.8, 1]);
+
+  assert.equal((await h.api('clock', { skew_ms: 864e5 })).ok, true); // tomorrow: a new period
+  assert.equal((await status()).spent, 0);
+  await h.turn('b1'); await h.turn('b1');
+  assert.equal(h.notes().length, 3, 're-armed');
+  assert.match(h.notes()[2], /at 82%/);
+  h.noLeak();
+});
+
+test('budgets: stop answers 400 without dialing upstream; count_tokens passes; per-session cap is per session; bad shapes -> 400', async (t) => {
+  const h = await budgetSetup(t);
+  const b = { id: 'all', name: 'everything today', scope: 'all', match: null, period: 'day', limit: 800, action: 'stop', thresholds: [1] };
+  for (const bad of [{ ...b, scope: 'galaxy' }, { ...b, limit: '2M' }, { ...b, limit: 0 }, { ...b, scope: 'project' }, { ...b, scope: 'session' }, { ...b, action: 'explode' }, { ...b, thresholds: [2] }, { ...b, id: undefined }])
+    assert.equal((await h.put({ budgets: [bad] })).status, 400, JSON.stringify(bad));
+  assert.equal((await h.put({ budgets: [b, b] })).status, 400, 'duplicate id');
+  assert.equal((await h.put({ budgets: [b] })).status, 200);
+
+  assert.equal((await h.turn('c1')).who, 'home', 'under the limit: passes');
+  const seen = h.s.seen.length, r = await h.turn('c1');
+  assert.equal(r.status, 400); assert.equal(r.type, 'error'); assert.equal(r.error.type, 'invalid_request_error');
+  assert.match(r.error.message, /budget ‘everything today’ is spent: 825 of 800 input-equivalent tokens today\. It resets \w{3} 00:00\. Raise or remove it at http:\/\/localhost:\d+\/router\/#cost/);
+  assert.equal(h.s.seen.length, seen, 'not dialed');
+  const [row] = await h.rows('select session_key, account_id, status, request_id, in_tok from requests order by id desc limit 1');
+  assert.deepEqual({ ...row }, { session_key: 'c1', account_id: 'home', status: 400, request_id: null, in_tok: null });
+  assert.deepEqual(h.notes(), ['Budget ‘everything today’ at 103% — 825 of 800 units — requests are now stopped']);
+  const ct = await fetch(`${h.base}/v1/messages/count_tokens`, { method: 'POST', headers: { authorization: 'Bearer tok-home-fake' }, body: '{"model":"claude-haiku-4","messages":[]}' });
+  assert.equal(ct.status, 200); assert.equal(h.s.seen.length, seen + 1, 'count_tokens is never blocked');
+
+  // the runaway-agent guard: one cap, measured per session
+  await h.put({ budgets: [{ id: 'cap', name: 'per-session cap', scope: 'session', match: null, period: 'session', limit: 800, action: 'stop', thresholds: [1] }] });
+  assert.equal((await h.turn('c1')).status, 400, 'c1 already spent 825');
+  assert.equal((await h.turn('c2')).status, 200, 'a second session has its own allowance');
+  assert.match((await h.turn('c2')).error.message, /‘per-session cap’ is spent: 825 of 800 .* in this session/);
+  assert.equal((await h.turn('c3')).status, 200);
+  assert.equal((await h.api('budgets'))[0].top.length, 3);
+  await h.put({ budgets: [] });
+  assert.equal((await h.turn('c1')).status, 200, 'budget removed');
   h.noLeak();
 });
 

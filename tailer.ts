@@ -10,8 +10,10 @@ import { check } from './advisor.ts';
 const ROOT = process.env.CLAUDE_PROJECTS_DIR ?? `${homedir()}/.claude/projects`;
 const CHUNK = 4 << 20; // read in 4 MB slices and yield between them so a big first scan never stalls proxying
 
-const upd = db.prepare(`update requests set in_tok = :in_tok, out_tok = :out_tok, cache_read = :cache_read, cache_create = :cache_create,
-  cache_1h = :cache_1h, cache_5m = :cache_5m, thinking_tok = :thinking_tok, jsonl_path = :jsonl_path, session_id = :session_id,
+// usage is fill-if-null: the router already wrote it from the response stream (usage_src 'stream') for most rows
+const upd = db.prepare(`update requests set in_tok = coalesce(in_tok, :in_tok), out_tok = coalesce(out_tok, :out_tok), cache_read = coalesce(cache_read, :cache_read),
+  cache_create = coalesce(cache_create, :cache_create), cache_1h = coalesce(cache_1h, :cache_1h), cache_5m = coalesce(cache_5m, :cache_5m),
+  usage_src = coalesce(usage_src, iif(:cache_create is not null, 'transcript', null)), thinking_tok = :thinking_tok, jsonl_path = :jsonl_path, session_id = :session_id,
   api_block_index = :api_block_index, model_from_transcript = :model, agent_id = :agent_id where request_id = :rid`);
 const sess = db.prepare(`update sessions set cwd = coalesce(:cwd, cwd), last_ts = max(coalesce(last_ts, 0), :ts)
   where session_key = (select session_key from requests where request_id = :rid)`);

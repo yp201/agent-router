@@ -6,12 +6,13 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { gunzipSync, inflateSync, brotliDecompressSync } from 'node:zlib';
+import { gunzipSync, inflateSync, brotliDecompressSync, createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
+import { StringDecoder } from 'node:string_decoder';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
-import { db, logRequest, settings, putSetting, DEFAULTS } from './ledger.ts';
+import { db, logRequest, settings, putSetting, DEFAULTS, now, clock } from './ledger.ts';
 import { startTailer, joined } from './tailer.ts';
-import { consoleApi, util, timeline, advice } from './console.ts';
+import { consoleApi, util, timeline, advice, budgetStatus, fmtUnits } from './console.ts';
 import { CLAUDE_BIN, handoff, notify, title } from './advisor.ts';
 import { type Account, listAccounts, getAccount, setAcct, healthy, token, forget, expiresAt } from './accounts.ts';
 
@@ -83,6 +84,7 @@ function sessionKey(p: any): string | null {
 
 const rl = (a: Account) => { try { return JSON.parse(a.last_ratelimit_json ?? '{}'); } catch { return {}; } };
 const num = (v: any) => (v == null ? null : Number(v));
+const at = (ms: number) => new Date(ms).toLocaleString('en-US', { weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
 const util5h = (a: Account) => util(a.last_ratelimit_json, '5h') ?? 0;
 const statusOf = (a?: Account) => !a ? 'removed' : a.disabled ? 'disabled' : a.needs_login ? 'needs_login'
   : a.cooling_until! > Date.now() ? 'cooling' : a.last_seen ? 'ok' : 'unknown';
@@ -126,8 +128,77 @@ function warnCheck(id: string, j: string) {
   const hit = (['5h', '7d'] as const).map((w) => ({ w, u: util(j, w) ?? 0, reset: util(j, w, 'reset') ?? 0 }))
     .filter((x) => x.u >= warn && db.prepare(`update accounts set warned_${x.w} = ? where id = ? and warned_${x.w} is not ?`).run(x.reset, id, x.reset).changes)
     .sort((x, y) => y.u - x.u)[0];
-  if (hit) notify(`${id} at ${Math.round(hit.u * 100)}% of its ${hit.w} window${hit.reset ? `, resets ${new Date(hit.reset * 1000)
-    .toLocaleString('en-US', { weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false })}` : ''}`);
+  if (hit) notify(`${id} at ${Math.round(hit.u * 100)}% of its ${hit.w} window${hit.reset ? `, resets ${at(hit.reset * 1000)}` : ''}`);
+}
+
+// ---- budgets (settings.budgets): status and the unit formula live in console.ts ----
+const okBudget = (b: any) => !!b && typeof b === 'object' && typeof b.id === 'string' && /^[\w-]{1,64}$/.test(b.id) && typeof b.name === 'string' && !!b.name.trim() && b.name.length <= 80
+  && ['all', 'project', 'account', 'session'].includes(b.scope) && ['day', 'week', 'session'].includes(b.period)
+  && (b.scope === 'all' ? b.match == null : b.scope === 'session' ? b.period === 'session' && (b.match == null || typeof b.match === 'string') : typeof b.match === 'string' && b.match !== '')
+  && Number.isFinite(b.limit) && b.limit > 0 && ['notify', 'stop'].includes(b.action)
+  && Array.isArray(b.thresholds) && b.thresholds.every((x: any) => typeof x === 'number' && x > 0 && x <= 1);
+const okBudgets = (v: any) => Array.isArray(v) && v.every(okBudget) && new Set(v.map((b) => b.id)).size === v.length;
+// Budgets a request counts against, with their status. project = basename of the session's cwd (known once the tailer has seen its
+// transcript); a per-session budget (period 'session') is measured for this request's session.
+function budgetsFor(key: string | null, acct: string, action?: string) {
+  const bs = (settings().budgets as any[]).filter((b) => (!action || b.action === action) && (key || b.period !== 'session'));
+  const proj = bs.some((b) => b.scope === 'project') && key ? one('select cwd from sessions where session_key = ?', key)?.cwd?.split('/').pop() : null;
+  return bs.filter((b) => b.scope === 'all' || (b.scope === 'account' ? b.match === acct : b.scope === 'project' ? b.match === proj : !b.match || b.match === key))
+    .map((b) => budgetStatus(b, key));
+}
+// After each /v1/messages: the first time a budget crosses a threshold in its current period -> one notification, recorded in budget_events.
+function budgetCheck(key: string | null, acct: string) {
+  for (const b of budgetsFor(key, acct)) {
+    const hit = [...b.thresholds].sort((x: number, y: number) => y - x).filter((th: number) => b.spent >= th * b.limit
+      && db.prepare(`insert into budget_events (budget_id, period_key, threshold, ts) select ?, ?, ?, ? where not exists
+        (select 1 from budget_events where budget_id = ? and period_key = ? and threshold = ? and ts >= ?)`).run(b.id, b.period_key, th, now(), b.id, b.period_key, th, b.period_start).changes);
+    if (hit.length) notify(`Budget ‘${b.name}’ at ${Math.floor(b.pct * 100)}% — ${fmtUnits(b.spent)} of ${fmtUnits(b.limit)} units${b.action === 'stop' && b.state === 'over' ? ' — requests are now stopped' : ''}`);
+  }
+}
+const stopMsg = (b: any) => `agent-router budget ‘${b.name}’ is spent: ${fmtUnits(b.spent)} of ${fmtUnits(b.limit)} input-equivalent tokens ${
+  b.period === 'day' ? `today. It resets ${at(b.period_end)}` : b.period === 'week' ? 'in the last 7 days. The window is rolling: spend frees up as it ages past 7 days'
+  : 'in this session. A per-session cap does not reset: start a new session'}. Raise or remove it at http://localhost:${PORT}/router/#cost`;
+
+// Usage from the response stream: a tee of the bytes the client gets (never delayed or altered), decoded and parsed for `usage`.
+// SSE: message_start.message.usage, then message_delta.usage (later fields win); only the current partial line is held.
+// Non-stream JSON: top-level `usage`, body buffered up to 2 MB. Only numbers are kept. Any failure -> no usage on that row,
+// logged once (never the content), response untouched.
+const USAGE_CAP = 2 << 20;
+let usageWarned = false;
+function tapUsage(up: IncomingMessage) {
+  const sse = String(up.headers['content-type']).includes('text/event-stream'), enc = String(up.headers['content-encoding'] ?? '').toLowerCase();
+  const z = enc === 'gzip' ? createGunzip() : enc === 'deflate' ? createInflate() : enc === 'br' ? createBrotliDecompress() : null;
+  const dec = new StringDecoder('utf8'), n = (v: any) => (typeof v === 'number' ? v : null);
+  let buf = '', u: any = null, dead = false, fin = false;
+  const feed = (c: Buffer | null) => { // null = end of body
+    if (dead) return;
+    try {
+      buf += c ? dec.write(c) : dec.end();
+      if (buf.length > USAGE_CAP) return void ([dead, buf] = [true, '']);
+      if (!sse) { if (!c && up.complete) u = JSON.parse(buf).usage; return; }
+      const lines = buf.split('\n');
+      buf = lines.pop()!;
+      for (const l of lines) {
+        if (!l.startsWith('data:') || !l.includes('"usage"')) continue;
+        const d = JSON.parse(l.slice(5));
+        u = { ...u, ...(d.type === 'message_start' ? d.message?.usage : d.type === 'message_delta' ? d.usage : null) };
+      }
+    } catch {
+      [dead, buf] = [true, ''];
+      if (!usageWarned) { usageWarned = true; console.error('usage: could not parse a response stream; that row has no stream usage (logged once)'); }
+    }
+  };
+  return new Promise<Record<string, string | number | null>>((ok) => {
+    const done = () => {
+      if (fin) return;
+      fin = true; feed(null);
+      ok(dead || !u || typeof u !== 'object' ? {} : { in_tok: n(u.input_tokens), out_tok: n(u.output_tokens), cache_read: n(u.cache_read_input_tokens), cache_create: n(u.cache_creation_input_tokens),
+        cache_1h: n(u.cache_creation?.ephemeral_1h_input_tokens), cache_5m: n(u.cache_creation?.ephemeral_5m_input_tokens), usage_src: 'stream' });
+    };
+    if (!z) return void up.on('data', feed).on('end', done).on('close', done);
+    z.on('data', feed).on('end', done).on('error', done); // a cut-off body: keep what was read
+    up.on('data', (c) => z.write(c)).on('end', () => z.end()).on('close', () => z.end());
+  });
 }
 
 // pick + token; an oauth account whose token can't be loaded is skipped for this request
@@ -161,7 +232,7 @@ const handler = (req: IncomingMessage, res: ServerResponse) => handle(req, res).
 });
 
 async function handle(req: IncomingMessage, res: ServerResponse) {
-  const start = Date.now();
+  const start = now();
   const { pathname } = new URL(req.url!, 'http://x');
   const chunks: Buffer[] = [];
   for await (const c of req) chunks.push(c);
@@ -195,10 +266,10 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const shape = ua.replace(/[0-9a-f]{8,}/gi, 'H').replace(/\d+/g, 'N');
     if (!uaShapes.has(shape) && uaShapes.size < 20) { uaShapes.add(shape); console.log('user-agent shape:', shape); }
   }
-  const log = (account_id: string, status: number, request_id: string | null, ratelimit_json: string, retry_of: number | null) => {
+  const log = (account_id: string, status: number, request_id: string | null, ratelimit_json: string, retry_of: number | null, usage: Record<string, any> = {}) => {
     const row = {
       ts: start, request_id, session_key: key, account_id, method: req.method!, path: req.url!, model,
-      status, latency_ms: Date.now() - start, stream: parsed.stream === true ? 1 : 0, retry_of, ratelimit_json, ...fp,
+      status, latency_ms: now() - start, stream: parsed.stream === true ? 1 : 0, retry_of, ratelimit_json, ...fp, ...usage,
     };
     console.log(new Date(start).toISOString(), row.method, row.path, status, row.latency_ms, request_id, model, account_id);
     try { const id = logRequest(row); joined(request_id); return id; } catch (e: any) { console.error('ledger insert failed:', e.message); return null; }
@@ -209,6 +280,16 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     log('none', 503, null, '{}', null);
     return json(res, 503, { error: { type: 'router_no_healthy_account', message: 'every account is disabled, cooling or needs login' } });
   }
+  // Budget stop: a matching `stop` budget at >= 100% answers here, without dialing. 400 invalid_request_error is what Claude Code
+  // shows once and does not retry (NOTES.md "Budgets"). Fails open: a budget bug must never take the proxy down.
+  if (isMsg) try {
+    const over = budgetsFor(key, c.a.id, 'stop').find((b) => b.state === 'over');
+    if (over) {
+      log(c.a.id, 400, null, '{}', null);
+      return res.writeHead(400, { 'content-type': 'application/json', 'x-should-retry': 'false' })
+        .end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: stopMsg(over) } }));
+    }
+  } catch (e: any) { console.error('budget stop check failed:', e.message); }
   const pinned = isMsg ? pinOf(key) : undefined;
   let from = pinned && pinned !== c.a.id ? pinned : null;
   let reason = from ? `unhealthy: ${statusOf(getAccount(from))}` : null;
@@ -234,7 +315,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     return { up, rl: s, rid: (up.headers['request-id'] as string) ?? null, why: isMsg && forced(up.statusCode!, a) ? cool(a, up) : null };
   };
 
-  let status = 502, requestId: string | null = null, ratelimit = '{}', retryOf: number | null = null;
+  let status = 502, requestId: string | null = null, ratelimit = '{}', retryOf: number | null = null, usage: Promise<Record<string, any>> | undefined;
   try {
     let r = await send(c);
     // Forced switch: nothing has been written to the client yet, so replay the buffered body once elsewhere.
@@ -260,13 +341,15 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(r.up.headers)) if (!SKIP_RES.has(k)) out[k] = v;
     res.writeHead(status, out);
+    if (isMsg && status < 400) usage = tapUsage(r.up);
     await pipeline(r.up, res);
   } catch (e: any) {
     if (!res.headersSent) json(res, 502, { error: { type: 'router_upstream_error', message: e.message } });
     else res.destroy();
   }
 
-  log(c.a.id, status, requestId, ratelimit, retryOf);
+  log(c.a.id, status, requestId, ratelimit, retryOf, await usage);
+  if (isMsg && status < 400) try { budgetCheck(key, c.a.id); } catch (e: any) { console.error('budget check failed:', e.message); }
 }
 
 const accountsView = () => {
@@ -298,7 +381,7 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
     for (const [k, v] of Object.entries(input ?? {})) {
       const d = DEFAULTS[k], ok = !(k in DEFAULTS) ? false : k.endsWith('_pct') ? typeof v === 'number' && v >= 0 && v <= 1
         : enums[k] ? enums[k].includes(v as string) : d === null ? v === null || typeof v === 'string'
-        : k === 'context_rules' ? Array.isArray(v) : typeof d !== 'object' ? typeof v === typeof d : typeof v === 'object' && v !== null && !Array.isArray(v);
+        : k === 'context_rules' ? Array.isArray(v) : k === 'budgets' ? okBudgets(v) : typeof d !== 'object' ? typeof v === typeof d : typeof v === 'object' && v !== null && !Array.isArray(v);
       if (!ok) return json(res, 400, { error: { type: 'invalid_setting', key: k } });
     }
     for (const [k, v] of Object.entries(input)) putSetting(k, v);
@@ -308,7 +391,7 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
     const ok = listAccounts().filter(healthy), n = newSession(ok);
     return json(res, 200, { ...consoleApi('overview', url.searchParams, accountsView()), policy_line: n.a ? `new sessions start on ${n.a.id} — ${n.why}` : n.why });
   }
-  if (m === 'GET' && ['cache', 'cost', 'insights', 'sessions'].includes(what) && !id) return json(res, 200, consoleApi(what, url.searchParams));
+  if (m === 'GET' && ['cache', 'cost', 'insights', 'sessions', 'budgets'].includes(what) && !id) return json(res, 200, consoleApi(what, url.searchParams));
   if (m === 'GET' && what === 'sessions' && action === 'timeline') return json(res, 200, timeline(id));
   if (m === 'GET' && what === 'sessions' && action === 'advice') return json(res, 200, advice(id));
   if (m === 'GET' && what === 'advice') return json(res, 200, advice());
@@ -318,6 +401,7 @@ async function api(req: IncomingMessage, res: ServerResponse, path: string, body
   }
   if (m === 'GET' && what === 'migrations') return json(res, 200, all('select * from migrations order by ts desc limit 100'));
   if (m === 'GET' && what === 'accounts') return json(res, 200, accountsView());
+  if (DRILLS && m === 'POST' && what === 'clock') { clock.skew = Number(input.skew_ms) || 0; console.warn(`DRILL clock skew ${clock.skew} ms`); return json(res, 200, { ok: true, skew_ms: clock.skew }); }
 
   if (m === 'POST' && what === 'accounts' && !id) {
     const nid = String(input.id ?? '');

@@ -62,6 +62,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .err { color: var(--clay); }
 .plain { border: 0; background: none; padding: 0; font: inherit; text-align: left; max-width: 100%; } .plain:hover { color: var(--clay); }
 .meter .bar { height: 4px; }
+[hidden] { display: none !important; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 @media (max-width: 1000px) { .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid2 { grid-template-columns: 1fr; } }
 @media (max-width: 720px) {
@@ -89,6 +90,9 @@ const $ = (s) => document.querySelector(s);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const NA = '<span class="muted">—</span>';
 const tok = (n) => n == null ? NA : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(Math.round(n));
+const units = (n) => n >= 1e6 ? `${+(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${+(n / 1e3).toFixed(1)}k` : String(Math.round(n)); // budgets: 1.6M / 2M
+const parseUnits = (v) => { const m = /^\s*(\d*\.?\d+)\s*([km]?)\s*$/i.exec(v); return m ? Number(m[1]) * ({ k: 1e3, m: 1e6 }[m[2].toLowerCase()] ?? 1) : NaN; };
+const bColor = (b) => b.state === 'over' ? 'var(--clay)' : b.state === 'warn' ? 'var(--amber)' : 'var(--teal)'; // teal < 80%, amber >= 80%, clay >= 100%
 const pct = (x) => x == null ? NA : `${Math.round(x * 100)}%`;
 const two = (n) => String(n).padStart(2, '0');
 const dur = (s) => { if (s == null || s < 0) return '—'; s = Math.round(s);
@@ -106,7 +110,7 @@ const model = (m) => esc((m ?? '—').replace(/^claude-/, '').replace(/-\d{8}$/,
 const get = (p) => fetch(`/router/${p}`).then((r) => r.json());
 const send = (method, p, body) => fetch(`/router/${p}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) }).then((r) => r.json());
 let S = {};            // last settings
-const ui = { cacheSession: 'all', cacheDays: 7, dollars: false, open: {}, added: null, tl: null, busy: {} }; // view state that survives re-renders
+const ui = { cacheSession: 'all', cacheDays: 7, dollars: false, open: {}, added: null, tl: null, busy: {}, b: {} }; // view state that survives re-renders
 const kt = (n) => n == null ? '—' : `${Math.round(n / 1000)}k`;
 const ctxColor = (s) => s.context_pct >= s.urgent_pct ? 'clay' : s.context_pct >= s.warn_pct ? 'amber' : 'muted';
 // Session timeline: x = turn, one lane per account (first appearance order), bar = context (teal read + clay write cap)
@@ -167,6 +171,8 @@ const views = {
       ${kpi('Switches', sw.manual + sw.forced + sw.ratelimited, `${sw.manual} manual · ${sw.forced} forced · ${sw.ratelimited} rate-limited`)}
       ${kpi('Headroom (5h)', pct(o.headroom_5h_pct), `of one account, pooled · resets ${dur(o.reset_in_s)}`)}
     </section>
+    ${o.budgets.length ? `<a href="#cost" class="panel" style="flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px 24px;padding:12px 20px" aria-label="Budgets">
+      <span class="label">Budgets</span>${o.budgets.map((b) => `<span class="row small" style="flex:1 1 220px;min-width:0"><span class="nm">${esc(b.name)}</span>${bar([[b.pct, bColor(b)]])}<span class="mono">${pct(b.pct)}</span></span>`).join('')}</a>` : ''}
     <section class="grid2">
       <div class="panel">
         <div class="between"><h2>Accounts</h2><a href="#accounts" class="small muted">Manage →</a></div>
@@ -288,8 +294,8 @@ const views = {
       </section>`;
   }],
 
-  cost: [['cost', 'accounts', 'sessions'], (c, accts, sessions) => {
-    const m = byKey(sessions);
+  cost: [['cost', 'accounts', 'sessions', 'budgets'], (c, accts, sessions, budgets) => {
+    const m = byKey(sessions), nb = { scope: 'all', period: 'day', action: 'notify', ...ui.b }, sel = (k, opts) => `<select name="${k}" data-b>${opts.map(([v, l]) => `<option value="${v}" ${nb[k] === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
     const w5 = c.windows['5h'], w7 = c.windows['7d'], st = c.settings, rc = st.rate_card ?? {};
     const resets = w5.map((w) => w.reset).filter(Boolean), firstReset = resets.length ? new Date(Math.min(...resets) * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '—';
     const warnings = [...w7.filter((w) => (w.projected_at_reset ?? 0) > 1 - st.weekly_reserve_pct).map((w) => `${w.account} will reach its ${pct(st.weekly_reserve_pct)} weekly reserve before reset at the current rate (${pct(w.projected_at_reset)} projected).`),
@@ -310,7 +316,7 @@ const views = {
           <span class="mono small ${(w.projected_at_reset ?? 0) > 1 - st.weekly_reserve_pct ? 'amber' : 'muted'}" style="width:170px">${pct(w.util)} · ${w.projected_at_reset == null ? `resets ${w.reset ? new Date(w.reset * 1000).toLocaleDateString('en-GB', { weekday: 'short' }) : '—'}` : `${pct(w.projected_at_reset)} by reset`}</span></div>`).join('')}
       </div>
       <form class="panel" id="budgets">
-        <h2>Budgets &amp; alerts</h2>
+        <h2>Window alerts &amp; routing thresholds</h2>
         ${[['warn_pct', 'Warn me when any account passes'], ['route_cutoff_pct', 'Stop starting new sessions on an account above'], ['weekly_reserve_pct', 'Reserve for the weekly window'],
           ['proactive_switch_pct', 'Move a pinned session off an account above'], ['proactive_min_gain', '…to one with at least this much more headroom']].map(([k, l]) =>
           `<label class="between"><span>${l}</span><span class="row"><input type="number" min="0" max="100" step="1" name="${k}" value="${Math.round(st[k] * 100)}">%</span></label>`).join('')}
@@ -326,14 +332,37 @@ const views = {
       </form>
     </section>
     <section class="panel">
-      <div class="between"><h2>Where the tokens went — today</h2><span class="small muted">from the session transcripts, not estimates</span></div>
+      <div class="between"><h2>Budgets</h2><span class="small muted">input-equivalent tokens (cache read 0.1×, cache write 1.25×/2×, output 5×)</span></div>
+      ${budgets.map((b) => `<div class="row" style="gap:12px">
+        <span class="nm" style="width:190px;font-weight:600" title="${esc(b.top.map((x) => `${x.label}: ${units(x.units)}`).join('\n'))}">${esc(b.name)}</span>
+        <span class="small muted nm" style="width:190px">${esc([b.scope, b.match, b.period === 'week' ? 'rolling 7 days' : b.period === 'session' ? 'per session' : 'today'].filter(Boolean).join(' · '))}</span>
+        ${bar([[b.pct, bColor(b)]])}
+        <span class="mono small" style="width:210px">${units(b.spent)} / ${units(b.limit)} units${b.dollars == null ? '' : ` · $${b.dollars.toFixed(2)}`}</span>
+        <span class="chip ${b.action === 'stop' ? 'bad' : ''}">${esc(b.action)}</span>
+        <button class="sm" data-act="budget-del" data-id="${esc(b.id)}" aria-label="Delete budget ${esc(b.name)}">Delete</button></div>`).join('')
+        || '<div class="note">No budgets yet. A budget is a spend limit over a scope and a period: it notifies at 80% and 100%, and with action “stop” the router refuses further requests in that scope until the period resets.</div>'}
+      <form id="budget-add" class="row" style="flex-wrap:wrap;align-items:flex-end;gap:12px">
+        <label class="col small muted">Name<input name="name" required maxlength="80" placeholder="climatefluent / day"></label>
+        <label class="col small muted">Scope${sel('scope', [['all', 'everything'], ['project', 'project'], ['account', 'account'], ['session', 'every session (cap)']])}</label>
+        <label class="col small muted" data-match ${/project|account/.test(nb.scope) ? '' : 'hidden'}>Match<input name="match" list="bm-${esc(nb.scope)}" placeholder="name"></label>
+        <datalist id="bm-project">${[...new Set(sessions.map((s) => s.project).filter(Boolean))].map((p) => `<option value="${esc(p)}">`).join('')}</datalist>
+        <datalist id="bm-account">${accts.map((a) => `<option value="${esc(a.id)}">`).join('')}</datalist>
+        <label class="col small muted">Period${sel('period', [['day', 'day (since midnight)'], ['week', 'week (rolling 7 days)'], ['session', 'session (per session)']])}</label>
+        <label class="col small muted">Limit (units)<input name="limit" required placeholder="2M" style="width:90px" class="mono"></label>
+        <label class="col small muted">At 100%${sel('action', [['notify', 'notify'], ['stop', 'stop requests']])}</label>
+        <button class="sm">Add budget</button>
+      </form>
+      <div class="note">“Week” is the last 7×24 hours, rolling. A project is known once a session's transcript has been read, so a project budget starts counting a session a few seconds in. “Stop” answers the CLI with an error naming the budget; raise or delete it here to continue.</div>
+    </section>
+    <section class="panel">
+      <div class="between"><h2>Where the tokens went — today</h2><span class="small muted">from the response stream and session transcripts, not estimates</span></div>
       <div class="table">
         <div class="tr th" style="${cols}"><span>session</span><span>share of window</span><span>turns</span><span>cache read</span><span>cache write</span><span>output</span><span>${ui.dollars ? 'dollars (est.)' : 'switch overhead'}</span></div>
         ${c.per_session.map((s) => `<div class="tr" style="${cols}"><span class="nm">${sname(m, s.session_key)}</span>${bar([[(s.share ?? 0) / maxShare, '#D97757']])}
           <span>${s.turns}</span><span>${tok(s.joined ? s.cache_read : null)}</span><span>${tok(s.joined ? s.cache_create : null)}</span><span>${tok(s.joined ? s.out_tok : null)}</span><span>${cell(s)}</span></div>`).join('')}
         <div class="tr" style="${cols}"><span>${c.one_shots.count} one-shots</span>${bar([[(c.one_shots.share ?? 0) / maxShare, '#A39E93']])}<span>${c.one_shots.count}</span><span>${NA}</span><span>${NA}</span><span>${tok(c.one_shots.out_tok || null)}</span><span>${NA}</span></div>
       </div>
-      <div class="note">"One-shots" are single-message requests with no tools — the desktop's side requests: title generation, prompt suggestions, summaries. Many never reach a transcript, so their usage often stays "—".</div>
+      <div class="note">"One-shots" are single-message requests with no tools — the desktop's side requests: title generation, prompt suggestions, summaries. They never reach a transcript; their usage is read from the response stream.</div>
     </section>`;
   }],
 
@@ -442,6 +471,7 @@ document.addEventListener('click', (e) => {
   if (d.act === 'goto-add') { location.hash = '#accounts'; setTimeout(() => $('#add-id')?.focus(), 400); }
   if (d.act === 'relogin') { ui.open[`relogin-${d.id}`] = !ui.open[`relogin-${d.id}`]; refresh(true); }
   if (d.act === 'units') { ui.dollars = d.v === '1'; refresh(true); }
+  if (d.act === 'budget-del' && confirm('Delete this budget?')) putSettings({ budgets: S.budgets.filter((b) => b.id !== d.id) });
   if (d.act === 'rate-del') { const rc = { ...S.rate_card }; delete rc[d.m]; putSettings({ rate_card: rc }); }
   if (d.act === 'rate-add') {
     const f = new FormData($('#budgets')), m = String(f.get('rc_model')).trim();
@@ -454,6 +484,13 @@ document.addEventListener('change', (e) => {
   if (d.s) ui.open[`pin-${d.s}`] = t.value;
   if (d.act === 'cache-session') { ui.cacheSession = t.value; refresh(true); }
   if (d.act === 'cache-days') { ui.cacheDays = Number(t.value); refresh(true); }
+  if ('b' in d) { // Add-budget selects: remembered across polls; a session cap is always per session
+    const f = t.form, s = f.elements;
+    if (s.scope.value === 'session') s.period.value = 'session';
+    ui.b = { scope: s.scope.value, period: s.period.value, action: s.action.value };
+    f.querySelector('[data-match]').hidden = !/project|account/.test(ui.b.scope);
+    s.match.setAttribute('list', `bm-${ui.b.scope}`);
+  }
   if (t.name === 'policy') putSettings({ policy: t.value });
   if (t.name === 'notify') putSettings({ notify: t.checked });
   if (t.closest('#budgets') && /_pct$|_gain$/.test(t.name)) {
@@ -469,6 +506,13 @@ document.addEventListener('submit', async (e) => {
   if (fid === 'add') {
     const id = String(f.get('id')).trim(), r = await act('accounts', { id });
     if (r.login_cmd) { ui.added = { id, login_cmd: r.login_cmd }; refresh(true); }
+  }
+  if (fid === 'budget-add') {
+    const scope = f.get('scope'), limit = parseUnits(String(f.get('limit')));
+    if (!(limit > 0)) return alert('Limit: a number of units, e.g. 2M or 500k');
+    const r = await putSettings({ budgets: [...(S.budgets ?? []), { id: `b${Date.now()}`, name: String(f.get('name')).trim(), scope, match: /project|account/.test(scope) ? String(f.get('match')).trim() : null,
+      period: scope === 'session' ? 'session' : f.get('period'), limit, action: f.get('action'), thresholds: [0.8, 1] }] });
+    if (!r?.error) { ui.b = {}; refresh(true); }
   }
   if (fid === 'rule-add') putSettings({ context_rules: [...S.context_rules, { id: `r${Date.now()}`, text: String(f.get('text')), enabled: true, state: 'proposed' }] });
   if (fid === 'ov') putSettings({ openvikings_endpoint: String(f.get('endpoint')).trim() || null });

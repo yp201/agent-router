@@ -1,6 +1,6 @@
 // Read-only views for the console UI: pure SQL + JS over the ledger. Nothing here writes.
-import { db, settings } from './ledger.ts';
-import { windowOf } from './advisor.ts';
+import { db, settings, now } from './ledger.ts';
+import { windowOf, title } from './advisor.ts';
 
 const all = (sql: string, ...a: any[]) => db.prepare(sql).all(...a) as any[];
 const one = (sql: string, ...a: any[]) => db.prepare(sql).get(...a) as any;
@@ -17,6 +17,16 @@ const today = () => new Date().setHours(0, 0, 0, 0);
 const sum = (rows: any[], f: (r: any) => number) => rows.reduce((a, r) => a + (f(r) || 0), 0);
 // ponytail: window accounting weights are unpublished; cache reads counted at their 0.1x price, everything else 1x.
 const W = (r: any) => (r.in_tok ?? 0) + (r.cache_create ?? 0) + (r.out_tok ?? 0) + (r.cache_read ?? 0) / 10;
+// THE unit for budgets, as SQL over a requests row: input-equivalent tokens (cache read 0.1×, cache write 1.25× for 5m / 2× for 1h,
+// output 5×). Model-agnostic. A cache write without the 1h/5m split counts 1.25×.
+export const UNITS = (t = '') => `(coalesce(${t}in_tok, 0) + 0.1 * coalesce(${t}cache_read, 0) + 5 * coalesce(${t}out_tok, 0) + iif(${t}cache_1h is null and ${t}cache_5m is null,
+  1.25 * coalesce(${t}cache_create, 0), 1.25 * coalesce(${t}cache_5m, 0) + 2 * coalesce(${t}cache_1h, 0)))`;
+export const fmtUnits = (n: number) => (n >= 1e6 ? `${+(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${+(n / 1e3).toFixed(1)}k` : String(Math.round(n)));
+// dollars for one row (or a sum of rows of one model) from settings.rate_card; null when the model has no rate — never a guessed price
+const price = (rc: Record<string, any>, r: any) => {
+  const k = Object.keys(rc).find((m) => r.model?.startsWith(m)), c = k && rc[k];
+  return c ? ((r.in_tok ?? 0) * (c.input ?? 0) + (r.out_tok ?? 0) * (c.output ?? 0) + (r.cache_read ?? 0) * (c.cache_read ?? 0) + (r.cache_create ?? 0) * (c.cache_write ?? 0)) / 1e6 : null;
+};
 const ctx = (r: any) => (r.cache_create != null ? (r.in_tok ?? 0) + (r.cache_read ?? 0) + r.cache_create : r.context_est);
 
 const FIX: Record<string, string> = {
@@ -29,7 +39,7 @@ const FIX: Record<string, string> = {
 // /v1/messages rows (2xx/3xx) since `since`, each annotated with `i` (turn in session), `switched`, and `burst`.
 function turns(since: number, session?: string | null) {
   const rows = all(`select r.id, r.ts, r.request_id, r.session_key, r.account_id, r.model, r.latency_ms, r.status, r.agent_id, r.tools_hash, r.tools_count,
-      r.system_hash, r.first_user_hash, r.msg_count, r.context_est, r.cache_read, r.cache_create, r.in_tok, r.out_tok,
+      r.system_hash, r.first_user_hash, r.msg_count, r.context_est, r.cache_read, r.cache_create, r.in_tok, r.out_tok, ${UNITS('r.')} units,
       exists (select 1 from migrations m where r.request_id is not null and m.request_id = r.request_id) migrated
     from requests r where ${MSG()} and status < 400 and session_key is not null and ts >= ? ${session ? 'and session_key = ?' : ''} order by ts`,
     ...(session ? [since, session] : [since]));
@@ -102,7 +112,7 @@ function overview(accounts: any[]) {
     },
     headroom_5h_pct: ok.length ? sum(ok, (a) => 1 - (a.util_5h ?? 0)) : null,
     reset_in_s: resets.length ? Math.round(Math.min(...resets) / 1000) : null,
-    accounts,
+    accounts, budgets: budgets().map(({ name, pct, state }) => ({ name, pct, state })),
     live: live.map((r) => ({ ts: r.ts, account: r.account_id, session_key: r.session_key, model: r.model, status: r.status, latency_ms: r.latency_ms,
       cache: r.cache_create == null ? '—' : r.cache_create > r.cache_read ? 'write' : 'hit', cache_create: r.cache_create,
       migration: r.migration ? JSON.parse(r.migration) : null })),
@@ -173,17 +183,13 @@ function cost() {
   const accts = all('select id, last_ratelimit_json j from accounts order by kind = \'home\' desc, id');
   const windows = Object.fromEntries((['5h', '7d'] as const).map((w) => [w, accts.map((a) => ({
     account: a.id, util: util(a.j, w), reset: util(a.j, w, 'reset'), projected_at_reset: project(a.id, w) }))]));
-  const price = (r: any) => {
-    const k = Object.keys(rc).find((m) => r.model?.startsWith(m)), c = k && rc[k];
-    return c ? ((r.in_tok ?? 0) * (c.input ?? 0) + (r.out_tok ?? 0) * (c.output ?? 0) + (r.cache_read ?? 0) * (c.cache_read ?? 0) + (r.cache_create ?? 0) * (c.cache_write ?? 0)) / 1e6 : null;
-  };
   const rows = turns(today()), oneShot = (r: any) => r.msg_count != null && r.msg_count <= 1 && !r.tools_count;
   const total = sum(rows.filter((r) => r.cache_create != null), W);
   const by = new Map<string, any[]>();
   for (const r of rows) if (!oneShot(r)) { const k = r.session_key ?? '-'; if (!by.has(k)) by.set(k, []); by.get(k)!.push(r); }
   const per_session = [...by].map(([session_key, rs]) => {
-    const j = rs.filter((r) => r.cache_create != null), ps = j.map(price);
-    return { session_key, turns: rs.length, joined: j.length, cache_read: sum(j, (r) => r.cache_read), cache_create: sum(j, (r) => r.cache_create),
+    const j = rs.filter((r) => r.cache_create != null), ps = j.map((r) => price(rc, r));
+    return { session_key, turns: rs.length, joined: j.length, units: Math.round(sum(rs, (r) => r.units)), cache_read: sum(j, (r) => r.cache_read), cache_create: sum(j, (r) => r.cache_create),
       out_tok: sum(j, (r) => r.out_tok), switch_overhead: sum(j.filter((r) => r.switched), (r) => r.cache_create),
       share: total ? sum(j, W) / total : null, dollars: j.length && ps.every((p) => p != null) ? sum(ps, (p) => p) : null };
   }).sort((a, b) => (b.share ?? 0) - (a.share ?? 0));
@@ -220,6 +226,35 @@ function insights() {
   };
 }
 
+// One budget's spend in its current period: SQL sum of units over /v1/messages rows (status < 400) with the scope filter.
+// day = since local midnight; week = rolling last 7×24 h; session = per session, whole life: `sk` names the session (a request's),
+// without it the view shows the biggest session active in the last 24 h.
+// ponytail: a SUM over the window per budget, per request and per poll (uses requests_ts / requests_session_ts); keep a running
+// total per budget and period if the ledger gets large.
+export function budgetStatus(b: any, sk?: string | null) {
+  const t = now(), day = new Date(t).setHours(0, 0, 0, 0), per = b.period === 'session';
+  const start = per ? 0 : b.period === 'day' ? day : t - 7 * 864e5;
+  const w = [`${MSG('r.')} and r.status < 400 and r.ts >= ?`], a: any[] = [start];
+  if (b.scope === 'project') { w.push(`r.session_key in (select session_key from sessions where substr(cwd, -length(?) - 1) = '/' || ?)`); a.push(b.match, b.match); }
+  if (b.scope === 'account') { w.push('r.account_id = ?'); a.push(b.match); }
+  if (b.scope === 'session' && b.match) { w.push('r.session_key = ?'); a.push(b.match); }
+  if (per && sk) { w.push('r.session_key = ?'); a.push(sk); }
+  else if (per) { w.push('r.session_key in (select session_key from sessions where last_ts >= ?)'); a.push(t - 864e5); }
+  const rows = all(`select r.session_key sk, r.model, sum(${UNITS('r.')}) units, sum(r.in_tok) in_tok, sum(r.out_tok) out_tok, sum(r.cache_read) cache_read,
+    sum(r.cache_create) cache_create from requests r where ${w.join(' and ')} group by 1, 2`, ...a);
+  const by = new Map<string | null, number>();
+  for (const r of rows) by.set(r.sk, (by.get(r.sk) ?? 0) + r.units);
+  const top = [...by].sort((x, y) => y[1] - x[1]).slice(0, 3);
+  const mine = per ? rows.filter((r) => r.sk === top[0]?.[0]) : rows, ps = mine.map((r) => price(settings().rate_card ?? {}, r));
+  const spent = Math.round(sum(mine, (r) => r.units)), pct = spent / b.limit;
+  return { ...b, spent, pct, state: pct >= 1 ? 'over' : pct >= 0.8 ? 'warn' : 'ok', period_start: start,
+    period_end: b.period === 'day' ? new Date(day).setDate(new Date(day).getDate() + 1) : null,
+    period_key: per ? sk ?? top[0]?.[0] ?? null : b.period === 'day' ? new Date(day).toLocaleDateString('sv') : 'rolling-7d',
+    dollars: ps.length && ps.every((p) => p != null) ? sum(ps, (p) => p) : null,
+    top: top.map(([k, units]) => ({ label: k ? title(k) : '—', units: Math.round(units) })) };
+}
+const budgets = () => (settings().budgets as any[]).map((b) => budgetStatus(b));
+
 // One session's /v1/messages turns in order, with account, joined usage, burst and the migration each turn paid for.
 export function timeline(key: string) {
   const rows = turns(0, key), names = new Map(all('select agent_id, name from agents where session_key = ?', key).map((a) => [a.agent_id, a.name]));
@@ -240,4 +275,5 @@ export function consoleApi(what: string, q: URLSearchParams, accounts?: any[]): 
   if (what === 'cache') return cache(q);
   if (what === 'cost') return cost();
   if (what === 'insights') return insights();
+  if (what === 'budgets') return budgets();
 }

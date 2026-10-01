@@ -73,6 +73,29 @@ advice card under the session in the console, with a **Write handoff summary** b
 fresh session. Only tool names, targets and sizes are stored, never tool output. Thresholds, per-model windows and the model
 live in settings (`context_warn_pct`, `context_urgent_pct`, `context_windows`, `advisor_model`, `advisor_enabled`); `NOTIFY=0` mutes it.
 
+## Budgets
+
+A budget is a spend limit over a scope (everything, one project, one account, or every session individually) and a period
+(day = since local midnight, week = the last 7×24 h, rolling, or the session's whole life). Add them in the console under
+**Cost & budgets**, or `PUT /router/settings` with `budgets: [...]`. There are none until you add one.
+
+- **Unit:** input-equivalent tokens, the same for every model: `input + 0.1 × cache read + 1.25 × cache write (5m) + 2 × cache write (1h) + 5 × output`.
+  Usage is read from each response as it streams through, so spend is current to the last request. Dollars are shown only for models in your rate card.
+- **notify** posts one macOS notification the first time the budget passes 80% and 100% in a period.
+- **stop** also refuses further `/v1/messages` requests in that scope once it is at 100%: Claude Code shows
+  `API Error: 400 agent-router budget ‘…’ is spent: 2.1M of 2M input-equivalent tokens today. It resets Fri 00:00. Raise or remove it at http://localhost:4001/router/#cost`
+  and ends the turn (no retries). Raise or delete the budget to continue. Token counting and other endpoints are never blocked.
+
+```bash
+# 2M units a day for one project (notify), and a 5M cap on any single session (stop: the runaway-agent guard)
+curl -X PUT localhost:4001/router/settings -d '{"budgets": [
+  {"id": "cf-day", "name": "climatefluent / day", "scope": "project", "match": "climatefluent", "period": "day", "limit": 2000000, "action": "notify", "thresholds": [0.8, 1]},
+  {"id": "cap", "name": "per-session cap", "scope": "session", "match": null, "period": "session", "limit": 5000000, "action": "stop", "thresholds": [0.8, 1]}]}'
+```
+
+A project is the basename of the session's working directory, known once the session's transcript has been read: the first
+request or two of a brand-new session are not counted against (or stopped by) a project budget.
+
 ## Day to day
 
 ```bash
@@ -101,11 +124,12 @@ which ignores that setting.
 ## Development
 
 ```bash
-node --test test_router.ts   # 17 tests, fake upstream, no network
+node --test test_router.ts   # 22 tests, fake upstream, no network
 ```
 
 `router.ts` proxy + routing · `accounts.ts` token store · `tailer.ts` transcript join · `console.ts` analytics · `advisor.ts` context advisor ·
 `ui.html` console · `agent-router.sh` install/status/uninstall. Plan and findings: `PLAN.md`, `NOTES.md`, `docs/`.
 
-Tokens are read from the official CLI's credential store at request time and never written to disk, logs or the UI.
+Tokens are read from the official CLI's credential store at request time; a refreshed token is written back to that same
+store (the CLI's own) and never written to the ledger, logs or UI.
 No request bodies are stored — only hashes, counts and token totals.

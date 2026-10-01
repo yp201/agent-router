@@ -37,6 +37,7 @@ create table if not exists requests (
   jsonl_path     text, session_id text, api_block_index integer,
   in_tok integer, out_tok integer, cache_read integer, cache_create integer,
   cache_1h integer, cache_5m integer, thinking_tok integer, model_from_transcript text,
+  usage_src text,                     -- 'stream' (read from the proxied response) | 'transcript' (filled by the tailer)
   -- request fingerprints (P3), /v1/messages only; hashes = sha256 hex[:16], never body text
   system_hash text, tools_hash text, tools_count integer, msg_count integer,
   first_user_hash text,               -- first user message minus <system-reminder> blocks (thread id + preamble detection)
@@ -63,3 +64,5 @@ create table if not exists advice (id integer primary key, session_key text, ts 
   breakdown_json text, text text, model text, request_id text);
 create table if not exists settings (key text primary key, value text);             -- JSON values; defaults in ledger.ts
 create index if not exists requests_ts on requests(ts);
+-- budgets (settings.budgets): one row the first time a budget crosses a threshold in a period; dedupes notifications, doubles as history
+create table if not exists budget_events (budget_id text, period_key text, threshold real, ts integer);
